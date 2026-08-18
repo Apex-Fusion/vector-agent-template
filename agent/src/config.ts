@@ -227,6 +227,15 @@ export interface SupplierConfig {
   /** Content-Type sent to the custom service. Env: SERVICE_CONTENT_TYPE, default "application/json". */
   serviceContentType: string;
   /**
+   * The processing SLA the operator advertises, ms — the same number
+   * `tx:post-advert` writes into the advert datum's max_processing_ms.
+   * Required when capabilityKind="custom": createApp's SLA boot guard refuses
+   * a SERVICE_TIMEOUT_MS that cannot nest inside it (minus the 30s deliver-by
+   * grace), because such a supplier claims jobs it can never submit.
+   * Env: ADVERT_MAX_PROCESSING_MS. 0 = unset (other capability kinds).
+   */
+  advertMaxProcessingMs: number;
+  /**
    * When true, the supplier boots a LiveOgmiosProvider (real submitTx/awaitTx).
    * Default false → ReadOnlyOgmiosProvider (safe; no chain writes).
    * Only the literal env value "1" sets this to true.
@@ -538,6 +547,22 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
   const serviceAuthHeader = env.SERVICE_AUTH_HEADER ?? "";
   const serviceContentType = env.SERVICE_CONTENT_TYPE ?? "application/json";
 
+  // ADVERT_MAX_PROCESSING_MS — the advertised SLA. Required for the custom
+  // kind (the boot guard in createApp compares SERVICE_TIMEOUT_MS against it
+  // and refuses to start when the service budget cannot nest inside the SLA);
+  // optional elsewhere, where 0 means "not declared to this process".
+  const advertMaxProcessingMsStr =
+    capabilityKind === "custom"
+      ? requireField(env, "ADVERT_MAX_PROCESSING_MS")
+      : (env.ADVERT_MAX_PROCESSING_MS ?? "");
+  let advertMaxProcessingMs = 0;
+  if (advertMaxProcessingMsStr !== "") {
+    if (!POS_INT_RE.test(advertMaxProcessingMsStr)) {
+      throw new Error("loadConfig: ADVERT_MAX_PROCESSING_MS must be a positive integer");
+    }
+    advertMaxProcessingMs = Number(advertMaxProcessingMsStr);
+  }
+
   const piperTimeoutStr = env.PIPER_TIMEOUT_MS;
   let piperTimeoutMs = 120_000;
   if (piperTimeoutStr !== undefined && piperTimeoutStr !== "") {
@@ -597,6 +622,7 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
     serviceTimeoutMs,
     serviceAuthHeader,
     serviceContentType,
+    advertMaxProcessingMs,
     liveChain,
     walletHealthIntervalMs,
   };

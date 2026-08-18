@@ -1419,18 +1419,12 @@ export function createApp(deps: SupplierDeps): Application {
   } else if (resolved.config.capabilityKind === "custom") {
     // SLA boot guard: the service budget must nest inside the advert SLA
     // minus the 30 s deliver-by grace, or claims burn on unsubmittable jobs.
-    // The advert datum is only readable asynchronously (chain query), and this
-    // factory is synchronous — so the boot check reads the operator's own
-    // declared SLA from ADVERT_MAX_PROCESSING_MS, the same env var
-    // `tx:post-advert` writes into the advert's max_processing_ms. Unset or
-    // unparseable: warn loudly rather than pretend the budget was checked.
-    const slaMs = Number(process.env.ADVERT_MAX_PROCESSING_MS ?? "");
-    if (!Number.isFinite(slaMs) || slaMs <= 0) {
-      console.warn(
-        "[custom] ADVERT_MAX_PROCESSING_MS unset or invalid — SLA boot guard skipped; " +
-          `SERVICE_TIMEOUT_MS (${resolved.config.serviceTimeoutMs}) is unchecked against the advert SLA`,
-      );
-    } else if (resolved.config.serviceTimeoutMs >= slaMs - 30_000) {
+    // The advert datum itself is only readable asynchronously (chain query)
+    // and this factory is synchronous, so the SLA arrives via config —
+    // ADVERT_MAX_PROCESSING_MS, required for this kind, the same number
+    // `tx:post-advert` writes into the advert's max_processing_ms.
+    const slaMs = resolved.config.advertMaxProcessingMs;
+    if (resolved.config.serviceTimeoutMs >= slaMs - 30_000) {
       throw new Error(
         `custom capability: SERVICE_TIMEOUT_MS (${resolved.config.serviceTimeoutMs}) must be < advert max_processing_ms - 30000 (${slaMs - 30_000})`,
       );
