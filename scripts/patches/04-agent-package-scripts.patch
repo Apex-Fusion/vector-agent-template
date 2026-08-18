@@ -1,0 +1,14 @@
+diff --git a/agent/package.json b/agent/package.json
+index 36e11ef..56019b7 100644
+--- a/agent/package.json
++++ b/agent/package.json
+@@ -4,7 +4,9 @@
+   "private": true,
+   "type": "module",
+   "scripts": {
++    "start": "tsx src/index.ts",
+     "typecheck": "tsc --noEmit",
++    "test": "vitest run src",
+     "tx:gen-keypair": "tsx src/cli/gen-keypair.ts",
+     "tx:post-advert": "tsx src/cli/post-advert.ts",
+     "tx:retire-advert": "tsx src/cli/retire-advert.ts",
