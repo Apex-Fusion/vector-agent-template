@@ -2,6 +2,7 @@
   "name": "vector-agent-template",
   "private": true,
   "license": "MIT",
+  "packageManager": "pnpm@10.33.2",
   "engines": { "node": ">=22" },
   "scripts": {
     "typecheck": "pnpm -r --if-present typecheck",
