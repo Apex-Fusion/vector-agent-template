@@ -19,10 +19,10 @@ import { createHash } from "crypto";
 import * as ed from "@noble/ed25519";
 import { blake2b } from "@noble/hashes/blake2b";
 
-import { buildReceipt, signReceipt } from "@marketplace/shared/receipt";
+import { buildReceipt, signReceipt, receiptResultHash } from "@marketplace/shared/receipt";
 import type { SignedReceipt } from "@marketplace/shared/receipt";
 
-import { verifyReceipt } from "./verify-receipt.js";
+import { verifyReceipt, verifyChainBindings } from "./verify-receipt.js";
 
 // @noble/ed25519 v2 sync mode needs a sha512 hook. The vendored sign.ts
 // installs one on import; we install ours too so key generation in this file
@@ -184,5 +184,99 @@ describe("verifyReceipt", () => {
       .toEqual({ ok: false, reason: "malformed_pub_key" });
     expect(verifyReceipt({ receipt: { ...signed.receipt, prompt_hash: 42 }, signature: signed.signature }, PAYLOAD, OUTPUT, supplier.pubHex))
       .toEqual({ ok: false, reason: "malformed_receipt" });
+  });
+});
+
+/**
+ * The bindings are what stop a self-consistent lie: everything verifyReceipt
+ * checks (receipt, output, signing key) arrives from ONE endpoint, so a
+ * dishonest agent can serve a matched set. Each test below breaks exactly one
+ * anchor to something the endpoint does not control.
+ */
+describe("verifyChainBindings", () => {
+  const supplier = makeSupplierKey("try-it-bindings-supplier");
+
+  function fixture(): { signed: SignedReceipt; onChain: string } {
+    const signed = makeSignedReceipt({
+      payload: PAYLOAD,
+      output: OUTPUT,
+      privHex: supplier.privHex,
+      pkh: supplier.pkh,
+    });
+    // Exactly what the supplier's Submit tx writes: buildSubmitTx({receiptHash}).
+    return { signed, onChain: receiptResultHash(signed) };
+  }
+
+  it("accepts a receipt whose hash is the one committed on chain", () => {
+    const { signed, onChain } = fixture();
+    expect(verifyChainBindings(signed, {
+      resultReceiptHashOnChain: onChain,
+      escrowRefPosted: ESCROW_REF,
+      advertSupplierPkh: supplier.pkh,
+      supplierPubKeyHex: supplier.pubHex,
+    })).toEqual({ ok: true });
+  });
+
+  it("rejects a receipt the chain does not commit (result_receipt_hash)", () => {
+    const { signed, onChain } = fixture();
+    // One byte off — i.e. the endpoint served a receipt other than the one it
+    // Submitted, or re-signed after the fact.
+    const other = `${onChain.slice(0, -1)}${onChain.endsWith("0") ? "1" : "0"}`;
+    expect(verifyChainBindings(signed, {
+      resultReceiptHashOnChain: other,
+      escrowRefPosted: ESCROW_REF,
+      advertSupplierPkh: supplier.pkh,
+      supplierPubKeyHex: supplier.pubHex,
+    })).toEqual({ ok: false, reason: "result_receipt_hash_mismatch" });
+  });
+
+  it("rejects when the escrow has no receipt hash on chain at all", () => {
+    const { signed } = fixture();
+    expect(verifyChainBindings(signed, {
+      resultReceiptHashOnChain: null,
+      escrowRefPosted: ESCROW_REF,
+      advertSupplierPkh: supplier.pkh,
+      supplierPubKeyHex: supplier.pubHex,
+    })).toEqual({ ok: false, reason: "no_result_receipt_hash_on_chain" });
+  });
+
+  it("rejects a receipt for someone else's escrow (replay)", () => {
+    const { signed, onChain } = fixture();
+    expect(verifyChainBindings(signed, {
+      resultReceiptHashOnChain: onChain,
+      escrowRefPosted: `${"cd".repeat(32)}#0`,
+      advertSupplierPkh: supplier.pkh,
+      supplierPubKeyHex: supplier.pubHex,
+    })).toEqual({ ok: false, reason: "wrong_escrow_ref" });
+  });
+
+  it("rejects a receipt claiming a supplier the advert never named", () => {
+    const { signed, onChain } = fixture();
+    expect(verifyChainBindings(signed, {
+      resultReceiptHashOnChain: onChain,
+      escrowRefPosted: ESCROW_REF,
+      advertSupplierPkh: "9f".repeat(28),
+      supplierPubKeyHex: supplier.pubHex,
+    })).toEqual({ ok: false, reason: "wrong_supplier" });
+  });
+
+  it("rejects a signing key that is not the advertised supplier's (circularity break)", () => {
+    // The endpoint serves a receipt with the right supplier_pkh and a signature
+    // that verifies — under a key it swapped in. blake2b-224 of that key does
+    // not hash to the advert's pkh, so it fails.
+    const impostor = makeSupplierKey("impostor-key");
+    const signed = makeSignedReceipt({
+      payload: PAYLOAD,
+      output: OUTPUT,
+      privHex: impostor.privHex,
+      pkh: supplier.pkh,
+    });
+    expect(verifyReceipt(signed, PAYLOAD, OUTPUT, impostor.pubHex)).toEqual({ ok: true });
+    expect(verifyChainBindings(signed, {
+      resultReceiptHashOnChain: receiptResultHash(signed),
+      escrowRefPosted: ESCROW_REF,
+      advertSupplierPkh: supplier.pkh,
+      supplierPubKeyHex: impostor.pubHex,
+    })).toEqual({ ok: false, reason: "pub_key_not_supplier" });
   });
 });

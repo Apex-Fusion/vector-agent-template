@@ -7,6 +7,17 @@ UPSTREAM="${1:?usage: sync-core.sh <upstream-clone-path> [<ref>]}"
 REF="${2:-origin/main}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# The vendored dirs are wiped and rebuilt below, and deleted template-owned
+# files are restored FROM THE INDEX - so any uncommitted edit under them would
+# be destroyed silently. Refuse to run until the tree is clean there.
+DIRTY=$(git -C "$ROOT" status --porcelain -- agent packages/shared)
+if [ -n "$DIRTY" ]; then
+  echo "sync-core: refusing to run - uncommitted changes under agent/ or packages/shared/:" >&2
+  echo "$DIRTY" >&2
+  echo "commit or stash them first (this script rebuilds those trees from upstream)" >&2
+  exit 1
+fi
+
 git -C "$UPSTREAM" fetch origin main --quiet
 PIN=$(git -C "$UPSTREAM" rev-parse "$REF")
 

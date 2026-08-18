@@ -34,10 +34,18 @@
  *
  * ─── Order of operations ───
  * Verification happens BEFORE Accept, not after (the brief's flow verified
- * after). Both hash checks plus the ed25519 check cost microseconds, so the
- * 600 s Accept window is in no danger, and accepting an unverifiable receipt is
- * exactly the thing a bonded escrow exists to prevent: an unaccepted escrow is
- * still the buyer's to reclaim after deliver_by.
+ * after), and nothing is accepted until BOTH the offline receipt checks and the
+ * on-chain bindings pass. The checks cost microseconds, so the 600 s Accept
+ * window is in no danger.
+ *
+ * What refusing to Accept does and does NOT do — no false comfort. Once the
+ * supplier has Submitted, `Reclaim` is out of reach: `reclaim.ts` only spends
+ * Open|Claimed escrows, and `release.ts` lets the SUPPLIER take payment +
+ * supplier_bond + buyer_bond once `submitted_at + 600 s` passes. So aborting
+ * here forfeits the money either way. What it buys is that this buyer never
+ * signs an on-chain Accept endorsing work whose receipt does not verify: the
+ * settlement record stays honest, and the failure is visible as a Release
+ * rather than an Accept. The funds are gone; the evidence is not corrupted.
  *
  * Env: BUYER_PRIV_KEY_HEX, OGMIOS_URL, NETWORK_ID, VECTOR_ZERO_TIME_MS (all required).
  * VECTOR_ZERO_TIME_MS is required rather than defaulted on purpose: the vendored
@@ -60,7 +68,7 @@ import type { EscrowDatum } from "@marketplace/shared/cbor";
 import { buildPostEscrowTx, buildAcceptTx } from "@marketplace/shared/tx";
 import type { ChatMessage, WalletKey } from "@marketplace/shared/tx";
 
-import { verifyReceipt } from "./verify-receipt.js";
+import { verifyReceipt, verifyChainBindings } from "./verify-receipt.js";
 
 // @noble/ed25519 v2 sync API needs a sha512 hook installed at load time.
 ed.etc.sha512Sync = (...messages: Uint8Array[]): Uint8Array => {
@@ -101,7 +109,7 @@ export interface EnvConfig {
 }
 
 /** Thrown for every expected failure; `reason` is the machine-readable code. */
-class BuyError extends Error {
+export class BuyError extends Error {
   public readonly reason: string;
   constructor(reason: string, message: string) {
     super(message);
@@ -166,6 +174,15 @@ export function loadEnvConfig(env: Record<string, string | undefined>): EnvConfi
   }
   const ogmiosUrl = env.OGMIOS_URL ?? "";
   if (!ogmiosUrl) throw new BuyError("bad_env", "OGMIOS_URL is required");
+  // The providers talk JSON-RPC over HTTP POST, not the websocket protocol
+  // Ogmios is better known for. A wss:// URL fails deep inside fetch with a
+  // scheme error that says nothing about the actual mistake.
+  if (!/^https?:\/\//.test(ogmiosUrl)) {
+    throw new BuyError(
+      "bad_env",
+      `OGMIOS_URL must be an http(s) URL — the chain providers use JSON-RPC over HTTP, not websockets (got: ${ogmiosUrl})`,
+    );
+  }
   if (env.NETWORK_ID !== "0" && env.NETWORK_ID !== "1") {
     throw new BuyError("bad_env", `NETWORK_ID must be "0" or "1" (got: ${env.NETWORK_ID ?? "unset"})`);
   }
@@ -235,6 +252,22 @@ export function buildWirePayload(payloadText: string): WirePayload {
   return { messages, wirePayload, promptHash: sha256Utf8Hex(wirePayload) };
 }
 
+/**
+ * The `custom` route mounts `express.json({ limit: "1mb" })`, so an oversized
+ * body is rejected by the parser — after the escrow is funded, with the job
+ * unclaimable and the money already committed. Refuse client-side instead, with
+ * head-room for the JSON envelope the payload rides in.
+ */
+export const MAX_WIRE_PAYLOAD_BYTES = 900_000;
+
+export function payloadSizeError(wirePayload: string): string | null {
+  const bytes = Buffer.byteLength(wirePayload, "utf8");
+  if (bytes > MAX_WIRE_PAYLOAD_BYTES) {
+    return `payload is ${bytes} bytes on the wire, over the ${MAX_WIRE_PAYLOAD_BYTES} limit this harness enforces (the agent's /v1/job parser caps the JSON body at 1mb) — split the work into smaller jobs`;
+  }
+  return null;
+}
+
 function refStr(ref: OutputReference): string {
   return `${ref.txHash}#${ref.index}`;
 }
@@ -243,17 +276,18 @@ function refStr(ref: OutputReference): string {
  * Both live builders we call (PostEscrow via `loadBlueprint`, Accept via
  * `loadEscrowScript`) read the compiled validator blueprint from
  * `<repo>/contracts/marketplace/plutus.json`, resolved relative to the shared
- * package - and this template deliberately does not vendor the Aiken
- * `contracts/` workspace. Checking first turns a mid-flight ENOENT into one
- * sentence that says what to put where. Nothing is submitted before this runs,
- * so a miss costs nothing but the trip.
+ * package. `scripts/sync-core.sh` vendors it from the same upstream commit as
+ * the code; it goes missing only if the tree was assembled by hand or the file
+ * was deleted. Checking first turns a mid-flight ENOENT into one sentence that
+ * says what to run. Nothing is submitted before this runs, so a miss costs
+ * nothing but the trip.
  */
 function preflightBlueprint(): void {
   const path = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "contracts", "marketplace", "plutus.json");
   if (!existsSync(path)) {
     throw new BuyError(
       "blueprint_missing",
-      `${path} not found — the escrow tx builders need the compiled validator blueprint. Copy contracts/marketplace/plutus.json from the marketplace contracts repo (it must be the build the advert's network runs) and retry`,
+      `${path} not found — the escrow tx builders need the compiled validator blueprint. Re-vendor it with "scripts/sync-core.sh <path-to-agents-marketplace-clone>", which pins it to the same commit as the code; do NOT hand-copy a blueprint from elsewhere, a different build derives a different script address`,
     );
   }
 }
@@ -283,7 +317,7 @@ async function chainStep<T>(reason: string, fn: () => Promise<T>): Promise<T> {
   }
 }
 
-interface HttpResult {
+export interface HttpResult {
   status: number;
   body: unknown;
   text: string;
@@ -324,15 +358,18 @@ function errDetail(body: unknown, fallback: string): string {
  * `buildAcceptTx` needs the current Submitted-state one. Upstream's buyer finds
  * it through the marketplace indexer (`/escrows?buyer=`); this template ships no
  * indexer, so we scan the escrow script address on Ogmios and match the datum
- * against our own commitment: buyer key + prompt hash + the `posted_at` we read
- * off our own escrow. The state machine carries all three through Claim and
- * Submit unchanged, and `posted_at` is what keeps a second run of the same
- * payload file from being mistaken for this one.
+ * against our own commitment on every immutable field we hold: buyer pkh,
+ * supplier pkh, advert ref, prompt hash, and the `posted_at` read off our own
+ * escrow. The state machine carries all of them through Claim and Submit
+ * unchanged; `posted_at` is what keeps a second run of the same payload file
+ * from being mistaken for this one.
  */
 async function resolveSubmittedEscrow(opts: {
   chain: LiveOgmiosProvider;
   escrowAddress: string;
   buyerPkh: string;
+  supplierPkh: string;
+  advertRef: OutputReference;
   promptHash: string;
   postedAt: number;
   timeoutMs: number;
@@ -353,6 +390,9 @@ async function resolveSubmittedEscrow(opts: {
       if (
         datum.state === "Submitted" &&
         datum.buyer_pkh === opts.buyerPkh &&
+        datum.supplier_pkh === opts.supplierPkh &&
+        datum.advert_ref.txHash === opts.advertRef.txHash &&
+        datum.advert_ref.index === opts.advertRef.index &&
         datum.prompt_hash === opts.promptHash &&
         datum.posted_at === opts.postedAt
       ) {
@@ -375,22 +415,70 @@ async function resolveSubmittedEscrow(opts: {
 
 // ─── job poll ──────────────────────────────────────────────────────────────
 
-interface DoneJob {
+export interface DoneJob {
   output: string;
   receipt: unknown;
   signature: unknown;
 }
 
-async function pollJob(opts: {
+/** Transport failures and body-less 5xx (a proxy, a restart) are worth another
+ * try; anything carrying the agent's own `reason` is a verdict, not a blip. */
+export function isTransientPollFailure(outcome: { kind: "threw"; err: unknown } | { kind: "http"; res: HttpResult }): boolean {
+  if (outcome.kind === "threw") {
+    return outcome.err instanceof BuyError && outcome.err.reason === "agent_unreachable";
+  }
+  const { status, body } = outcome.res;
+  if (status < 500) return false;
+  const reason = body && typeof body === "object" ? (body as Record<string, unknown>).reason : undefined;
+  return typeof reason !== "string";
+}
+
+/** Attempts per poll tick before the run is abandoned. */
+export const POLL_ATTEMPTS = 3;
+const POLL_RETRY_BACKOFF_MS = 1_000;
+
+export async function pollJob(opts: {
   endpoint: string;
   jobId: string;
   intervalMs: number;
   timeoutMs: number;
+  /** Injected by tests; defaults to the real HTTP client. */
+  request?: (url: string) => Promise<HttpResult>;
+  retryBackoffMs?: number;
 }): Promise<DoneJob> {
   const url = `${opts.endpoint}/v1/job/${opts.jobId}`;
+  const request = opts.request ?? ((u: string) => httpJson(u, { method: "GET" }));
+  const backoffMs = opts.retryBackoffMs ?? POLL_RETRY_BACKOFF_MS;
   const deadline = Date.now() + opts.timeoutMs;
   for (;;) {
-    const res = await httpJson(url, { method: "GET" });
+    // Give up on a tick only after POLL_ATTEMPTS — abandoning the poll does not
+    // abandon the job: the supplier still Submits and, 600 s later, Releases
+    // payment and both bonds to itself. A dropped connection must not cost that.
+    let res: HttpResult | null = null;
+    let lastErr: unknown = null;
+    for (let attempt = 1; attempt <= POLL_ATTEMPTS; attempt++) {
+      let outcome: { kind: "threw"; err: unknown } | { kind: "http"; res: HttpResult };
+      try {
+        outcome = { kind: "http", res: await request(url) };
+      } catch (err) {
+        outcome = { kind: "threw", err };
+      }
+      if (!isTransientPollFailure(outcome)) {
+        if (outcome.kind === "threw") throw outcome.err;
+        res = outcome.res;
+        break;
+      }
+      lastErr = outcome.kind === "threw"
+        ? outcome.err
+        : new BuyError("job_poll_failed", `HTTP ${outcome.res.status} with no reason: ${outcome.res.text.slice(0, 120)}`);
+      log(`poll      transient failure ${attempt}/${POLL_ATTEMPTS}: ${(lastErr as Error).message}`);
+      if (attempt < POLL_ATTEMPTS) await sleep(backoffMs);
+    }
+    if (res === null) {
+      throw lastErr instanceof BuyError
+        ? lastErr
+        : new BuyError("job_poll_failed", `polling failed ${POLL_ATTEMPTS}x: ${(lastErr as Error)?.message ?? String(lastErr)}`);
+    }
     if (res.status === 200) {
       const body = (res.body ?? {}) as Record<string, unknown>;
       const choices = Array.isArray(body.choices) ? body.choices : [];
@@ -446,6 +534,8 @@ export async function main(argv: string[], env: Record<string, string | undefine
     // See the builder-choice note in the file header: the wire payload IS the
     // preimage postEscrow hashes, so sha256(wirePayload) === escrow.prompt_hash.
     const { messages, wirePayload, promptHash } = buildWirePayload(payloadText);
+    const tooBig = payloadSizeError(wirePayload);
+    if (tooBig !== null) throw new BuyError("payload_too_large", tooBig);
 
     const buyerKey = deriveWalletKey(cfg.privKeyHex, cfg.networkId);
     const chain = new LiveOgmiosProvider({ ogmiosUrl: cfg.ogmiosUrl });
@@ -523,7 +613,24 @@ export async function main(argv: string[], env: Record<string, string | undefine
     });
     log(`job       done, ${done.output.length} bytes of output`);
 
-    // ── 7. Verify the receipt offline, BEFORE paying ──────────────────────
+    // ── 7. Find the Submitted escrow — needed to verify, not just to Accept ─
+    // Its datum carries `result_receipt_hash`, the supplier's on-chain
+    // commitment to the receipt bytes. Resolving first costs nothing (it spends
+    // nothing) and lets the verification below be anchored to the chain.
+    const submitted = await chainStep("submitted_lookup_failed", () => resolveSubmittedEscrow({
+      chain,
+      escrowAddress,
+      buyerPkh: buyerKey.pubKeyHash,
+      supplierPkh: advert.supplier_pkh,
+      advertRef: args.advertRef,
+      promptHash,
+      postedAt: escrowDatum.posted_at,
+      timeoutMs: SUBMITTED_LOOKUP_TIMEOUT_MS,
+      intervalMs: args.pollIntervalMs,
+    }));
+    log(`submitted ${refStr(submitted.ref)} (submitted_at=${submitted.datum.submitted_at})`);
+
+    // ── 8. Verify: offline receipt checks + on-chain bindings, BEFORE paying ─
     const capRes = await httpJson(`${args.endpoint}/capability`, { method: "GET" });
     if (capRes.status !== 200) {
       throw new BuyError("capability_unavailable", errDetail(capRes.body, `GET /capability returned HTTP ${capRes.status}`));
@@ -532,31 +639,29 @@ export async function main(argv: string[], env: Record<string, string | undefine
     if (typeof pubKeyHex !== "string") {
       throw new BuyError("capability_unavailable", "GET /capability returned no pub_key_hex");
     }
-    const verdict = verifyReceipt(
-      { receipt: done.receipt, signature: done.signature },
-      wirePayload,
-      done.output,
-      pubKeyHex,
-    );
-    if (!verdict.ok) {
-      throw new BuyError(
-        "receipt_unverified",
-        `${verdict.reason} — NOT accepting; the escrow stays locked and is reclaimable after deliver_by`,
-      );
-    }
-    log("receipt   verified offline (prompt hash, response hash, supplier signature)");
+    const signedReceipt = { receipt: done.receipt, signature: done.signature };
+    // Refusal is NOT a refund — see the header. Once Submitted, the supplier can
+    // Release payment and both bonds after the 600 s window whether we Accept or
+    // not. What we control is whether this buyer's signature endorses it.
+    const abortNote = "NOT accepting — the money is already at risk (after submitted_at+600s the supplier can Release payment and both bonds), but this buyer will not sign an Accept for work it cannot verify";
 
-    // ── 8. Accept: releases payment, closes the escrow ────────────────────
-    const submitted = await chainStep("submitted_lookup_failed", () => resolveSubmittedEscrow({
-      chain,
-      escrowAddress,
-      buyerPkh: buyerKey.pubKeyHash,
-      promptHash,
-      postedAt: escrowDatum.posted_at,
-      timeoutMs: SUBMITTED_LOOKUP_TIMEOUT_MS,
-      intervalMs: args.pollIntervalMs,
-    }));
-    log(`accept    spending ${refStr(submitted.ref)} (submitted_at=${submitted.datum.submitted_at})`);
+    const verdict = verifyReceipt(signedReceipt, wirePayload, done.output, pubKeyHex);
+    if (!verdict.ok) {
+      throw new BuyError("receipt_unverified", `${verdict.reason} — ${abortNote}`);
+    }
+    const bound = verifyChainBindings(signedReceipt, {
+      resultReceiptHashOnChain: submitted.datum.result_receipt_hash,
+      escrowRefPosted: refStr(escrowRef),
+      advertSupplierPkh: advert.supplier_pkh,
+      supplierPubKeyHex: pubKeyHex,
+    });
+    if (!bound.ok) {
+      throw new BuyError("receipt_unbound", `${bound.reason} — ${abortNote}`);
+    }
+    log("receipt   verified (prompt hash, response hash, signature) and bound to chain (result_receipt_hash, escrow_ref, supplier identity)");
+
+    // ── 9. Accept: releases payment, closes the escrow ────────────────────
+    log(`accept    spending ${refStr(submitted.ref)}`);
     const accepted = await chainStep("accept_failed", () => buildAcceptTx({ chain, buyerKey, escrowRef: submitted.ref }));
     await chainStep("accept_confirm_failed", () => chain.awaitTx(accepted.expectedTxHash, args.awaitTimeoutMs));
 
@@ -585,9 +690,12 @@ export async function main(argv: string[], env: Record<string, string | undefine
 // Auto-invoke when run directly (tsx src/buy-once.ts).
 if (process.argv[1]?.endsWith("buy-once.ts") || process.argv[1]?.endsWith("buy-once.js")) {
   main(process.argv.slice(2), process.env)
-    .then((code) => process.exit(code))
+    // process.exitCode, not process.exit(): exit() can truncate the pending
+    // stdout write, and that line is the machine-readable result. Node exits on
+    // its own once the event loop drains.
+    .then((code) => { process.exitCode = code; })
     .catch((err) => {
       process.stderr.write(`buy-once: fatal: ${(err as Error).message}\n`);
-      process.exit(1);
+      process.exitCode = 1;
     });
 }

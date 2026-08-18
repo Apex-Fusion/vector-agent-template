@@ -9,6 +9,10 @@
  *
  * No network, no chain, no trust in the agent that served the response.
  *
+ * `verifyChainBindings` (below) answers the fourth question — is this the
+ * receipt the CHAIN commits, from the supplier the buyer paid? — and both must
+ * pass before Accept.
+ *
  * SIGNATURE-LAYOUT MIRROR — the load-bearing detail. The supplier signs
  * `ed25519(utf8(canonicalize(receipt)), privKey)` (packages/shared/src/receipt/sign.ts),
  * where `canonicalize` is the RFC-8785 JCS subset in
@@ -28,7 +32,11 @@
  */
 
 import { createHash } from "crypto";
-import { verifyReceipt as verifyVendoredSignature } from "@marketplace/shared/receipt";
+import { blake2b } from "@noble/hashes/blake2b";
+import {
+  verifyReceipt as verifyVendoredSignature,
+  receiptResultHash,
+} from "@marketplace/shared/receipt";
 import type { Receipt, SignedReceipt } from "@marketplace/shared/receipt";
 
 /**
@@ -116,4 +124,91 @@ export function verifyReceipt(
   }
 
   return { ok: true };
+}
+
+/**
+ * What `verifyReceipt` alone cannot answer: is this the receipt the CHAIN
+ * commits, from the supplier the buyer actually paid?
+ *
+ * Everything in `verifyReceipt` arrives over one HTTP connection — the receipt,
+ * the output, and (from `GET /capability`) the key that signs it. A dishonest
+ * endpoint can serve a self-consistent set of all three. These four checks
+ * break that circularity by anchoring each piece to something the endpoint does
+ * not control:
+ *
+ *   - `escrow_ref`   — the escrow THIS buyer posted, not some other job's receipt
+ *   - `supplier_pkh` — the identity in the advert datum the buyer paid against
+ *   - the key itself — blake2b-224(pub_key_hex) must equal that same advert
+ *                      pkh, so a swapped signing key cannot pass by simply
+ *                      being served alongside a matching signature
+ *   - the receipt hash — `receiptResultHash({receipt, signature})` must equal
+ *                      the `result_receipt_hash` the supplier wrote on chain in
+ *                      its Submit tx. This is the binding: the bytes verified
+ *                      off-chain are the bytes the chain records.
+ *
+ * `receiptResultHash` is the vendored helper the supplier's Submit path uses
+ * (`customJobRunner.ts` → `buildSubmitTx({receiptHash})`), so this recomputes
+ * the same value the same way rather than mirroring it.
+ *
+ * Reason strings follow the upstream buyer SDK where it has equivalents
+ * (`wrong_supplier`, `wrong_escrow_ref` — buyer/src/sdk/Marketplace.ts).
+ */
+export interface ChainBindings {
+  /** `result_receipt_hash` read from the Submitted-state escrow datum. */
+  resultReceiptHashOnChain: string | null;
+  /** `"<txHash>#<index>"` of the escrow this buyer posted. */
+  escrowRefPosted: string;
+  /** `supplier_pkh` from the advert datum the escrow was posted against. */
+  advertSupplierPkh: string;
+  /** `pub_key_hex` served by `GET /capability`. */
+  supplierPubKeyHex: string;
+}
+
+export function verifyChainBindings(signed: SignedReceiptLike, bindings: ChainBindings): VerifyResult {
+  if (!signed || typeof signed !== "object" || !signed.receipt || typeof signed.receipt !== "object") {
+    return { ok: false, reason: "malformed_receipt" };
+  }
+  if (typeof signed.signature !== "string" || !HEX128_RE.test(signed.signature)) {
+    return { ok: false, reason: "malformed_signature" };
+  }
+  const fields = signed.receipt as Record<string, unknown>;
+
+  if (fields.escrow_ref !== bindings.escrowRefPosted) {
+    return { ok: false, reason: "wrong_escrow_ref" };
+  }
+  if (typeof fields.supplier_pkh !== "string" || fields.supplier_pkh !== bindings.advertSupplierPkh) {
+    return { ok: false, reason: "wrong_supplier" };
+  }
+  if (!HEX64_RE.test(bindings.supplierPubKeyHex)) {
+    return { ok: false, reason: "malformed_pub_key" };
+  }
+  const keyPkh = bytesToHex(blake2b(hexToBytes(bindings.supplierPubKeyHex), { dkLen: 28 }));
+  if (keyPkh !== bindings.advertSupplierPkh.toLowerCase()) {
+    return { ok: false, reason: "pub_key_not_supplier" };
+  }
+
+  if (typeof bindings.resultReceiptHashOnChain !== "string" || !HEX64_RE.test(bindings.resultReceiptHashOnChain)) {
+    return { ok: false, reason: "no_result_receipt_hash_on_chain" };
+  }
+  const recomputed = receiptResultHash({
+    receipt: signed.receipt as Receipt,
+    signature: signed.signature,
+  });
+  if (recomputed !== bindings.resultReceiptHashOnChain.toLowerCase()) {
+    return { ok: false, reason: "result_receipt_hash_mismatch" };
+  }
+
+  return { ok: true };
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  return bytes;
+}
+
+function bytesToHex(b: Uint8Array): string {
+  let out = "";
+  for (let i = 0; i < b.length; i++) out += b[i].toString(16).padStart(2, "0");
+  return out;
 }
