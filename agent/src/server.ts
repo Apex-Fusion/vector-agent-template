@@ -62,6 +62,8 @@ import { endChatSession, type EndChatSessionDeps } from "./chatSessionRunner.js"
 import { callOpenAiStream } from "./openai.js";
 import { healthzRouter } from "./routes/healthz.js";
 import { triggerOnFailureConsolidate } from "./walletHealth.js";
+import { makeHttpCalloutExecutor } from "./executor/httpCallout.js";
+import { makeCustomHandler, makeGetCustomJobHandler } from "./routes/custom.js";
 
 export interface SupplierDeps {
   chain: ChainProvider;
@@ -1414,6 +1416,33 @@ export function createApp(deps: SupplierDeps): Application {
     // fits comfortably under 16mb.
     app.post("/v1/ocr/extract", express.json({ limit: "16mb" }), makeOcrHandler(resolved));
     app.get("/v1/ocr/extract/:jobId", makeGetOcrJobHandler(resolved));
+  } else if (resolved.config.capabilityKind === "custom") {
+    // SLA boot guard: the service budget must nest inside the advert SLA
+    // minus the 30 s deliver-by grace, or claims burn on unsubmittable jobs.
+    // The advert datum is only readable asynchronously (chain query), and this
+    // factory is synchronous — so the boot check reads the operator's own
+    // declared SLA from ADVERT_MAX_PROCESSING_MS, the same env var
+    // `tx:post-advert` writes into the advert's max_processing_ms. Unset or
+    // unparseable: warn loudly rather than pretend the budget was checked.
+    const slaMs = Number(process.env.ADVERT_MAX_PROCESSING_MS ?? "");
+    if (!Number.isFinite(slaMs) || slaMs <= 0) {
+      console.warn(
+        "[custom] ADVERT_MAX_PROCESSING_MS unset or invalid — SLA boot guard skipped; " +
+          `SERVICE_TIMEOUT_MS (${resolved.config.serviceTimeoutMs}) is unchecked against the advert SLA`,
+      );
+    } else if (resolved.config.serviceTimeoutMs >= slaMs - 30_000) {
+      throw new Error(
+        `custom capability: SERVICE_TIMEOUT_MS (${resolved.config.serviceTimeoutMs}) must be < advert max_processing_ms - 30000 (${slaMs - 30_000})`,
+      );
+    }
+    (resolved as { executor?: unknown }).executor = makeHttpCalloutExecutor({
+      serviceUrl: resolved.config.serviceUrl,
+      timeoutMs: resolved.config.serviceTimeoutMs,
+      authHeader: resolved.config.serviceAuthHeader || undefined,
+      contentType: resolved.config.serviceContentType,
+    });
+    app.post("/v1/job", express.json({ limit: "1mb" }), makeCustomHandler(resolved));
+    app.get("/v1/job/:jobId", makeGetCustomJobHandler(resolved));
   } else if (resolved.config.capabilityKind === "chat-session") {
     const chat = makeChatSessionHandlers(resolved);
     app.post("/v1/chat/start", chat.start);
