@@ -85,4 +85,4 @@ HEALTHCHECK --interval=20s --timeout=5s --start-period=15s --retries=3 \
 
 # tsx is hoisted to /repo/node_modules/.bin by pnpm — invoke via the workspace bin.
 ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["node_modules/.bin/tsx", "supplier/src/index.ts"]
+CMD ["node_modules/.bin/tsx", "agent/src/index.ts"]

@@ -17,6 +17,11 @@
  * `Executor.execute` call against the operator's black box (the template's
  * single integration seam). Everything else is the proven money path.
  *
+ * Step 2's deadline is min(SERVICE_TIMEOUT_MS, escrowDatum.deliver_by - now):
+ * a job claimed late in its window gets a correspondingly smaller executor
+ * budget, so it cannot burn the full configured timeout and then miss the
+ * on-chain deliver_by deadline on Submit.
+ *
  * The function NEVER throws — all errors are captured into jobs.fail.
  *
  * Wire contract (the buyer must compute the same two hashes):
@@ -72,10 +77,15 @@ export async function runCustomJob(params: RunCustomJobParams): Promise<void> {
     let inference: { content: string; prompt_tokens: number; completion_tokens: number; wallclock_ms: number };
     try {
       const started = Date.now();
+      // Cap the budget at whatever remains before the escrow's deliver_by,
+      // not just the configured service timeout - a job claimed late in its
+      // window must not burn the full SERVICE_TIMEOUT_MS and then miss the
+      // on-chain Submit deadline.
+      const deadlineMs = Math.min(deps.config.serviceTimeoutMs, escrowDatum.deliver_by - started);
       const result = await params.executor.execute({
         capabilityId: advert.capability_id,
         requestPayload: requestBody.payload,
-        deadlineMs: deps.config.serviceTimeoutMs,
+        deadlineMs,
         jobRef: escrowRef,
       });
       inference = {

@@ -549,14 +549,13 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
 
   // ADVERT_MAX_PROCESSING_MS — the advertised SLA. Required for the custom
   // kind (the boot guard in createApp compares SERVICE_TIMEOUT_MS against it
-  // and refuses to start when the service budget cannot nest inside the SLA);
-  // optional elsewhere, where 0 means "not declared to this process".
-  const advertMaxProcessingMsStr =
-    capabilityKind === "custom"
-      ? requireField(env, "ADVERT_MAX_PROCESSING_MS")
-      : (env.ADVERT_MAX_PROCESSING_MS ?? "");
+  // and refuses to start when the service budget cannot nest inside the SLA).
+  // Parsed and validated ONLY when capabilityKind="custom" — other kinds
+  // never read this var before "custom" existed, so a stray/garbage value
+  // left in a shared .env must not break their boot. 0 = not declared.
   let advertMaxProcessingMs = 0;
-  if (advertMaxProcessingMsStr !== "") {
+  if (capabilityKind === "custom") {
+    const advertMaxProcessingMsStr = requireField(env, "ADVERT_MAX_PROCESSING_MS");
     if (!POS_INT_RE.test(advertMaxProcessingMsStr)) {
       throw new Error("loadConfig: ADVERT_MAX_PROCESSING_MS must be a positive integer");
     }

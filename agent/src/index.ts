@@ -87,9 +87,13 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 }
 
-// Only run when executed directly (not when imported by tests).
+// Only run when executed directly (not when imported by tests). Matches both
+// the pre-rename "supplier/" path (upstream) and the "agent/" path this
+// template renames it to, so main() runs under either tree shape.
 const isDirectRun = process.argv[1]?.endsWith("supplier/src/index.ts")
-  || process.argv[1]?.endsWith("supplier/dist/index.js");
+  || process.argv[1]?.endsWith("supplier/dist/index.js")
+  || process.argv[1]?.endsWith("agent/src/index.ts")
+  || process.argv[1]?.endsWith("agent/dist/index.js");
 if (isDirectRun) {
   main().catch((err) => {
     // eslint-disable-next-line no-console

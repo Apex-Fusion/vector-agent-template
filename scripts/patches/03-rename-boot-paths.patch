@@ -1,0 +1,30 @@
+diff --git a/agent/Dockerfile b/agent/Dockerfile
+index 1887adc..ce01c30 100644
+--- a/agent/Dockerfile
++++ b/agent/Dockerfile
+@@ -85,4 +85,4 @@ HEALTHCHECK --interval=20s --timeout=5s --start-period=15s --retries=3 \
+ 
+ # tsx is hoisted to /repo/node_modules/.bin by pnpm — invoke via the workspace bin.
+ ENTRYPOINT ["/sbin/tini", "--"]
+-CMD ["node_modules/.bin/tsx", "supplier/src/index.ts"]
++CMD ["node_modules/.bin/tsx", "agent/src/index.ts"]
+diff --git a/agent/src/index.ts b/agent/src/index.ts
+index 4404f71..bf1b4f0 100644
+--- a/agent/src/index.ts
++++ b/agent/src/index.ts
+@@ -87,9 +87,13 @@ async function main(): Promise<void> {
+   process.on("SIGTERM", () => shutdown("SIGTERM"));
+ }
+ 
+-// Only run when executed directly (not when imported by tests).
++// Only run when executed directly (not when imported by tests). Matches both
++// the pre-rename "supplier/" path (upstream) and the "agent/" path this
++// template renames it to, so main() runs under either tree shape.
+ const isDirectRun = process.argv[1]?.endsWith("supplier/src/index.ts")
+-  || process.argv[1]?.endsWith("supplier/dist/index.js");
++  || process.argv[1]?.endsWith("supplier/dist/index.js")
++  || process.argv[1]?.endsWith("agent/src/index.ts")
++  || process.argv[1]?.endsWith("agent/dist/index.js");
+ if (isDirectRun) {
+   main().catch((err) => {
+     // eslint-disable-next-line no-console

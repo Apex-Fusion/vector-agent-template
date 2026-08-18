@@ -55,4 +55,13 @@ describe("CAPABILITY_KIND=custom", () => {
     const c = loadConfig({ ...BASE, CAPABILITY_KIND: "chat", OLLAMA_URL: "http://127.0.0.1:11434" });
     expect(c.advertMaxProcessingMs).toBe(0);
   });
+  it("ignores a garbage ADVERT_MAX_PROCESSING_MS for non-custom kinds (parse is scoped to custom)", () => {
+    const c = loadConfig({
+      ...BASE,
+      CAPABILITY_KIND: "chat",
+      OLLAMA_URL: "http://127.0.0.1:11434",
+      ADVERT_MAX_PROCESSING_MS: "not-a-number",
+    });
+    expect(c.advertMaxProcessingMs).toBe(0);
+  });
 });

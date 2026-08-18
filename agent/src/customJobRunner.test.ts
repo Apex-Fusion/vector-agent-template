@@ -14,6 +14,9 @@
  *   3. the runner NEVER rejects (non-ExecutorError, submit failure included).
  *   4. wire contract: response_hash === sha256(utf8(outputPayload)) — no
  *      canonicalisation, no wrapping. The buyer side hashes the same bytes.
+ *   5. deadline: executor deadlineMs = min(serviceTimeoutMs, deliver_by -
+ *      now) — a job whose escrow deliver_by is near-now gets a smaller
+ *      budget than the configured service timeout.
  */
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
@@ -70,8 +73,11 @@ const advert = {
   model: "echo-service-v1",
 } as unknown as AdvertDatum;
 
+// deliver_by defaults far in the future so tests that don't care about the
+// deadline cap (test 5 below) see deadlineMs === serviceTimeoutMs unchanged.
 const escrowDatum = {
   prompt_hash: "ab".repeat(32),
+  deliver_by: Date.now() + 24 * 60 * 60 * 1000,
 } as unknown as EscrowDatum;
 
 const supplierKey: WalletKey = {
@@ -84,7 +90,11 @@ const supplierKey: WalletKey = {
 let jobs: FakeJobStore;
 let state: SupplierState;
 
-function makeParams(executor: Executor, overrides: Partial<SupplierConfig> = {}): RunCustomJobParams {
+function makeParams(
+  executor: Executor,
+  overrides: Partial<SupplierConfig> = {},
+  escrowOverrides: Partial<EscrowDatum> = {},
+): RunCustomJobParams {
   const chain = { awaitTx: vi.fn(async () => undefined) } as unknown as ChainProvider;
   const config = { serviceTimeoutMs: 5_000, ...overrides } as unknown as SupplierConfig;
   return {
@@ -100,7 +110,7 @@ function makeParams(executor: Executor, overrides: Partial<SupplierConfig> = {})
     escrowRef: ESCROW_REF,
     claimedRef: CLAIMED_REF,
     advert,
-    escrowDatum,
+    escrowDatum: { ...escrowDatum, ...escrowOverrides },
     requestBody: { payload: '{"in":1}' },
   };
 }
@@ -146,6 +156,25 @@ describe("runCustomJob", () => {
       deadlineMs: 7_000,
       jobRef: ESCROW_REF,
     });
+  });
+
+  it("caps the executor deadline at the escrow deliver_by when it is sooner than the service timeout", async () => {
+    const seen: ExecutorJob[] = [];
+    const executor = fakeExecutor(async (job) => {
+      seen.push(job);
+      return { outputPayload: "out" };
+    });
+    const deliverBy = Date.now() + 2_000;
+
+    await runCustomJob(
+      makeParams(executor, { serviceTimeoutMs: 30_000 }, { deliver_by: deliverBy }),
+    );
+
+    expect(seen).toHaveLength(1);
+    // Claimed 2s before deliver_by, so the budget must be capped well under
+    // the 30s serviceTimeoutMs — never the constant configured value.
+    expect(seen[0].deadlineMs).toBeGreaterThan(0);
+    expect(seen[0].deadlineMs).toBeLessThanOrEqual(2_000);
   });
 
   it("hashes the raw output bytes into response_hash (wire contract, no normalisation)", async () => {

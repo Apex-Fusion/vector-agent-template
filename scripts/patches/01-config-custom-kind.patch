@@ -1,5 +1,5 @@
 diff --git a/agent/src/config.ts b/agent/src/config.ts
-index 0ed01b1..c057635 100644
+index 0ed01b1..47a57b0 100644
 --- a/agent/src/config.ts
 +++ b/agent/src/config.ts
 @@ -86,7 +86,7 @@ export interface AdvertRef {
@@ -65,7 +65,7 @@ index 0ed01b1..c057635 100644
      // Multi-turn chat streams via callOpenAiStream, which only speaks the
      // OpenAI-compatible wire format — so chat-session is openai-only.
      if (llmBackend !== "openai") {
-@@ -508,6 +534,35 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+@@ -508,6 +534,34 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
    }
    const revisionProbeMode: RevisionProbeMode = probeModeStr;
  
@@ -84,14 +84,13 @@ index 0ed01b1..c057635 100644
 +
 +  // ADVERT_MAX_PROCESSING_MS — the advertised SLA. Required for the custom
 +  // kind (the boot guard in createApp compares SERVICE_TIMEOUT_MS against it
-+  // and refuses to start when the service budget cannot nest inside the SLA);
-+  // optional elsewhere, where 0 means "not declared to this process".
-+  const advertMaxProcessingMsStr =
-+    capabilityKind === "custom"
-+      ? requireField(env, "ADVERT_MAX_PROCESSING_MS")
-+      : (env.ADVERT_MAX_PROCESSING_MS ?? "");
++  // and refuses to start when the service budget cannot nest inside the SLA).
++  // Parsed and validated ONLY when capabilityKind="custom" — other kinds
++  // never read this var before "custom" existed, so a stray/garbage value
++  // left in a shared .env must not break their boot. 0 = not declared.
 +  let advertMaxProcessingMs = 0;
-+  if (advertMaxProcessingMsStr !== "") {
++  if (capabilityKind === "custom") {
++    const advertMaxProcessingMsStr = requireField(env, "ADVERT_MAX_PROCESSING_MS");
 +    if (!POS_INT_RE.test(advertMaxProcessingMsStr)) {
 +      throw new Error("loadConfig: ADVERT_MAX_PROCESSING_MS must be a positive integer");
 +    }
@@ -101,7 +100,7 @@ index 0ed01b1..c057635 100644
    const piperTimeoutStr = env.PIPER_TIMEOUT_MS;
    let piperTimeoutMs = 120_000;
    if (piperTimeoutStr !== undefined && piperTimeoutStr !== "") {
-@@ -563,6 +618,11 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+@@ -563,6 +617,11 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
      hfModelRevision,
      revisionProbeUrl,
      revisionProbeMode,
