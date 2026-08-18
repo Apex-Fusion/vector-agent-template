@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# supplier/Dockerfile — multi-stage image for the supplier node.
+# agent/Dockerfile — multi-stage image for the supplier node.
 #
 # Strategy: install workspace deps in a builder stage, then ship the source
 # tree + node_modules to a slim runtime stage that runs the entry point with
@@ -11,7 +11,7 @@
 # tsx is what apex-dashboard does and matches that working pattern.
 #
 # Build context MUST be the repo root so pnpm can resolve workspace deps:
-#   docker build -f supplier/Dockerfile -t marketplace-supplier .
+#   docker build -f agent/Dockerfile -t marketplace-supplier .
 #
 # Base image: node:20-alpine. Supplier has no native compile dependencies
 # (@noble/ed25519, express, cbor-x are pure JS). Stay on alpine for size.
@@ -25,16 +25,16 @@ WORKDIR /repo
 # pnpm via corepack — lockfile pins pnpm@10.33.2.
 RUN corepack enable && corepack prepare pnpm@10.33.2 --activate
 
-# Workspace manifests first to maximise layer cache reuse.
-COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json .npmrc ./
-# pnpm-lock.yaml's patchedDependencies hash the patch files at install time.
-COPY patches ./patches
+# Workspace manifests first to maximise layer cache reuse. This template
+# vendors only packages/shared + agent (ex-supplier) — no root .npmrc, no
+# patches/ dir (pnpm-lock.yaml here has no patchedDependencies), and no
+# buyer/ or indexer/ siblings (this workspace's lockfile importers are only
+# ".", "agent", "packages/shared" — confirmed via pnpm-lock.yaml), unlike the
+# full upstream monorepo this Dockerfile was vendored from. Omitted rather
+# than COPYing paths that don't exist in this repo.
+COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
 COPY packages/shared/package.json ./packages/shared/package.json
-COPY supplier/package.json ./supplier/package.json
-# Buyer + indexer manifests are needed because pnpm-lock.yaml indexes the
-# whole workspace. They are referenced but not installed (--filter excludes).
-COPY buyer/package.json ./buyer/package.json
-COPY indexer/package.json ./indexer/package.json
+COPY agent/package.json ./agent/package.json
 
 # Install only what supplier needs (and its transitive workspace deps).
 RUN pnpm install --frozen-lockfile --filter '@marketplace/supplier...'
@@ -50,12 +50,37 @@ RUN set -e \
  && cp "$SRC" "$DST/" \
  && echo "patched libsodium wrapper: $DST/libsodium-sumo.mjs"
 
-# Copy the actual source — shared + supplier + Aiken blueprint (loadBlueprint
-# reads contracts/marketplace/plutus.json at runtime to derive escrow addr +
-# attach the spending validator script in M1-F-4 live-CBOR builders).
+# Copy the actual source — shared + agent. NOTE: the Aiken blueprint
+# (contracts/marketplace/plutus.json, which loadBlueprint() reads to derive
+# the escrow address + attach the spending validator script in the live-CBOR
+# builders) is NOT vendored into this template — that contracts/ workspace
+# isn't part of this repo. loadBlueprint() is only called lazily, inside
+# live-chain builders (buildClaimTx/buildSubmitTx/postEscrow et al.), never
+# at import or boot time, so its absence here doesn't block build or boot;
+# it only surfaces if a LIVE_CHAIN=1 deployment actually exercises one of
+# those builders, and that deployment must supply the file separately.
 COPY packages/shared ./packages/shared
-COPY supplier ./supplier
-COPY contracts/marketplace/plutus.json ./contracts/marketplace/plutus.json
+COPY agent ./agent
+
+# Defence-in-depth against a leaked HOST node_modules: on at least one
+# Docker Desktop + Windows-host combination, the two source COPYs above were
+# observed to pull in a locally-installed agent/node_modules or
+# packages/shared/node_modules from the build context DESPITE the root
+# .dockerignore listing "node_modules" — reproduced with a full
+# `docker builder prune -af` in between, so it was not a stale-cache
+# artifact. COPY MERGES into an already-existing destination directory
+# rather than replacing it, so this silently overlaid the correct,
+# container-native node_modules the `pnpm install` above already produced
+# with the host's own copy — which carries host-OS-specific pnpm symlinks
+# (e.g. absolute Windows paths) that do not resolve inside this Linux image,
+# breaking module resolution at runtime even though the build itself still
+# exits 0. Fix: wipe whatever the COPYs may have overlaid, then re-run the
+# SAME install command — idempotent and near-instant here since every
+# package is already resolved into the local store from the first run — so
+# the final node_modules is deterministically the correct, freshly-linked
+# one regardless of what the build context happened to contain.
+RUN rm -rf ./agent/node_modules ./packages/shared/node_modules \
+ && pnpm install --frozen-lockfile --filter '@marketplace/supplier...'
 
 # ─── runtime ──────────────────────────────────────────────────────────────
 FROM node:${NODE_VERSION}-alpine AS runtime

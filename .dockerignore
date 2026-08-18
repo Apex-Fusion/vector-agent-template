@@ -1,0 +1,25 @@
+# .dockerignore — repo-root build context ignore file. Primary gate for
+# `docker build -f agent/Dockerfile .` (repo root is the documented build
+# context — see agent/Dockerfile's header comment). agent/.dockerignore is
+# a defence-in-depth duplicate for the (undocumented, unused) case of
+# building with ./agent as the context directly.
+#
+# node_modules is the critical entry here: without it, `COPY agent ./agent`
+# and `COPY packages/shared ./packages/shared` pull in the HOST's own
+# locally-installed node_modules (host-OS-specific symlinks — e.g. absolute
+# Windows paths on a Windows dev box) on top of the image's own, correct,
+# freshly `pnpm install`-ed node_modules from the builder stage, silently
+# breaking module resolution at runtime (the build itself still exits 0).
+
+node_modules
+dist
+*.tsbuildinfo
+.vitest-cache
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+.git
+tests/
+**/*.test.ts
