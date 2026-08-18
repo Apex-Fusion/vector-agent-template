@@ -71,6 +71,25 @@ importers:
         specifier: ^5.7.2
         version: 5.9.3
 
+  try-it:
+    dependencies:
+      '@marketplace/shared':
+        specifier: workspace:*
+        version: link:../packages/shared
+      '@noble/ed25519':
+        specifier: ^2.1.0
+        version: 2.3.0
+      '@noble/hashes':
+        specifier: ^1.8.0
+        version: 1.8.0
+      bech32:
+        specifier: ^2.0.0
+        version: 2.0.0
+    devDependencies:
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+
 packages:
 
   '@anastasia-labs/cardano-multiplatform-lib-browser@6.0.2-2':
