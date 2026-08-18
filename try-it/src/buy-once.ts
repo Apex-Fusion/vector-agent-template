@@ -45,7 +45,9 @@
  * confident, wrong validity ranges (PastHorizon) instead of an error.
  */
 
-import { readFileSync } from "fs";
+import { existsSync, readFileSync } from "fs";
+import { dirname, resolve } from "path";
+import { fileURLToPath } from "url";
 import { createHash } from "crypto";
 import * as ed from "@noble/ed25519";
 import { blake2b } from "@noble/hashes/blake2b";
@@ -237,6 +239,25 @@ function refStr(ref: OutputReference): string {
   return `${ref.txHash}#${ref.index}`;
 }
 
+/**
+ * Both live builders we call (PostEscrow via `loadBlueprint`, Accept via
+ * `loadEscrowScript`) read the compiled validator blueprint from
+ * `<repo>/contracts/marketplace/plutus.json`, resolved relative to the shared
+ * package - and this template deliberately does not vendor the Aiken
+ * `contracts/` workspace. Checking first turns a mid-flight ENOENT into one
+ * sentence that says what to put where. Nothing is submitted before this runs,
+ * so a miss costs nothing but the trip.
+ */
+function preflightBlueprint(): void {
+  const path = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "contracts", "marketplace", "plutus.json");
+  if (!existsSync(path)) {
+    throw new BuyError(
+      "blueprint_missing",
+      `${path} not found — the escrow tx builders need the compiled validator blueprint. Copy contracts/marketplace/plutus.json from the marketplace contracts repo (it must be the build the advert's network runs) and retry`,
+    );
+  }
+}
+
 function log(line: string): void {
   process.stderr.write(`${line}\n`);
 }
@@ -409,6 +430,9 @@ export async function main(argv: string[], env: Record<string, string | undefine
   process.env.VECTOR_ZERO_TIME_MS = String(cfg.zeroTimeMs);
 
   try {
+    // ── 0. Can we even build the txs? ─────────────────────────────────────
+    preflightBlueprint();
+
     // ── 1. Payload -> the exact bytes both sides commit to ────────────────
     let payloadText: string;
     try {
