@@ -21,6 +21,14 @@ fi
 git -C "$UPSTREAM" fetch origin main --quiet
 PIN=$(git -C "$UPSTREAM" rev-parse "$REF")
 
+# agent/.env (or any other real, non-.example env file) holds live secrets
+# that only ever live in the working tree - git never tracks them. The wipe
+# below would delete them silently, so refuse first unless opted out.
+if ls "$ROOT"/agent/.env* 2>/dev/null | grep -qv '\.example$'; then
+  echo "WARNING: untracked env files under agent/ will be deleted by re-vendoring - move them first" >&2
+  [ "${FORCE_SYNC:-0}" = "1" ] || exit 1
+fi
+
 rm -rf "$ROOT/packages/shared" "$ROOT/agent" "$ROOT/contracts/marketplace/plutus.json"
 mkdir -p "$ROOT/packages"
 git -C "$UPSTREAM" archive "$REF" packages/shared | tar -x -C "$ROOT"
