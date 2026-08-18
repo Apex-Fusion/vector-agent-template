@@ -1,0 +1,21 @@
+{
+  "capability_id": "ocr.page.extract.chandra-ocr-2.v1",
+  "weights_source": "hf:datalab-to/chandra-ocr-2",
+  "model_revision": "<40-hex commit SHA; self-hosted (OCR_UPSTREAM=openai-vision) deployments only — the Datalab-hosted default (OCR_UPSTREAM=datalab) is a third-party API with no pinnable checkpoint, so this is unset there>",
+  "license": "modified OpenRAIL-M (weights); Apache-2.0 (code)",
+  "request_shape": {
+    "route": "POST /v1/ocr/extract",
+    "body": { "image_b64": "plain base64, no data: prefix", "mime": "image/png | image/jpeg | image/webp", "output_format": "markdown | html | json" },
+    "one_page_per_job": true
+  },
+  "receipt": {
+    "schema": "v1 (8 fields, Ed25519-signed)",
+    "response_hash": "sha256(canonical({content, output_format}))",
+    "verify": "GET /capability → pub_key_hex; verify signature over canonical(receipt)"
+  },
+  "revision_probe": {
+    "route": "<runtime info route reporting the loaded checkpoint; self-hosted (openai-vision) upstream only>",
+    "policy": "self-hosted (OCR_UPSTREAM=openai-vision) upstream: probe before every Claim, mismatch refuses the job. Datalab-hosted default (OCR_UPSTREAM=datalab): per-job liveness probe only, no checkpoint pin."
+  },
+  "operator_disclosure": "first-party (HAL8-operated supplier)"
+}

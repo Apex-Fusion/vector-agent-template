@@ -1,0 +1,17 @@
+# supplier/.dockerignore — only consulted if `docker build` uses ./supplier
+# as its context. The project's documented build invocation uses the repo
+# root, so the top-level .dockerignore is the primary gate. This file is a
+# defence-in-depth duplicate.
+
+node_modules
+dist
+*.tsbuildinfo
+.vitest-cache
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+.git
+tests/
+**/*.test.ts

@@ -1,0 +1,27 @@
+{
+  "name": "@marketplace/supplier",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "tx:gen-keypair": "tsx src/cli/gen-keypair.ts",
+    "tx:post-advert": "tsx src/cli/post-advert.ts",
+    "tx:retire-advert": "tsx src/cli/retire-advert.ts",
+    "tx:publish-reference-scripts": "tsx src/cli/publish-reference-scripts.ts",
+    "tx:consolidate-wallet": "tsx src/cli/consolidate-wallet.ts"
+  },
+  "dependencies": {
+    "@marketplace/shared": "workspace:*",
+    "@noble/ed25519": "^2.1.0",
+    "@noble/hashes": "^1.8.0",
+    "bech32": "^2.0.0",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/supertest": "^6.0.2",
+    "supertest": "^7.0.0",
+    "typescript": "^5.7.2"
+  }
+}
