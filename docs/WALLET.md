@@ -23,6 +23,12 @@ Claim, Submit, and Accept traffic fragments a wallet into more and smaller UTxOs
 
 That consolidation is deliberately conservative. It halts itself (logging loudly once) if it ever consolidates three times in a row without reaching a healthy shape, or more than six times inside any 24-hour window, and stays halted until you consolidate by hand and restart the agent. Those two circuit breakers exist because an earlier version of this exact mechanism had neither: a non-idempotent health check made every single tick consolidate, and it burned real AP3X in fees continuously until the wallet ran dry. The guards are permanent; there's no config flag to turn them off.
 
+## Your keys are raw keypairs, and nothing can regenerate them
+
+`gen-keypair.ts` produces a raw ed25519 keypair, written once to stdout. It is deliberately simple: no BIP39 mnemonic, no HD derivation, no seed phrase. That has one hard consequence: **the JSON the command prints is the only copy of that wallet that will ever exist.** No phrase recovers it; no wallet app re-derives it. Store the file somewhere durable before the wallet holds anything, and treat a wallet whose key file is lost as gone, whatever its balance says on-chain.
+
+If you operate from an existing mnemonic-based wallet, keep it as your treasury and simply send AP3X from it to the template-generated addresses. The two systems coexist fine; just never confuse "I have the seed phrase for my treasury" with "I can recover the template's keys."
+
 ## Recovering stranded AP3X
 
 - **Escrow never claimed, or claimed but never submitted:** reclaims automatically to the buyer once deliver-by passes. No action needed beyond waiting; see `docs/LIFECYCLE.md`.
