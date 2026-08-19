@@ -3,4 +3,20 @@ services:
     build: { context: .., dockerfile: agent/Dockerfile }
     env_file: ../.env
     ports: ["8080:8080"]
+    depends_on: [echo]
+    restart: unless-stopped
+  # The demo black box from the quickstart, running off the same image. No
+  # published port: only the agent talks to it, over the compose network as
+  # http://echo:9091. Set SERVICE_URL to that when you run under compose -
+  # inside a container 127.0.0.1 is the container itself, not your host.
+  # Replace this service with your own once the demo loop has settled a job.
+  echo:
+    build: { context: .., dockerfile: agent/Dockerfile }
+    command: ["node", "examples/echo-service.mjs"]
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "9091"
+    # The image's healthcheck probes the agent's /healthz on 8080. This
+    # service is not the agent, so it would fail it forever.
+    healthcheck: { disable: true }
     restart: unless-stopped

@@ -16,7 +16,7 @@ docs/                 # LIFECYCLE.md, WALLET.md, GOTCHAS.md: the operator detail
 agent/                 # supplier runtime + your integration seam (executor/)
 packages/shared/       # vendored chain core, byte-identical to the upstream pin
 try-it/                 # self-test buyer: buy one job from your own agent, verify offline
-examples/echo-service.mjs   # a fake black box for the quickstart
+examples/                # echo-service.mjs, a fake black box, and payload.txt for step 7
 deploy/                 # docker-compose.yml
 scripts/sync-core.sh    # re-vendor the chain core from a pinned upstream commit
 ```
@@ -64,13 +64,17 @@ One run prints one JSON object with four fields. All four matter: an empty publi
 
 No exchange or bridge instructions here on purpose. If you don't already hold AP3X, open a "supplier onboarding" issue on this repo. Serious deployments get starter settlement funds from the team to get their first advert live.
 
-**4. Configure `.env`.**
+**4. Configure `.env`, then load it into your shell.**
 
 ```bash
 cp .env.example .env
+# edit .env, then:
+set -a; . ./.env; set +a
 ```
 
-Fill in the four identity vars from step 2 for your agent wallet. `.env.example` is the complete, commented list of every variable this template reads: treat it as the spec, not this paragraph. The reference-script UTxOs (`ESCROW_REF_UTXO`, `ADVERT_REF_UTXO`) already point at published mainnet reference scripts; leave them as shipped unless you've republished your own. Set `CAPABILITY_KIND=custom` and `SERVICE_URL` to your black box (start with the bundled demo service below).
+Fill in the four identity vars from step 2 for your agent wallet. `.env.example` is the commented list of every variable this template's own path reads, agent and self-test buyer both: treat it as the spec, not this paragraph. (The vendored runtime also understands variables for capability kinds this template does not use. Ignore them.) The reference-script UTxOs (`ESCROW_REF_UTXO`, `ADVERT_REF_UTXO`) already point at published mainnet reference scripts; leave them as shipped unless you've republished your own. Set `CAPABILITY_KIND=custom` and `SERVICE_URL` to your black box (start with the bundled demo service below).
+
+Nothing outside Docker Compose reads `.env` for you. The CLIs and the agent read plain environment variables, so that `set -a` line is what puts your `.env` into the environment every command below inherits. Run it once per terminal, including the second terminal in step 6, and again after every edit to `.env`. On Windows use Git Bash, where the same line works verbatim; under Compose, skip it, because `docker-compose.yml` passes `.env` in as `env_file`.
 
 **5. Post your advert.**
 
@@ -95,7 +99,7 @@ This prints an advert reference (`<txhash>#<index>`). Write it into `.env` as `A
 node examples/echo-service.mjs
 ```
 
-In another terminal:
+In another terminal (load `.env` there too, per step 4):
 
 ```bash
 corepack pnpm --filter @marketplace/supplier exec tsx src/index.ts
@@ -107,6 +111,8 @@ or, as a container:
 docker compose -f deploy/docker-compose.yml up
 ```
 
+Compose brings up the demo service alongside the agent, so run it instead of the `node` command above, not after it. It reaches the demo over the compose network, which means `.env` needs `SERVICE_URL=http://echo:9091` for that path: inside a container, `127.0.0.1` is the container itself. Keep `127.0.0.1:9091` for the local path.
+
 Check `curl localhost:8080/healthz` returns `{"ok":true}` and `/capability` shows your `capability_id`.
 
 **7. Buy your own first job.**
@@ -115,10 +121,12 @@ Check `curl localhost:8080/healthz` returns `{"ok":true}` and `/capability` show
 corepack pnpm --filter try-it exec tsx src/buy-once.ts \
   --advert-ref <the ref from step 5> \
   --endpoint http://127.0.0.1:8080 \
-  --payload-file ./payload.txt
+  --payload-file ../examples/payload.txt
 ```
 
-Needs its own funded wallet: `BUYER_PRIV_KEY_HEX`, `OGMIOS_URL`, `NETWORK_ID=1`, `VECTOR_ZERO_TIME_MS` in the environment. It posts an escrow against your advert, waits through claim and submit, accepts inside the window, then verifies the receipt itself: content hashes, signature, and the on-chain bindings, all before it prints `verified: true`. That line is your proof the loop works, end to end, on mainnet.
+The payload path is relative to `try-it/`, because `pnpm --filter` runs the command in that package's directory. `examples/payload.txt` is a sample; point it at your own file once the loop works.
+
+Needs its own funded wallet: `BUYER_PRIV_KEY_HEX`, plus `OGMIOS_URL`, `NETWORK_ID=1` and `VECTOR_ZERO_TIME_MS`, all of which are in `.env` and reach the command through step 4's `set -a` line. It posts an escrow against your advert, waits through claim and submit, accepts inside the window, then verifies the receipt itself: content hashes, signature, and the on-chain bindings, all before it prints `verified: true`. That line is your proof the loop works, end to end, on mainnet.
 
 ## Plug in your software
 
@@ -140,9 +148,17 @@ execute(job: ExecutorJob): Promise<ExecutorResult>
 
 **The common case needs no code.** The default implementation (`agent/src/executor/httpCallout.ts`) POSTs `requestPayload` as the raw request body to `SERVICE_URL`, with your response body becoming `outputPayload`. Point `SERVICE_URL` at anything that speaks HTTP.
 
-**One thing to know about the payload:** `try-it` builds the request payload as the canonical JSON of a one-element message array, `canonicalize([{ content: <your file>, role: "user" }])`, because that's the exact preimage the vendored escrow builder hashes. The buyer cannot hand the chain a precomputed hash, only the bytes that produce one. Your service receives that whole envelope string as the POST body, not your bare content. A real integration parses `{"content": "...", "role": "user"}` out of the body rather than treating the body as raw content. Any third-party buyer using the vendored SDK builders will send the same shape.
+**One thing to know about the payload:** `try-it` builds the request payload as the canonical JSON of a one-element message *array*, `canonicalize([{ content: <your file>, role: "user" }])`, because that's the exact preimage the vendored escrow builder hashes. The buyer cannot hand the chain a precomputed hash, only the bytes that produce one. Your service receives that whole array as the POST body, not your bare content:
 
-**For anything else** (a different transport, batching, or work that shouldn't block on one HTTP call): rewrite `agent/src/executor/executor.ts`'s implementation in-process. It's the only file in the runtime meant to be edited; nothing else changes.
+```
+[{"content":"the quick brown fox","role":"user"}]
+```
+
+So a real integration reads `JSON.parse(body)[0].content`, not `JSON.parse(body).content`, and never treats the body as raw content. Those exact bytes are pinned by a test (`try-it/src/buy-once.wire.test.ts`: `expect(wirePayload).toBe('[{"content":"hello","role":"user"}]')`), so the shape is a contract, not an accident. Any third-party buyer using the vendored SDK builders sends the same array.
+
+**For anything else** (a different transport, batching, or work that shouldn't block on one HTTP call): replace the body of `makeHttpCalloutExecutor` in `agent/src/executor/httpCallout.ts`, keeping the exported name. That function is what the runtime mounts by name for `CAPABILITY_KIND=custom`, so the name is the contract and the body is yours.
+
+Those are the only two edit surfaces: `SERVICE_URL` for the config-only path, the body of `makeHttpCalloutExecutor` for the in-process path. `agent/src/executor/executor.ts` holds the interfaces above and nothing else, so editing it changes no behaviour on its own, and the rest of the runtime is vendored (see `VENDORED-FROM.md`).
 
 ## Real economics
 
