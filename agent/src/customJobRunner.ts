@@ -97,9 +97,10 @@ export async function runCustomJob(params: RunCustomJobParams): Promise<void> {
     } catch (err) {
       const rawReason = err instanceof ExecutorError ? err.reason : "service_failure";
       const message = err instanceof Error ? err.message : String(err);
-      // *_timeout maps to httpStatus 502 here per Caroline's pin (the runner
-      // failure-code table only enumerates 502/*_failure). The narrower
-      // timeout reason is collapsed to the failure reason for jobs.fail.
+      // The runner's failure-code table only enumerates 502/*_failure, so the
+      // narrower *_timeout reasons collapse to their *_failure sibling before
+      // jobs.fail records them. The log line below keeps the raw reason, so
+      // the distinction survives for debugging.
       const collapsedReason =
         rawReason === "ollama_timeout" ? "ollama_failure"
           : rawReason === "openai_timeout" ? "openai_failure"
