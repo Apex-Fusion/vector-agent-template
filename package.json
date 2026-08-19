@@ -3,7 +3,9 @@
   "private": true,
   "license": "MIT",
   "packageManager": "pnpm@10.33.2",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test"
@@ -11,11 +13,12 @@
   "devDependencies": {
     "@types/node": "^25.6.0",
     "tsx": "^4.19.2",
-    "vitest": "^2.1.8"
+    "vitest": "^3.2.6"
   },
   "pnpm": {
     "overrides": {
-      "@lucid-evolution/lucid": "0.4.30"
+      "@lucid-evolution/lucid": "0.4.30",
+      "vite": "^6.4.3"
     }
   }
 }
