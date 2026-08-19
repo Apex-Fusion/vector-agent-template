@@ -11,7 +11,10 @@
  *     from an X-Escrow-Ref header and a `messages` array in the body);
  *   - prompt_hash check is sha256(utf8(payload)) — the raw request bytes, not
  *     a canonicalised message array;
- *   - the runner is `runCustomJob`, handed the mounted Executor.
+ *   - the runner is `runCustomJob`, handed the mounted Executor;
+ *   - one extra pre-Claim check the chat route has no equivalent for: the live
+ *     advert's max_processing_ms against the SLA this node was configured with
+ *     (step 3b), because the boot guard could only check the configured value.
  *
  * The private helpers `makeChatHandler` leans on (jsonError, parseEscrowRef,
  * sha256Hex, fetchActiveAdvert, the two regexes) are module-private in
@@ -107,6 +110,17 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
     // job runner) — the catch-all must only release its own acquisition.
     let acquiredRef: string | null = null;
     try {
+      // ── 0. The executor the mount attached ────────────────────────────
+      // Read once, narrowed here, so the runner call below takes a typed
+      // Executor instead of an `as` cast. createApp attaches it for
+      // capabilityKind="custom" and nothing else does, so an absent one is a
+      // misconfigured process, not a bad request: say so, and claim nothing.
+      const executor = deps.executor;
+      if (executor === undefined) {
+        return jsonError(res, 503, "executor_unavailable",
+          "no executor is mounted on this node");
+      }
+
       // ── 1+2. Body shape validation ────────────────────────────────────
       const body = (req.body ?? {}) as CustomBody;
       const escrowRefRaw = typeof body.escrow_ref === "string" ? body.escrow_ref : "";
@@ -131,6 +145,22 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
         return jsonError(res, e.status, e.reason, e.message);
       }
       const advert = advertResult.datum;
+
+      // ── 3b. The advert's REAL SLA against the declared one ────────────
+      // The boot guard nests SERVICE_TIMEOUT_MS inside ADVERT_MAX_PROCESSING_MS,
+      // which is what the operator DECLARED in config. Only the advert on chain
+      // binds: deliver_by is derived from its max_processing_ms, not from ours.
+      // If the live advert promises a tighter window than the declared one, the
+      // guard signed off on a budget this node cannot honour, and claiming the
+      // job would burn the bond on work that lands late. Refuse before the
+      // Claim, while nothing is at stake. Looser than declared is safe: the
+      // node simply finishes early.
+      if (advert.max_processing_ms < deps.config.advertMaxProcessingMs) {
+        return jsonError(res, 503, "advert_sla_mismatch",
+          `advert max_processing_ms ${advert.max_processing_ms} is tighter than the configured `
+          + `ADVERT_MAX_PROCESSING_MS ${deps.config.advertMaxProcessingMs}, which is what the boot `
+          + `guard checked SERVICE_TIMEOUT_MS against; re-post the advert or fix the config`);
+      }
 
       // ── 4. Resolve escrow UTxO ───────────────────────────────────────
       const escrowUtxo = await deps.chain.queryUtxo(escrowRef);
@@ -256,7 +286,7 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
           supplierKey: deps.supplierKey,
           jobs: deps.jobs,
         },
-        executor: deps.executor as Executor,
+        executor,
         jobId,
         escrowRef: escrowRefStr,
         claimedRef,

@@ -10,10 +10,16 @@
  * the route's own decode + hash-check logic runs unmodified up to the
  * prompt_hash comparison under test.
  *
- * Pin: a payload whose sha256 does not match the escrow datum's prompt_hash
- * is rejected 409 prompt_mismatch, BEFORE the supplier slot is acquired
- * (state.snapshot().activeSessions stays 0) and without falling through to
- * the Express error handler (next() never called).
+ * Pins:
+ *   1. a payload whose sha256 does not match the escrow datum's prompt_hash is
+ *      rejected 409 prompt_mismatch, BEFORE the supplier slot is acquired
+ *      (state.snapshot().activeSessions stays 0) and without falling through
+ *      to the Express error handler (next() never called).
+ *   2. a live advert whose max_processing_ms is TIGHTER than the configured
+ *      ADVERT_MAX_PROCESSING_MS is rejected 503 advert_sla_mismatch pre-Claim,
+ *      and a looser one is not (the check is deliberately one-sided).
+ *   3. a mount that attached no Executor answers 503 instead of claiming a job
+ *      it cannot run.
  */
 
 import { describe, it, expect, vi } from "vitest";
@@ -105,13 +111,16 @@ const escrowDatum: EscrowDatum = {
   state: "Open",
 };
 
-function makeChain(): ChainProvider {
+function makeChain(
+  advertPatch: Partial<AdvertDatum> = {},
+  escrowPatch: Partial<EscrowDatum> = {},
+): ChainProvider {
   const advertUtxo: Utxo = {
     ref: ADVERT_REF,
     address: "addr_test1_advert",
     lovelace: 0n,
     assets: {},
-    datumHex: encodeAdvertDatum(advert),
+    datumHex: encodeAdvertDatum({ ...advert, ...advertPatch }),
     scriptRef: null,
   };
   const escrowUtxo: Utxo = {
@@ -119,7 +128,7 @@ function makeChain(): ChainProvider {
     address: "addr_test1_escrow",
     lovelace: 0n,
     assets: {},
-    datumHex: encodeEscrowDatum(escrowDatum),
+    datumHex: encodeEscrowDatum({ ...escrowDatum, ...escrowPatch }),
     scriptRef: null,
   };
   return {
@@ -152,15 +161,22 @@ function makeReqRes(body: unknown) {
   return { req, res, captured };
 }
 
+/** The configured SLA matches the advert above unless a test says otherwise. */
+const config = {
+  advertRef: ADVERT_REF,
+  advertMaxProcessingMs: advert.max_processing_ms,
+} as unknown as SupplierConfig;
+
 describe("makeCustomHandler — prompt_hash check", () => {
   it("rejects 409 prompt_mismatch when sha256(payload) does not match the escrow's prompt_hash, without acquiring a slot", async () => {
     const state = new SupplierState(1);
     const deps: CustomRouteDeps = {
       chain: makeChain(),
       state,
-      config: { advertRef: ADVERT_REF } as unknown as SupplierConfig,
+      config,
       supplierKey,
       jobs: new JobStore(),
+      executor: { execute: vi.fn() },
     };
     const handler = makeCustomHandler(deps);
     const next = vi.fn();
@@ -179,6 +195,91 @@ describe("makeCustomHandler — prompt_hash check", () => {
     expect(next).not.toHaveBeenCalled();
     // The slot must never be acquired for a request rejected before Claim —
     // confirms the mismatch is caught ahead of any state mutation.
+    expect(state.snapshot().activeSessions).toBe(0);
+  });
+});
+
+describe("makeCustomHandler — advert SLA against the configured one", () => {
+  // The boot guard can only check ADVERT_MAX_PROCESSING_MS, the value the
+  // operator declared. Only the advert on chain binds: deliver_by comes from
+  // its max_processing_ms. An advert tighter than the declared SLA means the
+  // node's service budget no longer fits the window, so claiming would burn
+  // the bond on a job that lands late.
+  function depsWith(
+    advertPatch: Partial<AdvertDatum>,
+    escrowPatch: Partial<EscrowDatum> = {},
+  ): { deps: CustomRouteDeps; state: SupplierState } {
+    const state = new SupplierState(1);
+    return {
+      state,
+      deps: {
+        chain: makeChain(advertPatch, escrowPatch),
+        state,
+        config,
+        supplierKey,
+        jobs: new JobStore(),
+        executor: { execute: vi.fn() },
+      },
+    };
+  }
+
+  it("rejects 503 when the live advert's max_processing_ms is tighter than the configured SLA, before any Claim", async () => {
+    // A payload whose hash DOES match the escrow, so the only thing left to
+    // reject on is the SLA.
+    const payload = "matching payload";
+    const { deps, state } = depsWith(
+      { max_processing_ms: 120_000 },
+      { prompt_hash: sha256Hex(payload) },
+    );
+    const next = vi.fn();
+    const { req, res, captured } = makeReqRes({ escrow_ref: ESCROW_REF_STR, payload });
+
+    await makeCustomHandler(deps)(req, res, next as unknown as NextFunction);
+
+    expect(captured.statusCode).toBe(503);
+    expect(captured.body).toMatchObject({ reason: "advert_sla_mismatch" });
+    expect((captured.body as { message: string }).message).toContain("120000");
+    expect((captured.body as { message: string }).message).toContain("300000");
+    expect(next).not.toHaveBeenCalled();
+    expect(state.snapshot().activeSessions).toBe(0);
+  });
+
+  it("accepts an advert looser than the configured SLA (the node just finishes early)", async () => {
+    // Proves the check is one-sided. A looser advert must fall through to the
+    // ordinary path; here the escrow's prompt_hash still mismatches, so the
+    // request lands on 409 rather than the 503 above.
+    const { deps } = depsWith({ max_processing_ms: 600_000 });
+    const next = vi.fn();
+    const { req, res, captured } = makeReqRes({
+      escrow_ref: ESCROW_REF_STR,
+      payload: "this payload does not hash to the escrow's prompt_hash",
+    });
+
+    await makeCustomHandler(deps)(req, res, next as unknown as NextFunction);
+
+    expect(captured.statusCode).toBe(409);
+    expect(captured.body).toMatchObject({ reason: "prompt_mismatch" });
+  });
+});
+
+describe("makeCustomHandler — executor presence", () => {
+  it("rejects 503 rather than claiming a job it has no executor to run", async () => {
+    const state = new SupplierState(1);
+    const deps: CustomRouteDeps = {
+      chain: makeChain(),
+      state,
+      config,
+      supplierKey,
+      jobs: new JobStore(),
+      // executor deliberately absent: a mount that never attached one
+    };
+    const next = vi.fn();
+    const { req, res, captured } = makeReqRes({ escrow_ref: ESCROW_REF_STR, payload: "anything" });
+
+    await makeCustomHandler(deps)(req, res, next as unknown as NextFunction);
+
+    expect(captured.statusCode).toBe(503);
+    expect(captured.body).toMatchObject({ reason: "executor_unavailable" });
     expect(state.snapshot().activeSessions).toBe(0);
   });
 });

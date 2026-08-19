@@ -18,8 +18,26 @@ if [ -n "$DIRTY" ]; then
   exit 1
 fi
 
+# Only origin/main is fetched, because that is the ref this template tracks by
+# default. Any other <ref> - a tag, another branch, a bare commit - has to be
+# present in the clone already, or the rev-parse below fails and nothing is
+# touched. Fetch it yourself first if you are pinning to something else.
 git -C "$UPSTREAM" fetch origin main --quiet
 PIN=$(git -C "$UPSTREAM" rev-parse "$REF")
+
+# The pin this tree currently sits on, read out of VENDORED-FROM.md before that
+# file is rewritten at the end of this run. It is what makes "template-owned
+# addition" decidable further down: a path the PREVIOUS pin did not have was
+# never upstream's, so it is ours to restore. Without it, every missing path
+# looks the same and an upstream deletion gets silently resurrected.
+PREV_PIN=$(sed -n 's/.*at commit `\([0-9a-f]\{40\}\)`.*/\1/p' "$ROOT/VENDORED-FROM.md" 2>/dev/null | head -1)
+if [ -n "$PREV_PIN" ] && git -C "$UPSTREAM" cat-file -e "${PREV_PIN}^{commit}" 2>/dev/null; then
+  PREV_PATHS=$(git -C "$UPSTREAM" ls-tree -r --name-only "$PREV_PIN" -- supplier packages/shared \
+    | sed 's|^supplier/|agent/|')
+else
+  PREV_PATHS=""
+  echo "sync-core: no previous pin resolvable from VENDORED-FROM.md - restoring every deleted tracked path (pre-2026-08 behaviour)" >&2
+fi
 
 # agent/.env (or any other real, non-.example env file) holds live secrets
 # that only ever live in the working tree - git never tracks them. The wipe
@@ -29,7 +47,10 @@ if ls "$ROOT"/agent/.env* 2>/dev/null | grep -qv '\.example$'; then
   [ "${FORCE_SYNC:-0}" = "1" ] || exit 1
 fi
 
-rm -rf "$ROOT/packages/shared" "$ROOT/agent" "$ROOT/contracts/marketplace/plutus.json"
+# "$ROOT/supplier" is not a typo: a run that dies between the archive extract
+# and the mv below leaves the upstream directory name behind, and the next run
+# would then extract on top of it and mv a merged tree into place.
+rm -rf "$ROOT/packages/shared" "$ROOT/agent" "$ROOT/supplier" "$ROOT/contracts/marketplace/plutus.json"
 mkdir -p "$ROOT/packages"
 git -C "$UPSTREAM" archive "$REF" packages/shared | tar -x -C "$ROOT"
 # supplier/ -> agent/ is the single path rename this template owns.
@@ -51,8 +72,22 @@ git -C "$UPSTREAM" archive "$REF" contracts/marketplace/plutus.json | tar -x -C 
 # scripts/patches/ recreates them. Restore exactly what the wipe deleted, by
 # path, from the index: never a blanket `checkout -- agent`, which would also
 # revert genuinely new upstream content and hide the re-vendor.
+#
+# Restore ONLY the template's own additions. Every path missing after the
+# re-vendor is absent from the NEW ref by construction, so the new ref cannot
+# tell the two cases apart; the PREVIOUS pin can. A path the previous pin also
+# lacked was never upstream's, so it is a template addition and gets restored.
+# A path the previous pin HAD is an upstream deletion at the new ref, and
+# checking it back out would silently keep a file the pin no longer ships, in a
+# tree whose whole promise is that it matches its pin. Report those instead.
+# The one path rename this template owns (supplier/ -> agent/) is applied to
+# the upstream listing before comparing.
 git -C "$ROOT" diff --name-only --diff-filter=D -- agent packages/shared | while read -r deleted; do
-  git -C "$ROOT" checkout -- "$deleted"
+  if printf '%s\n' "$PREV_PATHS" | grep -qxF -- "$deleted"; then
+    echo "sync-core: $deleted was upstream at ${PREV_PIN:0:12} and is gone at ${PIN:0:12} - left deleted (upstream removed it)" >&2
+  else
+    git -C "$ROOT" checkout -- "$deleted"
+  fi
 done
 
 # Re-apply template-owned patches to vendored files. Conflict = hard stop.

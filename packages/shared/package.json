@@ -14,7 +14,8 @@
     "./tx/server": "./src/tx/server.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run src"
   },
   "devDependencies": {
     "cbor-x": "^1.5.4",

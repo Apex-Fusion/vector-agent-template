@@ -17,10 +17,12 @@
  * `Executor.execute` call against the operator's black box (the template's
  * single integration seam). Everything else is the proven money path.
  *
- * Step 2's deadline is min(SERVICE_TIMEOUT_MS, escrowDatum.deliver_by - now):
+ * Step 2's deadline is min(SERVICE_TIMEOUT_MS, deliver_by - now - SUBMIT_RESERVE_MS):
  * a job claimed late in its window gets a correspondingly smaller executor
  * budget, so it cannot burn the full configured timeout and then miss the
- * on-chain deliver_by deadline on Submit.
+ * on-chain deliver_by deadline on Submit. When that leaves nothing, the job
+ * fails as `deliver_by_too_close` without calling the operator's service at
+ * all: work that cannot be submitted in time is work nobody gets paid for.
  *
  * The function NEVER throws — all errors are captured into jobs.fail.
  *
@@ -59,6 +61,17 @@ function sha256Hex(s: string): string {
 }
 
 /**
+ * Time held back, after the executor returns, for step 4+5: build the Submit
+ * transaction, submit it, and wait for it to land, all before the escrow's
+ * on-chain deliver_by. Submit is a script spend, so this is a chain round trip,
+ * not a function call. A job that lets the executor run right up to deliver_by
+ * produces a result it can never submit, and forfeits the supplier bond on
+ * work it actually did. Mirrors the 30 s the boot guard reserves in
+ * server.ts's SLA arithmetic.
+ */
+const SUBMIT_RESERVE_MS = 30_000;
+
+/**
  * Run the operator's service → receipt → Submit in the background.
  * Always resolves (never rejects). Terminal state written to jobs store.
  * Supplier lock is released in try/finally regardless of outcome.
@@ -75,13 +88,35 @@ export async function runCustomJob(params: RunCustomJobParams): Promise<void> {
     // the LLM backends return, so receipt construction downstream is
     // identical. A black box has no token semantics — both counts are 0.
     let inference: { content: string; prompt_tokens: number; completion_tokens: number; wallclock_ms: number };
+    // Wall clock, deliberately. deliver_by is a wall-clock millisecond stamp
+    // written by the buyer's builder, so this compares like with like on a live
+    // chain. Under a mock backend the route derives its own "now" from the mock
+    // slot instead (routes/custom.ts step 7), so the two can diverge in tests;
+    // that divergence is a test-harness artifact, not a production path.
+    const started = Date.now();
+    // Cap the budget at whatever remains before the escrow's deliver_by, less
+    // the Submit reserve, and never more than the configured service timeout.
+    // A job claimed late in its window must not burn the full
+    // SERVICE_TIMEOUT_MS and then miss the on-chain Submit deadline.
+    const deadlineMs = Math.min(
+      deps.config.serviceTimeoutMs,
+      escrowDatum.deliver_by - started - SUBMIT_RESERVE_MS,
+    );
+    if (deadlineMs <= 0) {
+      // Nothing left to work with. Fail before the operator's service is even
+      // called: any result it produced could not be submitted in time, so the
+      // call would cost real compute for a job that cannot settle.
+      const remaining = escrowDatum.deliver_by - started;
+      const message =
+        `escrow deliver_by is ${remaining}ms away, which leaves no executor budget once the ` +
+        `${SUBMIT_RESERVE_MS}ms Submit reserve is held back`;
+      console.warn(
+        `[job_failed] jobId=${jobId} reason=deliver_by_too_close httpStatus=502 msg=${message}`,
+      );
+      deps.jobs.fail(jobId, { httpStatus: 502, reason: "deliver_by_too_close", message });
+      return;
+    }
     try {
-      const started = Date.now();
-      // Cap the budget at whatever remains before the escrow's deliver_by,
-      // not just the configured service timeout - a job claimed late in its
-      // window must not burn the full SERVICE_TIMEOUT_MS and then miss the
-      // on-chain Submit deadline.
-      const deadlineMs = Math.min(deps.config.serviceTimeoutMs, escrowDatum.deliver_by - started);
       const result = await params.executor.execute({
         capabilityId: advert.capability_id,
         requestPayload: requestBody.payload,

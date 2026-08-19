@@ -14,9 +14,11 @@
  *   3. the runner NEVER rejects (non-ExecutorError, submit failure included).
  *   4. wire contract: response_hash === sha256(utf8(outputPayload)) — no
  *      canonicalisation, no wrapping. The buyer side hashes the same bytes.
- *   5. deadline: executor deadlineMs = min(serviceTimeoutMs, deliver_by -
- *      now) — a job whose escrow deliver_by is near-now gets a smaller
- *      budget than the configured service timeout.
+ *   5. deadline: executor deadlineMs = min(serviceTimeoutMs, deliver_by - now
+ *      - 30s Submit reserve) — a job whose escrow deliver_by is near-now gets a
+ *      smaller budget than the configured service timeout, and one with less
+ *      than the reserve left fails deliver_by_too_close without the service
+ *      ever being called. Both sides of that boundary are pinned.
  */
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
@@ -158,23 +160,61 @@ describe("runCustomJob", () => {
     });
   });
 
-  it("caps the executor deadline at the escrow deliver_by when it is sooner than the service timeout", async () => {
+  it("caps the executor deadline at deliver_by minus the Submit reserve when that is sooner than the service timeout", async () => {
     const seen: ExecutorJob[] = [];
     const executor = fakeExecutor(async (job) => {
       seen.push(job);
       return { outputPayload: "out" };
     });
-    const deliverBy = Date.now() + 2_000;
+    // 45s of window: 30s goes to the Submit reserve, ~15s is left to work with.
+    const deliverBy = Date.now() + 45_000;
 
     await runCustomJob(
       makeParams(executor, { serviceTimeoutMs: 30_000 }, { deliver_by: deliverBy }),
     );
 
     expect(seen).toHaveLength(1);
-    // Claimed 2s before deliver_by, so the budget must be capped well under
-    // the 30s serviceTimeoutMs — never the constant configured value.
+    // Never the constant configured value, and never the raw remaining window:
+    // the reserve has to come off the top or Submit has no time to land.
     expect(seen[0].deadlineMs).toBeGreaterThan(0);
-    expect(seen[0].deadlineMs).toBeLessThanOrEqual(2_000);
+    expect(seen[0].deadlineMs).toBeLessThanOrEqual(15_000);
+    expect(seen[0].deadlineMs).toBeGreaterThan(13_000);
+  });
+
+  it("fails deliver_by_too_close, without calling the service, when the reserve eats the whole window", async () => {
+    const executor = fakeExecutor(async () => ({ outputPayload: "out" }));
+    // 20s left, under the 30s Submit reserve: any result would be unsubmittable.
+    const deliverBy = Date.now() + 20_000;
+
+    await expect(
+      runCustomJob(makeParams(executor, { serviceTimeoutMs: 30_000 }, { deliver_by: deliverBy })),
+    ).resolves.toBeUndefined();
+
+    expect(executor.execute).not.toHaveBeenCalled();
+    expect(buildSubmitTx).not.toHaveBeenCalled();
+    expect(jobs.transitions).toEqual([`setRunning:${JOB_ID}`, `fail:${JOB_ID}`]);
+    expect(jobs.failure).toMatchObject({ httpStatus: 502, reason: "deliver_by_too_close" });
+    // The lock is released on this path too, or the node serves nothing else.
+    expect(state.snapshot().activeSessions).toBe(0);
+  });
+
+  it("still calls the service one millisecond above the reserve boundary", async () => {
+    // Boundary pin from the other side: 30s + 5s of slack must NOT fast-fail.
+    // Together with the test above this brackets deadlineMs <= 0 exactly.
+    const seen: ExecutorJob[] = [];
+    const executor = fakeExecutor(async (job) => {
+      seen.push(job);
+      return { outputPayload: "out" };
+    });
+
+    await runCustomJob(
+      makeParams(executor, { serviceTimeoutMs: 30_000 }, { deliver_by: Date.now() + 35_000 }),
+    );
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0].deadlineMs).toBeGreaterThan(0);
+    expect(seen[0].deadlineMs).toBeLessThanOrEqual(5_000);
+    expect(jobs.failure).toBeUndefined();
   });
 
   it("hashes the raw output bytes into response_hash (wire contract, no normalisation)", async () => {
