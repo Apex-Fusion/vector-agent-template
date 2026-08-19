@@ -4,10 +4,19 @@
  *   corepack pnpm --filter try-it exec tsx src/buy-once.ts \
  *     --advert-ref <txHash#ix> --endpoint http://host:8080 --payload-file ./payload.txt
  *
- * Posts a bonded escrow against the agent's advert, hands the agent the job,
- * polls until it is done, verifies the signed receipt OFFLINE, and only then
- * Accepts (which releases payment). Exit 0 means: settled on chain and the
- * receipt verified. Anything else exits non-zero with one line on stderr.
+ * Flow: preflight the blueprint -> read the advert -> PREFLIGHT THE WALLET (can
+ * this wallet still Accept after it posts?) -> post the bonded escrow -> check
+ * the posted datum commits our bytes -> hand the agent the job -> poll ->
+ * resolve the Submitted escrow -> verify the receipt offline AND against chain
+ * state -> Accept (which releases payment). Exit 0 means: settled on chain and
+ * the receipt verified. Anything else exits non-zero with one line on stderr.
+ *
+ * The wallet pre-flight is not a nicety. On the first mainnet run the escrow
+ * posted, the job ran, Submit landed, and Accept then failed with
+ * `collateral_required` - PostEscrow's coin selection had eaten the buyer's
+ * pure-5-ADA UTxO. Funds locked, accept window ticking, and the only exit was
+ * the supplier's Release taking payment and both bonds. Money must not move
+ * until the wallet can finish the whole settlement.
  *
  * ─── ESCROW BUILDER CHOICE (read this before changing the payload shape) ───
  *
@@ -28,7 +37,7 @@
  * that one-element canonical chat envelope, not arbitrary bytes. The AGENT side
  * is fully general - any buyer able to commit an arbitrary prompt_hash may send
  * any string - so lifting this means an upstream builder that takes a
- * precomputed prompt_hash, not a change here. Step 4 below re-reads the posted
+ * precomputed prompt_hash, not a change here. Step 5 below re-reads the posted
  * datum and aborts BEFORE the agent is called if the two hashes ever diverge,
  * so builder drift surfaces as one clear line instead of a 409 per purchase.
  *
@@ -250,6 +259,86 @@ export function buildWirePayload(payloadText: string): WirePayload {
   const messages: ChatMessage[] = [{ role: "user", content: payloadText }];
   const wirePayload = canonicalize(messages);
   return { messages, wirePayload, promptHash: sha256Utf8Hex(wirePayload) };
+}
+
+// ─── wallet shape: can this buyer finish what it is about to start? ────────
+
+/**
+ * Collateral eligibility, mirrored from the vendored builders
+ * (`liveCbor.ts`: `COLLATERAL_MIN_LOVELACE`, `assertCollateralCandidate`,
+ * `reserveCollateralInputs`): a UTxO qualifies only if it holds at least
+ * 5 ADA and NOTHING but lovelace. Every script spend - Claim, Submit, Accept,
+ * Reclaim - needs one.
+ */
+export const COLLATERAL_MIN_LOVELACE = 5_000_000n;
+
+/**
+ * Working balance the non-collateral UTxOs must cover on top of the escrow
+ * lock. `reserveCollateralInputs` hands lucid a restricted input set ONLY when
+ * the remaining UTxOs cover `locked + 2 ADA`; below that it returns null, lucid
+ * selects freely, and the collateral UTxO is fair game - which is exactly how
+ * the mainnet run lost it. So 2 ADA, not the 1 ADA of bare fee headroom.
+ */
+export const WORKING_BALANCE_CUSHION_LOVELACE = 2_000_000n;
+
+export interface WalletUtxoLike {
+  lovelace: bigint;
+  /** Native assets only (the vendored Utxo type keeps ada out of this map). */
+  assets: Record<string, bigint>;
+}
+
+export type FundsCheck = { ok: true } | { ok: false; reason: string; message: string };
+
+function ada(lovelace: bigint): string {
+  return `${(Number(lovelace) / 1_000_000).toFixed(6).replace(/0+$/, "").replace(/\.$/, "")} ADA`;
+}
+
+/**
+ * Refuse to lock funds this wallet cannot finish settling.
+ *
+ * Two legs, both fatal BEFORE the escrow post:
+ *   (a) no pure-lovelace UTxO >= 5 ADA -> the Accept script spend has no
+ *       collateral, so the job would settle only via the supplier's Release;
+ *   (b) the rest of the wallet cannot cover the escrow lock + cushion -> coin
+ *       selection falls back to unrestricted and eats the collateral, which
+ *       lands in the same place one tx later.
+ */
+export function checkSettlementFunds(utxos: WalletUtxoLike[], lockLovelace: bigint): FundsCheck {
+  const eligible = utxos.filter(
+    (u) => u.lovelace >= COLLATERAL_MIN_LOVELACE && Object.keys(u.assets).length === 0,
+  );
+  const total = utxos.reduce((sum, u) => sum + u.lovelace, 0n);
+
+  if (eligible.length === 0) {
+    const max = utxos.reduce((m, u) => (u.lovelace > m ? u.lovelace : m), 0n);
+    return {
+      ok: false,
+      reason: "collateral_missing",
+      message:
+        `no pure-lovelace UTxO >= ${COLLATERAL_MIN_LOVELACE} lovelace (${ada(COLLATERAL_MIN_LOVELACE)}) for Accept collateral — ` +
+        `wallet has ${utxos.length} UTxO(s), largest ${max} lovelace, ${total} total. ` +
+        `Fund the buyer as TWO UTxOs: one of exactly ${ada(COLLATERAL_MIN_LOVELACE)} to sit untouched as collateral, ` +
+        `plus a second of at least ${ada(lockLovelace + WORKING_BALANCE_CUSHION_LOVELACE)} to spend`,
+    };
+  }
+
+  // The cheapest eligible UTxO is the one reserveCollateralInputs holds back.
+  const reserved = eligible.reduce((min, u) => (u.lovelace < min.lovelace ? u : min), eligible[0]);
+  const working = total - reserved.lovelace;
+  const required = lockLovelace + WORKING_BALANCE_CUSHION_LOVELACE;
+  if (working < required) {
+    return {
+      ok: false,
+      reason: "insufficient_working_balance",
+      message:
+        `wallet cannot fund the escrow without spending its collateral — needs ${required} lovelace (${ada(required)}: ` +
+        `${lockLovelace} lock + ${WORKING_BALANCE_CUSHION_LOVELACE} fee/change headroom) outside the ` +
+        `${reserved.lovelace}-lovelace collateral UTxO, has ${working} (short by ${required - working}). ` +
+        `Fund the buyer as TWO UTxOs: ${ada(COLLATERAL_MIN_LOVELACE)} collateral + at least ${ada(required)} to spend`,
+    };
+  }
+
+  return { ok: true };
 }
 
 /**
@@ -556,7 +645,19 @@ export async function main(argv: string[], env: Record<string, string | undefine
     log(`capability ${advert.capability_id} model=${advert.model}`);
     log(`price     ${advert.price_lovelace} lovelace (+bonds -> ${totalLovelace} locked), sla=${advert.max_processing_ms}ms`);
 
-    // ── 3. Post the escrow ────────────────────────────────────────────────
+    // ── 3. Wallet pre-flight — the last point where nothing is at stake ───
+    // The escrow lock is payment + both bonds, floored at the live builder's
+    // 2 ADA min-utxo (escrowLockFloor only exceeds the economic total for
+    // locks smaller than that floor).
+    const lockLovelace = totalLovelace < 2_000_000n ? 2_000_000n : totalLovelace;
+    const walletUtxos = await chainStep("wallet_query_failed", () => chain.queryUtxosByAddress(buyerKey.address));
+    const funds = checkSettlementFunds(walletUtxos, lockLovelace);
+    if (!funds.ok) {
+      throw new BuyError(funds.reason, funds.message);
+    }
+    log(`wallet    ${walletUtxos.length} UTxO(s), collateral + working balance sufficient for lock ${lockLovelace}`);
+
+    // ── 4. Post the escrow ────────────────────────────────────────────────
     log("post-escrow: building + submitting...");
     const posted = await chainStep("escrow_post_failed", () => buildPostEscrowTx({
       chain,
@@ -570,7 +671,7 @@ export async function main(argv: string[], env: Record<string, string | undefine
     const escrowRef = posted.escrowOutputRef;
     log(`escrow    ${refStr(escrowRef)} confirmed`);
 
-    // ── 4. Wire-contract self-check, BEFORE the agent is involved ─────────
+    // ── 5. Wire-contract self-check, BEFORE the agent is involved ─────────
     const escrowUtxo = await chainStep("escrow_query_failed", () => chain.queryUtxo(escrowRef));
     if (escrowUtxo === null || !escrowUtxo.datumHex) {
       throw new BuyError("escrow_not_found", `escrow UTxO ${refStr(escrowRef)} vanished after confirmation`);
@@ -584,7 +685,7 @@ export async function main(argv: string[], env: Record<string, string | undefine
     }
     const escrowAddress = escrowUtxo.address;
 
-    // ── 5. Hand the job to the agent ──────────────────────────────────────
+    // ── 6. Hand the job to the agent ──────────────────────────────────────
     // POST /v1/job does NOT return until the agent has built AND confirmed its
     // Claim tx (a 60 s awaitTx inside the route), so the client budget has to
     // cover a chain round-trip. Time out early and the agent still claims the
@@ -603,7 +704,7 @@ export async function main(argv: string[], env: Record<string, string | undefine
     }
     log(`job       ${jobId} accepted, polling every ${args.pollIntervalMs}ms`);
 
-    // ── 6. Poll to a terminal state ───────────────────────────────────────
+    // ── 7. Poll to a terminal state ───────────────────────────────────────
     const jobTimeoutMs = args.jobTimeoutMs > 0 ? args.jobTimeoutMs : advert.max_processing_ms + JOB_TIMEOUT_SLACK_MS;
     const done = await pollJob({
       endpoint: args.endpoint,
@@ -613,7 +714,7 @@ export async function main(argv: string[], env: Record<string, string | undefine
     });
     log(`job       done, ${done.output.length} bytes of output`);
 
-    // ── 7. Find the Submitted escrow — needed to verify, not just to Accept ─
+    // ── 8. Find the Submitted escrow — needed to verify, not just to Accept ─
     // Its datum carries `result_receipt_hash`, the supplier's on-chain
     // commitment to the receipt bytes. Resolving first costs nothing (it spends
     // nothing) and lets the verification below be anchored to the chain.
@@ -630,7 +731,7 @@ export async function main(argv: string[], env: Record<string, string | undefine
     }));
     log(`submitted ${refStr(submitted.ref)} (submitted_at=${submitted.datum.submitted_at})`);
 
-    // ── 8. Verify: offline receipt checks + on-chain bindings, BEFORE paying ─
+    // ── 9. Verify: offline receipt checks + on-chain bindings, BEFORE paying ─
     const capRes = await httpJson(`${args.endpoint}/capability`, { method: "GET" });
     if (capRes.status !== 200) {
       throw new BuyError("capability_unavailable", errDetail(capRes.body, `GET /capability returned HTTP ${capRes.status}`));
@@ -660,7 +761,7 @@ export async function main(argv: string[], env: Record<string, string | undefine
     }
     log("receipt   verified (prompt hash, response hash, signature) and bound to chain (result_receipt_hash, escrow_ref, supplier identity)");
 
-    // ── 9. Accept: releases payment, closes the escrow ────────────────────
+    // ──10. Accept: releases payment, closes the escrow ────────────────────
     log(`accept    spending ${refStr(submitted.ref)}`);
     const accepted = await chainStep("accept_failed", () => buildAcceptTx({ chain, buyerKey, escrowRef: submitted.ref }));
     await chainStep("accept_confirm_failed", () => chain.awaitTx(accepted.expectedTxHash, args.awaitTimeoutMs));
