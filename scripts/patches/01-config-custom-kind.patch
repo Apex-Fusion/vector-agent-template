@@ -1,0 +1,114 @@
+diff --git a/agent/src/config.ts b/agent/src/config.ts
+index 0ed01b1..47a57b0 100644
+--- a/agent/src/config.ts
++++ b/agent/src/config.ts
+@@ -86,7 +86,7 @@ export interface AdvertRef {
+  *                    image → one extraction). Upstream is an OpenAI-compatible
+  *                    VISION endpoint (OPENAI_BASE_URL), e.g. vLLM serving
+  *                    datalab-to/chandra-ocr-2. */
+-export type CapabilityKind = "chat" | "tts" | "chat-session" | "ocr";
++export type CapabilityKind = "chat" | "tts" | "chat-session" | "ocr" | "custom";
+ 
+ /** Served-checkpoint probe cadence for the ocr capability.
+  *   "per_job" — probe the upstream before every Claim (default when
+@@ -215,6 +215,26 @@ export interface SupplierConfig {
+   revisionProbeUrl: string;
+   /** Probe cadence; see RevisionProbeMode. Env: REVISION_PROBE_MODE. */
+   revisionProbeMode: RevisionProbeMode;
++  /**
++   * Operator service endpoint for the custom capability. Required when
++   * capabilityKind="custom" (the operator's black box). Env: SERVICE_URL.
++   */
++  serviceUrl: string;
++  /** Custom-service request timeout, ms. Env: SERVICE_TIMEOUT_MS, default 120_000. */
++  serviceTimeoutMs: number;
++  /** Optional auth header value forwarded to the custom service. Env: SERVICE_AUTH_HEADER, default "". */
++  serviceAuthHeader: string;
++  /** Content-Type sent to the custom service. Env: SERVICE_CONTENT_TYPE, default "application/json". */
++  serviceContentType: string;
++  /**
++   * The processing SLA the operator advertises, ms — the same number
++   * `tx:post-advert` writes into the advert datum's max_processing_ms.
++   * Required when capabilityKind="custom": createApp's SLA boot guard refuses
++   * a SERVICE_TIMEOUT_MS that cannot nest inside it (minus the 30s deliver-by
++   * grace), because such a supplier claims jobs it can never submit.
++   * Env: ADVERT_MAX_PROCESSING_MS. 0 = unset (other capability kinds).
++   */
++  advertMaxProcessingMs: number;
+   /**
+    * When true, the supplier boots a LiveOgmiosProvider (real submitTx/awaitTx).
+    * Default false → ReadOnlyOgmiosProvider (safe; no chain writes).
+@@ -270,9 +290,10 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+     capKindStr !== "chat" &&
+     capKindStr !== "tts" &&
+     capKindStr !== "chat-session" &&
+-    capKindStr !== "ocr"
++    capKindStr !== "ocr" &&
++    capKindStr !== "custom"
+   ) {
+-    throw new Error('loadConfig: CAPABILITY_KIND must be "chat", "tts", "chat-session", or "ocr"');
++    throw new Error('loadConfig: CAPABILITY_KIND must be "chat", "tts", "chat-session", "ocr", or "custom"');
+   }
+   const capabilityKind: CapabilityKind = capKindStr;
+ 
+@@ -292,7 +313,12 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+   let ollamaUrl = "";
+   let openaiBaseUrl = "";
+   let piperUrl = "";
+-  if (capabilityKind === "chat-session") {
++  if (capabilityKind === "custom") {
++    // The custom kind talks only to the operator's own service.
++    ollamaUrl = env.OLLAMA_URL ?? "";
++    openaiBaseUrl = env.OPENAI_BASE_URL ?? "";
++    piperUrl = env.PIPER_URL ?? "";
++  } else if (capabilityKind === "chat-session") {
+     // Multi-turn chat streams via callOpenAiStream, which only speaks the
+     // OpenAI-compatible wire format — so chat-session is openai-only.
+     if (llmBackend !== "openai") {
+@@ -508,6 +534,34 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+   }
+   const revisionProbeMode: RevisionProbeMode = probeModeStr;
+ 
++  // Custom-capability service config. SERVICE_URL is the operator's black box.
++  const serviceUrl = capabilityKind === "custom" ? requireField(env, "SERVICE_URL") : (env.SERVICE_URL ?? "");
++  const svcTimeoutStr = env.SERVICE_TIMEOUT_MS;
++  let serviceTimeoutMs = 120_000;
++  if (svcTimeoutStr !== undefined && svcTimeoutStr !== "") {
++    if (!POS_INT_RE.test(svcTimeoutStr)) {
++      throw new Error("loadConfig: SERVICE_TIMEOUT_MS must be a positive integer");
++    }
++    serviceTimeoutMs = Number(svcTimeoutStr);
++  }
++  const serviceAuthHeader = env.SERVICE_AUTH_HEADER ?? "";
++  const serviceContentType = env.SERVICE_CONTENT_TYPE ?? "application/json";
++
++  // ADVERT_MAX_PROCESSING_MS — the advertised SLA. Required for the custom
++  // kind (the boot guard in createApp compares SERVICE_TIMEOUT_MS against it
++  // and refuses to start when the service budget cannot nest inside the SLA).
++  // Parsed and validated ONLY when capabilityKind="custom" — other kinds
++  // never read this var before "custom" existed, so a stray/garbage value
++  // left in a shared .env must not break their boot. 0 = not declared.
++  let advertMaxProcessingMs = 0;
++  if (capabilityKind === "custom") {
++    const advertMaxProcessingMsStr = requireField(env, "ADVERT_MAX_PROCESSING_MS");
++    if (!POS_INT_RE.test(advertMaxProcessingMsStr)) {
++      throw new Error("loadConfig: ADVERT_MAX_PROCESSING_MS must be a positive integer");
++    }
++    advertMaxProcessingMs = Number(advertMaxProcessingMsStr);
++  }
++
+   const piperTimeoutStr = env.PIPER_TIMEOUT_MS;
+   let piperTimeoutMs = 120_000;
+   if (piperTimeoutStr !== undefined && piperTimeoutStr !== "") {
+@@ -563,6 +617,11 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+     hfModelRevision,
+     revisionProbeUrl,
+     revisionProbeMode,
++    serviceUrl,
++    serviceTimeoutMs,
++    serviceAuthHeader,
++    serviceContentType,
++    advertMaxProcessingMs,
+     liveChain,
+     walletHealthIntervalMs,
+   };

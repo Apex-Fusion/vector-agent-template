@@ -1,0 +1,1 @@
+A short line of sample text for the quickstart purchase. The demo service echoes it back, and the signed receipt commits the hash of both halves.

@@ -1,0 +1,14 @@
+diff --git a/packages/shared/package.json b/packages/shared/package.json
+index ad5b45e..e919ef7 100644
+--- a/packages/shared/package.json
++++ b/packages/shared/package.json
+@@ -14,7 +14,8 @@
+     "./tx/server": "./src/tx/server.ts"
+   },
+   "scripts": {
+-    "typecheck": "tsc --noEmit"
++    "typecheck": "tsc --noEmit",
++    "test": "vitest run src"
+   },
+   "devDependencies": {
+     "cbor-x": "^1.5.4",

@@ -1,0 +1,144 @@
+diff --git a/agent/.dockerignore b/agent/.dockerignore
+index 98900cb..fe7a0b0 100644
+--- a/agent/.dockerignore
++++ b/agent/.dockerignore
+@@ -1,4 +1,4 @@
+-# supplier/.dockerignore — only consulted if `docker build` uses ./supplier
++# agent/.dockerignore — only consulted if `docker build` uses ./agent
+ # as its context. The project's documented build invocation uses the repo
+ # root, so the top-level .dockerignore is the primary gate. This file is a
+ # defence-in-depth duplicate.
+diff --git a/agent/Dockerfile b/agent/Dockerfile
+index 0036f3c..5ef7962 100644
+--- a/agent/Dockerfile
++++ b/agent/Dockerfile
+@@ -1,6 +1,6 @@
+ # syntax=docker/dockerfile:1.7
+ #
+-# supplier/Dockerfile — multi-stage image for the supplier node.
++# agent/Dockerfile — multi-stage image for the supplier node.
+ #
+ # Strategy: install workspace deps in a builder stage, then ship the source
+ # tree + node_modules to a slim runtime stage that runs the entry point with
+@@ -11,12 +11,13 @@
+ # tsx is what apex-dashboard does and matches that working pattern.
+ #
+ # Build context MUST be the repo root so pnpm can resolve workspace deps:
+-#   docker build -f supplier/Dockerfile -t marketplace-supplier .
++#   docker build -f agent/Dockerfile -t marketplace-supplier .
+ #
+-# Base image: node:20-alpine. Supplier has no native compile dependencies
++# Base image: node:22-alpine, matching this repo's engines field (node >=22)
++# and the Node version CI runs. Supplier has no native compile dependencies
+ # (@noble/ed25519, express, cbor-x are pure JS). Stay on alpine for size.
+ 
+-ARG NODE_VERSION=20.19.0
++ARG NODE_VERSION=22.23.2
+ 
+ # ─── builder ──────────────────────────────────────────────────────────────
+ FROM node:${NODE_VERSION}-alpine AS builder
+@@ -25,16 +26,16 @@ WORKDIR /repo
+ # pnpm via corepack — lockfile pins pnpm@10.33.2.
+ RUN corepack enable && corepack prepare pnpm@10.33.2 --activate
+ 
+-# Workspace manifests first to maximise layer cache reuse.
+-COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json .npmrc ./
+-# pnpm-lock.yaml's patchedDependencies hash the patch files at install time.
+-COPY patches ./patches
++# Workspace manifests first to maximise layer cache reuse. This template
++# vendors only packages/shared + agent (ex-supplier) — no root .npmrc, no
++# patches/ dir (pnpm-lock.yaml here has no patchedDependencies), and no
++# buyer/ or indexer/ siblings (this workspace's lockfile importers are only
++# ".", "agent", "packages/shared" — confirmed via pnpm-lock.yaml), unlike the
++# full upstream monorepo this Dockerfile was vendored from. Omitted rather
++# than COPYing paths that don't exist in this repo.
++COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
+ COPY packages/shared/package.json ./packages/shared/package.json
+-COPY supplier/package.json ./supplier/package.json
+-# Buyer + indexer manifests are needed because pnpm-lock.yaml indexes the
+-# whole workspace. They are referenced but not installed (--filter excludes).
+-COPY buyer/package.json ./buyer/package.json
+-COPY indexer/package.json ./indexer/package.json
++COPY agent/package.json ./agent/package.json
+ 
+ # Install only what supplier needs (and its transitive workspace deps).
+ RUN pnpm install --frozen-lockfile --filter '@marketplace/supplier...'
+@@ -50,12 +51,43 @@ RUN set -e \
+  && cp "$SRC" "$DST/" \
+  && echo "patched libsodium wrapper: $DST/libsodium-sumo.mjs"
+ 
+-# Copy the actual source — shared + supplier + Aiken blueprint (loadBlueprint
+-# reads contracts/marketplace/plutus.json at runtime to derive escrow addr +
+-# attach the spending validator script in M1-F-4 live-CBOR builders).
++# Copy the actual source — shared + agent + the Aiken blueprint.
++#
++# The blueprint (contracts/marketplace/plutus.json) IS vendored into this
++# template, pinned to the same upstream commit as the code (VENDORED-FROM.md).
++# loadBlueprint() reads it to derive the escrow/advert script addresses and to
++# attach the spending validator in the live-CBOR builders. It is loaded lazily,
++# inside those builders (buildClaimTx/buildSubmitTx/postEscrow et al.), never at
++# import or boot time — so an image missing it still builds and boots, then
++# fails on the first real job, after the buyer's funds are already locked. That
++# is exactly why it is copied here and checked in CI rather than left implicit.
++#
++# examples/ carries the demo black box (echo-service.mjs) the quickstart and
++# deploy/docker-compose.yml run as a second service off this same image.
+ COPY packages/shared ./packages/shared
+-COPY supplier ./supplier
++COPY agent ./agent
+ COPY contracts/marketplace/plutus.json ./contracts/marketplace/plutus.json
++COPY examples ./examples
++
++# Defence-in-depth against a leaked HOST node_modules: on at least one
++# Docker Desktop + Windows-host combination, the two source COPYs above were
++# observed to pull in a locally-installed agent/node_modules or
++# packages/shared/node_modules from the build context DESPITE the root
++# .dockerignore listing "node_modules" — reproduced with a full
++# `docker builder prune -af` in between, so it was not a stale-cache
++# artifact. COPY MERGES into an already-existing destination directory
++# rather than replacing it, so this silently overlaid the correct,
++# container-native node_modules the `pnpm install` above already produced
++# with the host's own copy — which carries host-OS-specific pnpm symlinks
++# (e.g. absolute Windows paths) that do not resolve inside this Linux image,
++# breaking module resolution at runtime even though the build itself still
++# exits 0. Fix: wipe whatever the COPYs may have overlaid, then re-run the
++# SAME install command — idempotent and near-instant here since every
++# package is already resolved into the local store from the first run — so
++# the final node_modules is deterministically the correct, freshly-linked
++# one regardless of what the build context happened to contain.
++RUN rm -rf ./agent/node_modules ./packages/shared/node_modules \
++ && pnpm install --frozen-lockfile --filter '@marketplace/supplier...'
+ 
+ # ─── runtime ──────────────────────────────────────────────────────────────
+ FROM node:${NODE_VERSION}-alpine AS runtime
+@@ -85,4 +117,4 @@ HEALTHCHECK --interval=20s --timeout=5s --start-period=15s --retries=3 \
+ 
+ # tsx is hoisted to /repo/node_modules/.bin by pnpm — invoke via the workspace bin.
+ ENTRYPOINT ["/sbin/tini", "--"]
+-CMD ["node_modules/.bin/tsx", "supplier/src/index.ts"]
++CMD ["node_modules/.bin/tsx", "agent/src/index.ts"]
+diff --git a/agent/src/index.ts b/agent/src/index.ts
+index 51ab719..4d40867 100644
+--- a/agent/src/index.ts
++++ b/agent/src/index.ts
+@@ -87,9 +87,17 @@ async function main(): Promise<void> {
+   process.on("SIGTERM", () => shutdown("SIGTERM"));
+ }
+ 
+-// Only run when executed directly (not when imported by tests).
+-const isDirectRun = process.argv[1]?.endsWith("supplier/src/index.ts")
+-  || process.argv[1]?.endsWith("supplier/dist/index.js");
++// Only run when executed directly (not when imported by tests). Matches both
++// the pre-rename "supplier/" path (upstream) and the "agent/" path this
++// template renames it to, so main() runs under either tree shape. Windows
++// reports argv[1] with backslashes, which never matches these forward-slash
++// suffixes as-is - normalize separators before comparing so the gate also
++// fires when run directly on a Windows dev box, not only inside Docker/Linux.
++const normalizedArgv1 = process.argv[1]?.replace(/\\/g, "/");
++const isDirectRun = normalizedArgv1?.endsWith("supplier/src/index.ts")
++  || normalizedArgv1?.endsWith("supplier/dist/index.js")
++  || normalizedArgv1?.endsWith("agent/src/index.ts")
++  || normalizedArgv1?.endsWith("agent/dist/index.js");
+ if (isDirectRun) {
+   main().catch((err) => {
+     // eslint-disable-next-line no-console

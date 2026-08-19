@@ -3,4 +3,14 @@ dist/
 .env
 .env.*
 !.env.example
+# Vendored upstream example files that must not ship in this template. The
+# ROOT .env.example is the single env spec here, and the per-capability detail
+# examples belong to upstream capabilities this template does not use (they
+# also name an operator's own upstream vendor, which no public surface here
+# does). sync-core.sh re-extracts them from upstream on every re-vendor, so an
+# ignore rule keeps them untracked where a patch could not. Listed AFTER the
+# !.env.example negation so the first of them is re-ignored.
+agent/.env.example
+agent/*.example.json
 *.tsbuildinfo
+.superpowers/

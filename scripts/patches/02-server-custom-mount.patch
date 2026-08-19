@@ -1,0 +1,61 @@
+diff --git a/agent/src/server.ts b/agent/src/server.ts
+index 7f16471..d4d46c1 100644
+--- a/agent/src/server.ts
++++ b/agent/src/server.ts
+@@ -62,6 +62,8 @@ import { endChatSession, type EndChatSessionDeps } from "./chatSessionRunner.js"
+ import { callOpenAiStream } from "./openai.js";
+ import { healthzRouter } from "./routes/healthz.js";
+ import { triggerOnFailureConsolidate } from "./walletHealth.js";
++import { makeHttpCalloutExecutor } from "./executor/httpCallout.js";
++import { makeCustomHandler, makeGetCustomJobHandler, type CustomRouteDeps } from "./routes/custom.js";
+ 
+ export interface SupplierDeps {
+   chain: ChainProvider;
+@@ -1414,6 +1416,47 @@ export function createApp(deps: SupplierDeps): Application {
+     // fits comfortably under 16mb.
+     app.post("/v1/ocr/extract", express.json({ limit: "16mb" }), makeOcrHandler(resolved));
+     app.get("/v1/ocr/extract/:jobId", makeGetOcrJobHandler(resolved));
++  } else if (resolved.config.capabilityKind === "custom") {
++    // SLA boot guard. A claimed job pays three costs before its result can
++    // land, and all three have to fit inside the window the escrow allows:
++    //   CLAIM_AWAIT   the route waits out the Claim tx confirmation (60 s)
++    //   SERVICE_TIMEOUT_MS  the operator's black box
++    //   SUBMIT_RESERVE  the runner's reserve for building, submitting and
++    //                   confirming Submit (30 s, mirrored in customJobRunner)
++    // The window is the advert's max_processing_ms plus the 30 s network
++    // buffer the escrow builder adds: deliver_by = posted_at +
++    // max_processing_ms + 30 s (packages/shared/src/tx/escrow/postEscrow.ts).
++    // Refuse to boot when they do not fit, rather than claim jobs this node
++    // cannot submit in time and forfeit the bond on each one.
++    //
++    // The advert datum itself is only readable asynchronously (chain query)
++    // and this factory is synchronous, so the SLA arrives via config —
++    // ADVERT_MAX_PROCESSING_MS, required for this kind, the same number
++    // `tx:post-advert` writes into the advert's max_processing_ms. That is a
++    // declared value, so routes/custom.ts re-checks it against the live advert
++    // before every Claim.
++    const slaMs = resolved.config.advertMaxProcessingMs;
++    const CLAIM_AWAIT_MS = 60_000;
++    const SUBMIT_RESERVE_MS = 30_000;
++    const DELIVER_BY_BUFFER_MS = 30_000;
++    const needed = resolved.config.serviceTimeoutMs + CLAIM_AWAIT_MS + SUBMIT_RESERVE_MS;
++    const window = slaMs + DELIVER_BY_BUFFER_MS;
++    if (needed > window) {
++      throw new Error(
++        `custom capability: SERVICE_TIMEOUT_MS (${resolved.config.serviceTimeoutMs}) + ${CLAIM_AWAIT_MS} claim await + ${SUBMIT_RESERVE_MS} submit reserve = ${needed}ms exceeds the deliver-by window of ${window}ms (advert max_processing_ms ${slaMs} + ${DELIVER_BY_BUFFER_MS} network buffer); lower SERVICE_TIMEOUT_MS to at most ${window - CLAIM_AWAIT_MS - SUBMIT_RESERVE_MS} or raise the advert SLA`,
++      );
++    }
++    // Typed rather than cast to `unknown`: ResolvedDeps structurally satisfies
++    // CustomRouteDeps, whose optional `executor` field is this one, so the
++    // assignment is checked against the Executor interface instead of asserted.
++    (resolved as CustomRouteDeps).executor = makeHttpCalloutExecutor({
++      serviceUrl: resolved.config.serviceUrl,
++      timeoutMs: resolved.config.serviceTimeoutMs,
++      authHeader: resolved.config.serviceAuthHeader || undefined,
++      contentType: resolved.config.serviceContentType,
++    });
++    app.post("/v1/job", express.json({ limit: "1mb" }), makeCustomHandler(resolved));
++    app.get("/v1/job/:jobId", makeGetCustomJobHandler(resolved));
+   } else if (resolved.config.capabilityKind === "chat-session") {
+     const chat = makeChatSessionHandlers(resolved);
+     app.post("/v1/chat/start", chat.start);
