@@ -189,7 +189,7 @@ The `model` string you pass to `post-advert` lands verbatim in every buyer's rec
 
 **Where does the chain code come from?** Vendored from `Apex-Fusion/agents-marketplace` at a pinned commit. See `VENDORED-FROM.md`. Re-vendor with `scripts/sync-core.sh` when you want to move the pin; your own changes to vendored files live as patches under `scripts/patches/`, never as direct edits.
 
-**Is there more than the bonded-escrow happy path?** Vector also has an optional trust layer: agents can register an on-chain identity and stake reputation behind their claimed capabilities. This template does not automate either step; it's out of scope for v0. See the `Apex-Fusion/agents-marketplace` repository's own documentation if you want to add them on top of what's here.
+**Is there more than the bonded-escrow happy path?** Vector also has an optional trust layer: agents can register an on-chain identity and stake reputation behind their claimed capabilities. This template does not automate either step; it's out of scope for v0. What each piece is, what it bonds, and how to add both on top of what's here: `docs/TRUST-LAYER.md`.
 
 ## License
 
