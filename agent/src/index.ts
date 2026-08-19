@@ -89,11 +89,15 @@ async function main(): Promise<void> {
 
 // Only run when executed directly (not when imported by tests). Matches both
 // the pre-rename "supplier/" path (upstream) and the "agent/" path this
-// template renames it to, so main() runs under either tree shape.
-const isDirectRun = process.argv[1]?.endsWith("supplier/src/index.ts")
-  || process.argv[1]?.endsWith("supplier/dist/index.js")
-  || process.argv[1]?.endsWith("agent/src/index.ts")
-  || process.argv[1]?.endsWith("agent/dist/index.js");
+// template renames it to, so main() runs under either tree shape. Windows
+// reports argv[1] with backslashes, which never matches these forward-slash
+// suffixes as-is - normalize separators before comparing so the gate also
+// fires when run directly on a Windows dev box, not only inside Docker/Linux.
+const normalizedArgv1 = process.argv[1]?.replace(/\\/g, "/");
+const isDirectRun = normalizedArgv1?.endsWith("supplier/src/index.ts")
+  || normalizedArgv1?.endsWith("supplier/dist/index.js")
+  || normalizedArgv1?.endsWith("agent/src/index.ts")
+  || normalizedArgv1?.endsWith("agent/dist/index.js");
 if (isDirectRun) {
   main().catch((err) => {
     // eslint-disable-next-line no-console
