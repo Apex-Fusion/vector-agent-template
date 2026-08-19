@@ -55,4 +55,23 @@ for p in scripts/patches/*.patch; do
 done
 
 [ "$fail" -eq 0 ] || exit 1
+
+# Tier 2: commerce/payment framing ban - PROSE surfaces only (README + docs/).
+# Marketplace vocabulary is stake, bond, commission, settle. Never sell/buy/pay/earn,
+# no money-function words. Protocol role nouns (buyer, supplier), UTxO-technical
+# "spend/spent", and the buy-once CLI name are allowed.
+PROSE_BANNED='\bsells?\b|\bselling\b|purchas|\bpays?\b|\bpaid\b|\bpayments?\b|payout|\bbuys?\b|\bbuying\b|\bmoney\b|currency|\bfunds\b|\bspending\b|\binvest|\bearn'
+# Self-test: the pattern must match a known-bad probe, or the lint is broken.
+if ! printf 'agents earn while selling\n' | grep -qiE "$PROSE_BANNED"; then
+  echo "FAIL: tier-2 pattern self-test did not match its probe - lint broken" >&2
+  exit 1
+fi
+PROSE_RAW=$(grep -rniE "$PROSE_BANNED" README.md docs/*.md || true)
+PROSE_HITS=$(printf '%s\n' "$PROSE_RAW" | grep -v 'buy-once' || true)
+if [ -n "$PROSE_HITS" ]; then
+  printf '%s\n' "$PROSE_HITS"
+  echo "FAIL: commerce/payment framing in prose (stake, bond, commission, settle - never sell/buy/pay)" >&2
+  exit 1
+fi
+
 echo "prose lint clean ($(printf '%s\n' "$FILES" | wc -l | tr -d ' ') tracked files + patch additions)"

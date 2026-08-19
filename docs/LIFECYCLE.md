@@ -16,7 +16,7 @@ A job is one escrow UTxO that moves through a fixed set of states. Five transact
 ```
 Open      -- Claim   --> Claimed
 Claimed   -- Submit  --> Submitted
-Submitted -- Accept  --> Accepted    [terminal: buyer accepted, payment settles to the supplier]
+Submitted -- Accept  --> Accepted    [terminal: buyer accepted, the quoted amount settles to the supplier]
 Submitted -- Release --> Released    [terminal: accept window missed, supplier settles unilaterally]
 Open      -- Reclaim --> Reclaimed   [terminal: buyer refunded, only after deliver-by]
 Claimed   -- Reclaim --> Reclaimed   [terminal: buyer refunded, only after deliver-by]
@@ -29,9 +29,9 @@ Once a job reaches Submitted, Reclaim is no longer available. The buyer's only e
 | Post (creates the escrow) | buyer | (none) → Open | locks price + both bonds |
 | Claim | supplier | Open → Claimed | n/a |
 | Submit | supplier | Claimed → Submitted | posts the signed result hash |
-| Accept | buyer | Submitted → Accepted | payment settles to the supplier; both bonds return |
+| Accept | buyer | Submitted → Accepted | the quoted amount settles to the supplier; both bonds return |
 | Reclaim | buyer | Open or Claimed → Reclaimed | buyer gets back price + both bonds |
-| Release | supplier | Submitted → Released | payment + both bonds settle to the supplier |
+| Release | supplier | Submitted → Released | the quoted amount + both bonds settle to the supplier |
 
 Accepted and Released are both terminal settlements. The difference is only who triggered it and when. Reclaimed is the buyer's terminal escape hatch, only available before a result has been submitted.
 
@@ -44,6 +44,6 @@ Accepted and Released are both terminal settlements. The difference is only who 
 
 ## Release path: status as of ship date
 
-The chain supports Release: after the 600-second accept window closes on a Submitted job, the supplier can settle it unilaterally and collect payment plus both bonds, with no further action from the buyer. The transaction builder for it ships in the vendored core (`packages/shared/src/tx/escrow/release.ts`).
+The chain supports Release: after the 600-second accept window closes on a Submitted job, the supplier can settle it unilaterally, taking the quoted amount plus both bonds, with no further action from the buyer. The transaction builder for it ships in the vendored core (`packages/shared/src/tx/escrow/release.ts`).
 
 **This template does not ship a command for it.** There's no `tx:release` CLI, no automated watcher that fires one when a window closes. If a buyer misses the accept window today, your only path to that settlement is writing your own script against the vendored builder. Until that gap closes, the operating assumption is: buyers accept promptly, and suppliers should not count on Release as a safety net.

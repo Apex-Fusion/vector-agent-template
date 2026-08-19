@@ -1,6 +1,6 @@
 # vector-agent-template
 
-> An agent is any piece of software that can be viewed as a black box and offers a service or a product that can be purchased via the agents marketplace on Vector.
+> An agent is any piece of software that can be viewed as a black box and offers a service or a product that can be commissioned via the agents marketplace on Vector.
 
 This repo wraps your black box in the marketplace supplier runtime: an on-chain advert, bonded escrow with claim and submit handling, wallet health, signed delivery receipts, and an HTTPS serving surface. Point it at your service, fund two wallets, and it is a real listing on Vector mainnet.
 
@@ -15,7 +15,7 @@ README.md            # you are here
 docs/                 # LIFECYCLE.md, WALLET.md, GOTCHAS.md: the operator detail
 agent/                 # supplier runtime + your integration seam (executor/)
 packages/shared/       # vendored chain core, byte-identical to the upstream pin
-try-it/                 # self-test buyer: buy one job from your own agent, verify offline
+try-it/                 # self-test buyer: commission one job from your own agent, verify offline
 examples/                # echo-service.mjs, a fake black box, and payload.txt for step 7
 deploy/                 # docker-compose.yml
 scripts/sync-core.sh    # re-vendor the chain core from a pinned upstream commit
@@ -23,15 +23,15 @@ scripts/sync-core.sh    # re-vendor the chain core from a pinned upstream commit
 
 `packages/shared/` and everything under `agent/` that came from the upstream `agents-marketplace` repository are vendored, not written here. See `VENDORED-FROM.md` for the pinned commit. Do not hand-edit those files; if you need to change vendored behavior, add a patch under `scripts/patches/` and re-run `scripts/sync-core.sh` (see its header comment). The parts you are meant to touch are `agent/src/executor/`, your `.env`, and the advert flags you choose at post time.
 
-## How selling works
+## How commissioned work settles
 
-You cannot just pay an agent on Vector. You commission bonded work under stake: the buyer posts an escrow that locks the price plus both sides' bonds, you claim it and do the work, you submit a signed receipt of the result, and the buyer accepts it. On accept, payment settles to your wallet and both bonds return. Collecting requires doing, or verifying, the work, and the whole exchange is provable after the fact from the signed receipt alone.
+Work on Vector is commissioned, bonded, and settled. The buyer posts an escrow that locks the quoted amount plus both sides' bonds, you claim it and do the work, you submit a signed receipt of the result, and the buyer accepts it. On accept, the settlement releases to your wallet and both bonds return. Collecting requires doing, or verifying, the work, and the whole exchange is provable after the fact from the signed receipt alone.
 
 Three pieces make that true:
 
 - **Advert**: an on-chain UTxO you post once, naming your capability, your price, your processing SLA, and the HTTPS endpoint that fronts your black box.
 - **Bonded escrow**: the buyer's job posts as one on-chain object that moves through a fixed set of states as the job proceeds. See `docs/LIFECYCLE.md` for the full state machine and the timing windows that bind it.
-- **Signed receipt**: your agent signs the result hash before it ever collects payment; the buyer verifies signature, content hashes, and on-chain bindings before accepting. `try-it` does exactly this against your own agent, offline, before it accepts.
+- **Signed receipt**: your agent signs the result hash before anything settles; the buyer verifies signature, content hashes, and on-chain bindings before accepting. `try-it` does exactly this against your own agent, offline, before it accepts.
 
 ## Quickstart
 
@@ -60,9 +60,9 @@ One run prints one JSON object with four fields. All four matter: an empty publi
 | `pubKeyHash` | `SUPPLIER_PKH` |
 | `address` | `SUPPLIER_ADDRESS` |
 
-**3. Fund both wallets.** Fund each as two separate transactions: exactly 5 AP3X alone first (pure collateral), then whatever working balance you want to spend or hold as bonds. `try-it` refuses to lock funds into an escrow if your wallet is not shaped this way. See `docs/WALLET.md` before you send anything.
+**3. Fund both wallets.** Fund each as two separate transactions: exactly 5 AP3X alone first (pure collateral), then whatever working balance you want available for escrow locks and bonds. `try-it` refuses to post an escrow if your wallet is not shaped this way. See `docs/WALLET.md` before you send anything.
 
-No exchange or bridge instructions here on purpose. If you don't already hold AP3X, open a "supplier onboarding" issue on this repo. Serious deployments get starter settlement funds from the team to get their first advert live.
+No exchange or bridge instructions here on purpose. If you don't already hold AP3X, open a "supplier onboarding" issue on this repo. Serious deployments get starter AP3X for bonds and fees from the team to get their first advert live.
 
 **4. Configure `.env`, then load it into your shell.**
 
@@ -115,7 +115,7 @@ Compose brings up the demo service alongside the agent, so run it instead of the
 
 Check `curl localhost:8080/healthz` returns `{"ok":true}` and `/capability` shows your `capability_id`.
 
-**7. Buy your own first job.**
+**7. Commission your own first job.**
 
 ```bash
 corepack pnpm --filter try-it exec tsx src/buy-once.ts \
@@ -162,7 +162,7 @@ Those are the only two edit surfaces: `SERVICE_URL` for the config-only path, th
 
 ## Real economics
 
-Every script transaction (post, claim, submit, accept) pays a minimum chain fee around 0.5 AP3X. A fully settled job runs all four, so budget roughly 2 to 2.5 AP3X in chain fees per settled job, on top of the bonds you post and get back. Price your product above that all-in cost, not just above zero.
+Every script transaction (post, claim, submit, accept) carries a minimum chain fee around 0.5 AP3X. A fully settled job runs all four, so budget roughly 2 to 2.5 AP3X in chain fees per settled job, on top of the bonds you post and get back. Quote your product above that all-in cost.
 
 No accuracy or volume figures here on purpose. This template proves the mechanics; measure and publish your product's own numbers separately.
 
@@ -170,18 +170,18 @@ No accuracy or volume figures here on purpose. This template proves the mechanic
 
 Two things bite people who skip the docs:
 
-- **Wallet shape.** Fund every wallet as two UTxOs (collateral, then working balance), never one. `try-it` and the agent both pre-flight this before committing funds. See `docs/WALLET.md` for the exact numbers and why the split exists.
-- **Timing.** Deliver-by, the 600-second accept window, and what happens if a buyer misses it are in `docs/LIFECYCLE.md`. Read it before you run anything with funds you'd miss.
+- **Wallet shape.** Fund every wallet as two UTxOs (collateral, then working balance), never one. `try-it` and the agent both pre-flight this before locking anything into an escrow. See `docs/WALLET.md` for the exact numbers and why the split exists.
+- **Timing.** Deliver-by, the 600-second accept window, and what happens if a buyer misses it are in `docs/LIFECYCLE.md`. Read it before you run anything with AP3X you'd miss.
 
 One operational habit: after you edit `.env` (for example, pasting in `ADVERT_REF` from step 5), `docker compose restart` will *not* pick up the change: it restarts the same container with the environment it already has. Recreate it instead: `docker compose -f deploy/docker-compose.yml up -d --force-recreate`, or `down` then `up`. More of these in `docs/GOTCHAS.md`.
 
 ## Naming your listing
 
-The `model` string you pass to `post-advert` lands verbatim in every buyer's receipt. Use a neutral product name for what you're selling, never the name of a vendor or upstream model you happen to be wrapping. `records.extract.myproduct.v1` and `my-product-v1` above are the pattern: `<domain>.<action>.<product>.v1` for the capability id, a plain product name for the model string. Buyers see your product, not your supply chain.
+The `model` string you pass to `post-advert` lands verbatim in every buyer's receipt. Use a neutral product name for what you offer, never the name of a vendor or upstream model you happen to be wrapping. `records.extract.myproduct.v1` and `my-product-v1` above are the pattern: `<domain>.<action>.<product>.v1` for the capability id, a plain product name for the model string. Buyers see your product, not your supply chain.
 
 ## FAQ
 
-**Can I sell more than one thing?** Each advert offers one `capability_id` at one price and one SLA. Run more than one advert (and route them to more than one endpoint, or branch inside your executor on `capabilityId`) if you have more than one product.
+**Can I offer more than one thing?** Each advert offers one `capability_id` at one price and one SLA. Run more than one advert (and route them to more than one endpoint, or branch inside your executor on `capabilityId`) if you have more than one product.
 
 **What if my payload isn't a simple string?** V0 is JSON in, JSON out, as opaque strings. See "Plug in your software" above for exactly what arrives on the wire. Anything richer belongs inside `requestPayload`/`outputPayload` by convention (e.g., JSON-encode it yourself), not as a wire-contract change.
 
