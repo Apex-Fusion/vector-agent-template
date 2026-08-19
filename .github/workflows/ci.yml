@@ -12,4 +12,13 @@ jobs:
       - run: pnpm -r --if-present typecheck
       - run: pnpm -r --if-present test
       - run: bash scripts/lint-public-prose.sh
-      - run: docker build -f agent/Dockerfile .
+      - run: docker build -f agent/Dockerfile -t vector-agent-template:ci .
+      # The compiled validator blueprint must be INSIDE the image.
+      # loadBlueprint() is called lazily, deep inside the live tx builders, so
+      # an image that is missing contracts/marketplace/plutus.json still builds
+      # green and still boots green - and then fails on the first real job,
+      # with the buyer's funds already locked in an escrow. Load it here so a
+      # missing blueprint fails the build instead of a stranger's first sale.
+      - name: blueprint loads inside the image
+        run: >-
+          docker run --rm --entrypoint sh vector-agent-template:ci -c "cd packages/shared && ../../node_modules/.bin/tsx -e \"import('./src/tx/blueprint.js').then(m=>{m.loadBlueprint();console.log('blueprint OK')}).catch(e=>{console.error('blueprint FAILED - '+e.message);process.exit(1)})\""

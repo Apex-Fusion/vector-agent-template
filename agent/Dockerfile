@@ -13,10 +13,11 @@
 # Build context MUST be the repo root so pnpm can resolve workspace deps:
 #   docker build -f agent/Dockerfile -t marketplace-supplier .
 #
-# Base image: node:20-alpine. Supplier has no native compile dependencies
+# Base image: node:22-alpine, matching this repo's engines field (node >=22)
+# and the Node version CI runs. Supplier has no native compile dependencies
 # (@noble/ed25519, express, cbor-x are pure JS). Stay on alpine for size.
 
-ARG NODE_VERSION=20.19.0
+ARG NODE_VERSION=22.23.2
 
 # ─── builder ──────────────────────────────────────────────────────────────
 FROM node:${NODE_VERSION}-alpine AS builder
@@ -50,17 +51,23 @@ RUN set -e \
  && cp "$SRC" "$DST/" \
  && echo "patched libsodium wrapper: $DST/libsodium-sumo.mjs"
 
-# Copy the actual source — shared + agent. NOTE: the Aiken blueprint
-# (contracts/marketplace/plutus.json, which loadBlueprint() reads to derive
-# the escrow address + attach the spending validator script in the live-CBOR
-# builders) is NOT vendored into this template — that contracts/ workspace
-# isn't part of this repo. loadBlueprint() is only called lazily, inside
-# live-chain builders (buildClaimTx/buildSubmitTx/postEscrow et al.), never
-# at import or boot time, so its absence here doesn't block build or boot;
-# it only surfaces if a LIVE_CHAIN=1 deployment actually exercises one of
-# those builders, and that deployment must supply the file separately.
+# Copy the actual source — shared + agent + the Aiken blueprint.
+#
+# The blueprint (contracts/marketplace/plutus.json) IS vendored into this
+# template, pinned to the same upstream commit as the code (VENDORED-FROM.md).
+# loadBlueprint() reads it to derive the escrow/advert script addresses and to
+# attach the spending validator in the live-CBOR builders. It is loaded lazily,
+# inside those builders (buildClaimTx/buildSubmitTx/postEscrow et al.), never at
+# import or boot time — so an image missing it still builds and boots, then
+# fails on the first real job, after the buyer's funds are already locked. That
+# is exactly why it is copied here and checked in CI rather than left implicit.
+#
+# examples/ carries the demo black box (echo-service.mjs) the quickstart and
+# deploy/docker-compose.yml run as a second service off this same image.
 COPY packages/shared ./packages/shared
 COPY agent ./agent
+COPY contracts/marketplace/plutus.json ./contracts/marketplace/plutus.json
+COPY examples ./examples
 
 # Defence-in-depth against a leaked HOST node_modules: on at least one
 # Docker Desktop + Windows-host combination, the two source COPYs above were
