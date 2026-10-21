@@ -9,25 +9,12 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: pnpm }
       - run: pnpm install --frozen-lockfile
-      # libsodium-wrappers-sumo (transitive via @lucid-evolution/lucid) imports
-      # "./libsodium-sumo.mjs" from its wrapper, but pnpm's strict store layout
-      # puts that file in the sibling package libsodium-sumo, so every test that
-      # loads lucid fails to import it. agent/Dockerfile patches the image with
-      # the same copy; this step does it for the test run, version for version.
+      # The root postinstall (scripts/patch-libsodium.mjs) copies libsodium-sumo.mjs
+      # next to libsodium-wrappers-sumo, as agent/Dockerfile does in the image: without
+      # it lucid does not load and every test that builds a transaction fails to import.
+      # Run it again here so a skipped postinstall fails the job loudly; it is idempotent.
       - name: patch the libsodium wrapper, as agent/Dockerfile does
-        run: |
-          set -e
-          found=0
-          for dst in node_modules/.pnpm/libsodium-wrappers-sumo@*/node_modules/libsodium-wrappers-sumo/dist/modules-sumo-esm; do
-            [ -d "$dst" ] || continue
-            version=$(echo "$dst" | sed -n 's#^node_modules/.pnpm/libsodium-wrappers-sumo@\([^/]*\)/.*#\1#p')
-            src="node_modules/.pnpm/libsodium-sumo@$version/node_modules/libsodium-sumo/dist/modules-sumo-esm/libsodium-sumo.mjs"
-            [ -f "$src" ] || { echo "libsodium-sumo@$version not found for $dst"; exit 1; }
-            cp "$src" "$dst/"
-            echo "patched libsodium wrapper $version"
-            found=1
-          done
-          [ "$found" -eq 1 ] || { echo "no libsodium-wrappers-sumo in the store"; exit 1; }
+        run: node scripts/patch-libsodium.mjs
       - run: pnpm -r --if-present typecheck
       - run: pnpm -r --if-present test
       - run: bash scripts/lint-public-prose.sh

@@ -8,7 +8,8 @@
   },
   "scripts": {
     "typecheck": "pnpm -r --if-present typecheck",
-    "test": "pnpm -r --if-present test"
+    "test": "pnpm -r --if-present test",
+    "postinstall": "node scripts/patch-libsodium.mjs"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
