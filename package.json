@@ -9,7 +9,7 @@
   "scripts": {
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test",
-    "postinstall": "node scripts/patch-libsodium.mjs"
+    "postinstall": "node -e \"require('fs').existsSync('scripts/patch-libsodium.mjs') ? import('./scripts/patch-libsodium.mjs') : console.log('patch-libsodium: scripts/ is not in this build context; agent/Dockerfile makes the copy itself')\""
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
