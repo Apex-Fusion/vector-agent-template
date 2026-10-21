@@ -9,6 +9,12 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: pnpm }
       - run: pnpm install --frozen-lockfile
+      # The root postinstall (scripts/patch-libsodium.mjs) copies libsodium-sumo.mjs
+      # next to libsodium-wrappers-sumo, as agent/Dockerfile does in the image: without
+      # it lucid does not load and every test that builds a transaction fails to import.
+      # Run it again here so a skipped postinstall fails the job loudly; it is idempotent.
+      - name: patch the libsodium wrapper, as agent/Dockerfile does
+        run: node scripts/patch-libsodium.mjs
       - run: pnpm -r --if-present typecheck
       - run: pnpm -r --if-present test
       - run: bash scripts/lint-public-prose.sh
