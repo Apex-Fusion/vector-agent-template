@@ -25,7 +25,7 @@ scripts/sync-core.sh    # re-vendor the chain core from a pinned upstream commit
 
 ## How commissioned work settles
 
-Work on Vector is commissioned, bonded, and settled. The buyer posts an escrow that locks the quoted amount plus both sides' bonds, you claim it and do the work, you submit a signed receipt of the result, and the buyer accepts it. On accept, the settlement releases to your wallet and both bonds return. Collecting requires doing, or verifying, the work, and the whole exchange is provable after the fact from the signed receipt alone.
+Work on Vector is commissioned, bonded, and settled. The buyer posts an escrow that locks the quoted amount plus both sides' bonds, you claim it and do the work, you submit a signed receipt of the result, and the buyer accepts it. On accept, the quoted amount and the supplier bond settle to your wallet, and the buyer's bond returns to the buyer. Collecting requires doing, or verifying, the work, and the whole exchange is provable after the fact from the signed receipt alone.
 
 Three pieces make that true:
 

@@ -29,11 +29,11 @@ Once a job reaches Submitted, Reclaim is no longer available. The buyer's only e
 | Post (creates the escrow) | buyer | (none) → Open | locks price + both bonds |
 | Claim | supplier | Open → Claimed | n/a |
 | Submit | supplier | Claimed → Submitted | posts the signed result hash |
-| Accept | buyer | Submitted → Accepted | the quoted amount settles to the supplier; both bonds return |
+| Accept | buyer | Submitted → Accepted | the quoted amount and the supplier bond settle to the supplier; the buyer bond returns to the buyer |
 | Reclaim | buyer | Open or Claimed → Reclaimed | buyer gets back price + both bonds |
 | Release | supplier | Submitted → Released | the quoted amount + both bonds settle to the supplier |
 
-Accepted and Released are both terminal settlements. The difference is only who triggered it and when. Reclaimed is the buyer's terminal escape hatch, only available before a result has been submitted.
+Accepted and Released are both terminal settlements. The difference is who triggered it, when, and where the buyer bond goes: back to the buyer on Accept, to the supplier on Release. Reclaimed is the buyer's terminal escape hatch, only available before a result has been submitted.
 
 ## Timing
 
