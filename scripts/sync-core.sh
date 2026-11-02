@@ -109,13 +109,19 @@ done
 # tree whose whole promise is that it matches its pin. Report those instead.
 # The one path rename this template owns (supplier/ -> agent/) is applied to
 # the upstream listing before comparing.
-git -C "$ROOT" diff --name-only --diff-filter=D -- agent packages/shared | while read -r deleted; do
+#
+# The list is read in full BEFORE the first checkout: `git diff` can still hold
+# the index lock while it refreshes the index, so piping it straight into the
+# loop races `git checkout` for that lock and stops the run half-way.
+DELETED=$(git -C "$ROOT" diff --name-only --diff-filter=D -- agent packages/shared)
+while read -r deleted; do
+  [ -n "$deleted" ] || continue
   if printf '%s\n' "$PREV_PATHS" | grep -qxF -- "$deleted"; then
     echo "sync-core: $deleted was upstream at ${PREV_PIN:0:12} and is gone at ${PIN:0:12} - left deleted (upstream removed it)" >&2
   else
     git -C "$ROOT" checkout -- "$deleted"
   fi
-done
+done <<< "$DELETED"
 
 # Re-apply template-owned patches to vendored files. Conflict = hard stop.
 if ls "$ROOT"/scripts/patches/*.patch >/dev/null 2>&1; then
