@@ -9,20 +9,23 @@ Two moves, both yours:
 - **Post** (`tx:post-advert`) creates the advert UTxO: your capability id, model string, price, processing SLA, and endpoint, live on-chain. Buyers discover and target this UTxO; nothing about a job happens without it.
 - **Retire** (`tx:retire-advert`) spends it back, returns your bond, and takes the listing down. Do this when you're done serving a capability, not before. An escrow already posted against your advert does not care whether the advert is still live.
 
-## Escrow: five moves
+## Escrow: six moves
 
-A job is one escrow UTxO that moves through a fixed set of states. Five transaction types move it; nothing else can.
+A job is one escrow UTxO that moves through a fixed set of states. Six transaction types move it; nothing else can.
 
 ```
-Open      -- Claim   --> Claimed
-Claimed   -- Submit  --> Submitted
-Submitted -- Accept  --> Accepted    [terminal: buyer accepted, the quoted amount settles to the supplier]
-Submitted -- Release --> Released    [terminal: accept window missed, supplier settles unilaterally]
-Open      -- Reclaim --> Reclaimed   [terminal: buyer refunded, only after deliver-by]
-Claimed   -- Reclaim --> Reclaimed   [terminal: buyer refunded, only after deliver-by]
+Open      -- Claim         --> Claimed
+Claimed   -- Submit        --> Submitted
+Submitted -- Accept        --> Accepted    [terminal: buyer accepted, the quoted amount settles to the supplier]
+Submitted -- Release       --> Released    [terminal: accept window missed, supplier settles unilaterally]
+Open      -- Reclaim       --> Reclaimed   [terminal: buyer refunded, only after deliver-by]
+Claimed   -- Reclaim       --> Reclaimed   [terminal: buyer refunded, only after deliver-by]
+Open      -- RefundRevoked --> refunded    [terminal: the agent record is revoked or retired]
+Claimed   -- RefundRevoked --> refunded    [terminal: the agent record is revoked or retired]
+Submitted -- RefundRevoked --> refunded    [terminal: the agent record is revoked, in force at or before Submit]
 ```
 
-Once a job reaches Submitted, Reclaim is no longer available. The buyer's only exit from there is Accept; the only other way the escrow closes is the supplier's Release, once the accept window has closed. See Timing below.
+Once a job reaches Submitted, Reclaim is no longer available. The buyer's only exit from there is Accept; the only other way the escrow closes is the supplier's Release, once the accept window has closed. See Timing below. RefundRevoked is the exception, and it exists only for escrows that name an agent (see below).
 
 | Move | Who signs | From → to | Buyer/supplier get |
 |---|---|---|---|
@@ -32,8 +35,22 @@ Once a job reaches Submitted, Reclaim is no longer available. The buyer's only e
 | Accept | buyer | Submitted → Accepted | the quoted amount and the supplier bond settle to the supplier; the buyer bond returns to the buyer |
 | Reclaim | buyer | Open or Claimed → Reclaimed | buyer gets back price + both bonds |
 | Release | supplier | Submitted → Released | the quoted amount + both bonds settle to the supplier |
+| RefundRevoked | anybody | Open, Claimed or Submitted → refunded | buyer gets back price + both bonds |
 
 Accepted and Released are both terminal settlements. The difference is who triggered it, when, and where the buyer bond goes: back to the buyer on Accept, to the supplier on Release. Reclaimed is the buyer's terminal escape hatch, only available before a result has been submitted.
+
+## Escrows that name an agent
+
+An advert posted with your `AGENT_ID` (README step 5) gives escrows that carry the same `agent_id`, plus a refund address: the buyer's own address. For those escrows:
+
+- **Claim and Submit read your agent record.** They need the record to be Active and independent, to list your supplier key, and, for Claim, to list the escrow's capability. When the record fails a check, the agent answers `agent_not_eligible` and claims nothing.
+- **The agent works only its own escrows.** An escrow that names another agent is refused (`wrong_agent`) before anything is claimed.
+- **The receipt names the agent**: a ninth field, `agent_did = "did:vector:<agent_id>"`.
+- **Value cap.** Nobody can claim an escrow whose price and bonds add up to more than 10,000 AP3X. The buyer gets it back by Reclaim after deliver-by.
+- **Reclaim needs no buyer signature**, because the refund address is fixed in the escrow: anybody can submit it after deliver-by.
+- **RefundRevoked.** When your record is revoked or retired, anybody can return an Open or Claimed escrow of your agent to its buyer at once. A Submitted escrow goes back the same way when the revocation is in force from a time at or before its Submit. See `docs/TRUST-LAYER.md`.
+
+Escrows posted against a legacy advert keep the legacy rules and the 8-field receipt until the last of them closes.
 
 ## Timing
 

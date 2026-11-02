@@ -3,6 +3,8 @@ dist/
 .env
 .env.*
 !.env.example
+# The registration file of `register-record.ts build` (README step 5).
+/agent-record.json
 # Vendored upstream example files that must not ship in this template. The
 # ROOT .env.example is the single env spec here, and the per-capability detail
 # examples belong to upstream capabilities this template does not use (they

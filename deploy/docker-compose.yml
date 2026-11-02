@@ -1,6 +1,10 @@
 services:
   agent:
     build: { context: .., dockerfile: agent/Dockerfile }
+    # The whole .env reaches the agent, including the agent record settings
+    # (AGENT_ID, IDENTITY_POLICY_ID, IDENTITY_ESCROW_REF_UTXO,
+    # IDENTITY_ADVERT_REF_UTXO). Without AGENT_ID the agent works legacy
+    # escrows only. Recreate the container after you edit .env.
     env_file: ../.env
     ports: ["8080:8080"]
     depends_on: [echo]
