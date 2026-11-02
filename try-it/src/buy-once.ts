@@ -4,12 +4,13 @@
  *   corepack pnpm --filter try-it exec tsx src/buy-once.ts \
  *     --advert-ref <txHash#ix> --endpoint http://host:8080 --payload-file ./payload.txt
  *
- * Flow: preflight the blueprint -> read the advert -> PREFLIGHT THE WALLET (can
- * this wallet still Accept after it posts?) -> post the bonded escrow -> check
- * the posted datum commits our bytes -> hand the agent the job -> poll ->
- * resolve the Submitted escrow -> verify the receipt offline AND against chain
- * state -> Accept (which releases payment). Exit 0 means: settled on chain and
- * the receipt verified. Anything else exits non-zero with one line on stderr.
+ * Flow: preflight the blueprints -> read the advert (either layout) -> pick the
+ * escrow layout -> PREFLIGHT THE WALLET (can this wallet still Accept after it
+ * posts?) -> post the bonded escrow -> check the posted datum commits our bytes
+ * -> hand the agent the job -> poll -> resolve the Submitted escrow -> verify
+ * the receipt offline AND against chain state -> Accept (which releases
+ * payment). Exit 0 means: settled on chain and the receipt verified. Anything
+ * else exits non-zero with one line on stderr.
  *
  * The wallet pre-flight is not a nicety. On the first mainnet run the escrow
  * posted, the job ran, Submit landed, and Accept then failed with
@@ -18,28 +19,37 @@
  * the supplier's Release taking payment and both bonds. Money must not move
  * until the wallet can finish the whole settlement.
  *
+ * ─── ESCROW LAYOUTS ───
+ *
+ * The advert decides the escrow (upstream docs/IDENTITY_REGISTRY.md §6, §9.6).
+ * A legacy advert gives a legacy escrow. An advert with an `agent_id` gives an
+ * escrow that carries the same `agent_id` and a `refund` address (this buyer's
+ * own address), and its Post must first pass the listing rule: the agent's
+ * record is live, independent and Active, lists the supplier key and the
+ * capability, and the indexer lists the advert (see ./identity.ts). The
+ * receipt of such an escrow has a ninth field, `agent_did`. From SWITCH_SLOT
+ * on, a legacy advert is refused: the marketplace no longer lists it.
+ *
  * ─── ESCROW BUILDER CHOICE (read this before changing the payload shape) ───
  *
  * Builder: `buildPostEscrowTx` (the generic `packages/shared/src/tx/escrow/postEscrow.ts`).
  *
  * Why: the custom capability's wire contract is `escrow.prompt_hash ===
- * sha256(utf8(payload))` over the RAW payload string (agent/src/routes/custom.ts),
- * and NO vendored builder accepts a precomputed prompt_hash - each computes its
- * own: postEscrow hashes `canonicalize(messages)`, postChatEscrow hashes a
- * session-nonce envelope, postOcrEscrow/postTtsEscrow hash their own request
- * envelopes. So the buyer cannot choose the hash; it can only choose the
- * PREIMAGE. This harness therefore puts that preimage on the wire verbatim:
- * the payload string it POSTs IS `canonicalize([{content: <your file>, role: "user"}])`,
- * the exact bytes postEscrow hashed. Contract satisfied with zero
- * re-implementation, and the agent still does no canonicalisation of its own.
+ * sha256(utf8(payload))` over the RAW payload string (agent/src/routes/custom.ts).
+ * The builder takes either `messages`, and then hashes `canonicalize(messages)`,
+ * or a precomputed `prompt_hash`. This harness takes the `messages` path and
+ * puts that preimage on the wire verbatim: the payload string it POSTs IS
+ * `canonicalize([{content: <your file>, role: "user"}])`, the exact bytes
+ * postEscrow hashed. Contract satisfied with zero re-implementation, and the
+ * agent still does no canonicalisation of its own.
  *
- * Consequence, stated plainly: with the vendored builders, a buyer's payload is
- * that one-element canonical chat envelope, not arbitrary bytes. The AGENT side
- * is fully general - any buyer able to commit an arbitrary prompt_hash may send
- * any string - so lifting this means an upstream builder that takes a
- * precomputed prompt_hash, not a change here. Step 5 below re-reads the posted
- * datum and aborts BEFORE the agent is called if the two hashes ever diverge,
- * so builder drift surfaces as one clear line instead of a 409 per purchase.
+ * Consequence, stated plainly: a payload from this harness is that one-element
+ * canonical chat envelope, not arbitrary bytes, and buy-once.wire.test.ts pins
+ * those bytes. The AGENT side is fully general - a buyer that commits its own
+ * prompt_hash (the builder's `prompt_hash` option) may send any string. Step 5
+ * below re-reads the posted datum and aborts BEFORE the agent is called if the
+ * two hashes ever diverge, so builder drift surfaces as one clear line instead
+ * of a 409 per purchase.
  *
  * ─── Order of operations ───
  * Verification happens BEFORE Accept, not after (the brief's flow verified
@@ -55,11 +65,18 @@
  * signs an on-chain Accept endorsing work whose receipt does not verify: the
  * settlement record stays honest, and the failure is visible as a Release
  * rather than an Accept. The funds are gone; the evidence is not corrupted.
+ * (An escrow with an `agent_id` has one more exit, RefundRevoked, but only
+ * when the agent's record is revoked; this harness does not build it.)
  *
  * Env: BUYER_PRIV_KEY_HEX, OGMIOS_URL, NETWORK_ID, VECTOR_ZERO_TIME_MS (all required).
  * VECTOR_ZERO_TIME_MS is required rather than defaulted on purpose: the vendored
  * slot maths falls back to a testnet genesis when it is unset, which produces
  * confident, wrong validity ranges (PastHorizon) instead of an error.
+ * An advert with an `agent_id` also needs IDENTITY_POLICY_ID (the identity
+ * registry's policy ID) and INDEXER_URL (default on NETWORK_ID=1: the public
+ * mainnet indexer). Optional: IDENTITY_ESCROW_REF_UTXO (the published escrow
+ * script; without it the escrow spends carry the script inline) and
+ * SWITCH_SLOT (from this chain slot on, refuse a legacy advert).
  */
 
 import { existsSync, readFileSync } from "fs";
@@ -72,12 +89,27 @@ import { bech32 } from "bech32";
 
 import { LiveOgmiosProvider } from "@marketplace/shared/chain";
 import type { OutputReference } from "@marketplace/shared/chain";
-import { decodeAdvertDatum, decodeEscrowDatum, canonicalize } from "@marketplace/shared/cbor";
-import type { EscrowDatum } from "@marketplace/shared/cbor";
-import { buildPostEscrowTx, buildAcceptTx } from "@marketplace/shared/tx";
-import type { ChatMessage, WalletKey } from "@marketplace/shared/tx";
+import { canonicalize, plutusAddressFromBech32 } from "@marketplace/shared/cbor";
+import type { AdvertDatum, AnyEscrowDatum, EscrowDatum, IdentityEscrowDatum } from "@marketplace/shared/cbor";
+import { vectorDid } from "@marketplace/shared/identity";
+import {
+  buildPostEscrowTx,
+  buildAcceptTx,
+  escrowLockFloor,
+  loadIdentityBlueprint,
+  NETWORK_BUFFER_MS,
+} from "@marketplace/shared/tx";
+import type { ChatMessage, IdentityBlueprint, PostEscrowLayoutOptions, WalletKey } from "@marketplace/shared/tx";
 
 import { verifyReceipt, verifyChainBindings } from "./verify-receipt.js";
+import {
+  chainRecordLookup,
+  decodeAdvert,
+  decodeEscrow,
+  indexerAdvertSigners,
+  MAINNET_INDEXER_URL,
+  postLayout,
+} from "./identity.js";
 
 // @noble/ed25519 v2 sync API needs a sha512 hook installed at load time.
 ed.etc.sha512Sync = (...messages: Uint8Array[]): Uint8Array => {
@@ -115,6 +147,12 @@ export interface EnvConfig {
   ogmiosUrl: string;
   networkId: 0 | 1;
   zeroTimeMs: number;
+  /** IDENTITY_POLICY_ID (56 lowercase hex); null when unset. Needed for an advert with an agent_id. */
+  identityPolicyId: string | null;
+  /** INDEXER_URL, else the public mainnet indexer on NETWORK_ID=1, else "". Needed for an advert with an agent_id. */
+  indexerUrl: string;
+  /** SWITCH_SLOT: from this chain slot on, a legacy advert is refused; null when unset. */
+  switchSlot: number | null;
 }
 
 /** Thrown for every expected failure; `reason` is the machine-readable code. */
@@ -202,7 +240,26 @@ export function loadEnvConfig(env: Record<string, string | undefined>): EnvConfi
       "VECTOR_ZERO_TIME_MS is required (network genesis, ms). Unset, the tx builders fall back to a testnet genesis and emit wrong validity ranges",
     );
   }
-  return { privKeyHex, ogmiosUrl, networkId: env.NETWORK_ID === "1" ? 1 : 0, zeroTimeMs };
+  const networkId = env.NETWORK_ID === "1" ? 1 : 0;
+
+  // Identity settings: needed only for an advert with an agent_id, so they are
+  // validated when set and checked for presence in main(), once the advert is read.
+  const identityPolicyId = env.IDENTITY_POLICY_ID ? env.IDENTITY_POLICY_ID.toLowerCase() : null;
+  if (identityPolicyId !== null && !/^[0-9a-f]{56}$/.test(identityPolicyId)) {
+    throw new BuyError("bad_env", "IDENTITY_POLICY_ID must be 56 hex characters (the identity registry's policy ID)");
+  }
+  const indexerUrl = (env.INDEXER_URL || (networkId === 1 ? MAINNET_INDEXER_URL : "")).replace(/\/+$/, "");
+  if (indexerUrl !== "" && !/^https?:\/\//.test(indexerUrl)) {
+    throw new BuyError("bad_env", `INDEXER_URL must be an http(s) URL (got: ${indexerUrl})`);
+  }
+  let switchSlot: number | null = null;
+  if (env.SWITCH_SLOT) {
+    if (!/^\d+$/.test(env.SWITCH_SLOT) || !Number.isSafeInteger(Number(env.SWITCH_SLOT))) {
+      throw new BuyError("bad_env", `SWITCH_SLOT must be a non-negative integer chain slot (got: ${env.SWITCH_SLOT})`);
+    }
+    switchSlot = Number(env.SWITCH_SLOT);
+  }
+  return { privKeyHex, ogmiosUrl, networkId, zeroTimeMs, identityPolicyId, indexerUrl, switchSlot };
 }
 
 // ─── wallet ────────────────────────────────────────────────────────────────
@@ -342,6 +399,53 @@ export function checkSettlementFunds(utxos: WalletUtxoLike[], lockLovelace: bigi
 }
 
 /**
+ * The lovelace the Post will lock: payment + both bonds, raised to the
+ * min-ada of the escrow output in its largest (Submitted) state. That floor
+ * follows the datum size, and an escrow with an `agent_id` carries two more
+ * fields (`agent_id`, `refund`), so its floor is higher. The vendored
+ * `escrowLockFloor` computes it, over the datum this Post writes; the
+ * timestamps only need the right CBOR width, not the exact value.
+ */
+export function escrowLockLovelace(opts: {
+  advert: AdvertDatum;
+  advertRef: OutputReference;
+  /** The advert's agent_id; null for a legacy advert. */
+  agentId: string | null;
+  buyerKey: WalletKey;
+  promptHash: string;
+  nowMs: number;
+}): bigint {
+  const { advert } = opts;
+  const open: EscrowDatum = {
+    buyer_pkh: opts.buyerKey.pubKeyHash,
+    supplier_pkh: advert.supplier_pkh,
+    advert_ref: opts.advertRef,
+    capability_id: advert.capability_id,
+    request_spec_hash: sha256Utf8Hex(canonicalize({
+      capability_id: advert.capability_id,
+      max_output_tokens: advert.max_output_tokens,
+      model: advert.model,
+    })),
+    prompt_hash: opts.promptHash,
+    payment_lovelace: advert.price_lovelace,
+    buyer_bond_lovelace: advert.buyer_bond_lovelace,
+    supplier_bond_lovelace: advert.supplier_bond_lovelace,
+    deliver_by: opts.nowMs + advert.max_processing_ms + NETWORK_BUFFER_MS,
+    posted_at: opts.nowMs,
+    submitted_at: null,
+    result_receipt_hash: null,
+    state: "Open",
+  };
+  const datum: EscrowDatum | IdentityEscrowDatum = opts.agentId === null ? open : {
+    ...open,
+    agent_id: opts.agentId,
+    // The Post writes the buyer's own address, with no datum (§6.5).
+    refund: { address: plutusAddressFromBech32(opts.buyerKey.address), datum: null },
+  };
+  return escrowLockFloor(datum, advert.price_lovelace + advert.buyer_bond_lovelace + advert.supplier_bond_lovelace);
+}
+
+/**
  * The `custom` route mounts `express.json({ limit: "1mb" })`, so an oversized
  * body is rejected by the parser — after the escrow is funded, with the job
  * unclaimable and the money already committed. Refuse client-side instead, with
@@ -362,22 +466,27 @@ function refStr(ref: OutputReference): string {
 }
 
 /**
- * Both live builders we call (PostEscrow via `loadBlueprint`, Accept via
- * `loadEscrowScript`) read the compiled validator blueprint from
- * `<repo>/contracts/marketplace/plutus.json`, resolved relative to the shared
- * package. `scripts/sync-core.sh` vendors it from the same upstream commit as
- * the code; it goes missing only if the tree was assembled by hand or the file
- * was deleted. Checking first turns a mid-flight ENOENT into one sentence that
- * says what to run. Nothing is submitted before this runs, so a miss costs
- * nothing but the trip.
+ * The live builders we call read two compiled validator blueprints, resolved
+ * relative to the shared package: `<repo>/contracts/marketplace/plutus.json`
+ * for a legacy escrow (PostEscrow via `loadBlueprint`, Accept via
+ * `loadEscrowScript`) and `<repo>/contracts/identity-marketplace/plutus.json`
+ * for an escrow with an `agent_id` (`loadIdentityBlueprint`).
+ * `scripts/sync-core.sh` vendors both from the same upstream commit as the
+ * code; one goes missing only if the tree was assembled by hand or the file was
+ * deleted. Checking first turns a mid-flight ENOENT into one sentence that says
+ * what to run. Nothing is submitted before this runs, so a miss costs nothing
+ * but the trip.
  */
-function preflightBlueprint(): void {
-  const path = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "contracts", "marketplace", "plutus.json");
-  if (!existsSync(path)) {
-    throw new BuyError(
-      "blueprint_missing",
-      `${path} not found — the escrow tx builders need the compiled validator blueprint. Re-vendor it with "scripts/sync-core.sh <path-to-agents-marketplace-clone>", which pins it to the same commit as the code; do NOT hand-copy a blueprint from elsewhere, a different build derives a different script address`,
-    );
+function preflightBlueprints(): void {
+  const contracts = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "contracts");
+  for (const project of ["marketplace", "identity-marketplace"]) {
+    const path = resolve(contracts, project, "plutus.json");
+    if (!existsSync(path)) {
+      throw new BuyError(
+        "blueprint_missing",
+        `${path} not found — the escrow tx builders need the compiled validator blueprint. Re-vendor it with "scripts/sync-core.sh <path-to-agents-marketplace-clone>", which pins it to the same commit as the code; do NOT hand-copy a blueprint from elsewhere, a different build derives a different script address`,
+      );
+    }
   }
 }
 
@@ -448,10 +557,11 @@ function errDetail(body: unknown, fallback: string): string {
  * it through the marketplace indexer (`/escrows?buyer=`); this template ships no
  * indexer, so we scan the escrow script address on Ogmios and match the datum
  * against our own commitment on every immutable field we hold: buyer pkh,
- * supplier pkh, advert ref, prompt hash, and the `posted_at` read off our own
- * escrow. The state machine carries all of them through Claim and Submit
- * unchanged; `posted_at` is what keeps a second run of the same payload file
- * from being mistaken for this one.
+ * supplier pkh, advert ref, prompt hash, the agent (an escrow with an
+ * `agent_id` keeps it), and the `posted_at` read off our own escrow. The state
+ * machine carries all of them through Claim and Submit unchanged; `posted_at`
+ * is what keeps a second run of the same payload file from being mistaken for
+ * this one.
  */
 async function resolveSubmittedEscrow(opts: {
   chain: LiveOgmiosProvider;
@@ -461,6 +571,8 @@ async function resolveSubmittedEscrow(opts: {
   advertRef: OutputReference;
   promptHash: string;
   postedAt: number;
+  /** agent_id of our escrow; null for a legacy escrow. */
+  agentId: string | null;
   timeoutMs: number;
   intervalMs: number;
 }): Promise<{ ref: OutputReference; datum: EscrowDatum }> {
@@ -470,12 +582,14 @@ async function resolveSubmittedEscrow(opts: {
     const matches: Array<{ ref: OutputReference; datum: EscrowDatum }> = [];
     for (const u of utxos) {
       if (!u.datumHex) continue;
-      let datum: EscrowDatum;
+      let escrow: AnyEscrowDatum;
       try {
-        datum = decodeEscrowDatum(u.datumHex);
+        escrow = decodeEscrow(u.datumHex);
       } catch {
         continue; // not an escrow datum we understand — someone else's UTxO
       }
+      const datum = escrow.datum;
+      const agentId = escrow.layout === "identity" ? escrow.datum.agent_id : null;
       if (
         datum.state === "Submitted" &&
         datum.buyer_pkh === opts.buyerPkh &&
@@ -483,7 +597,8 @@ async function resolveSubmittedEscrow(opts: {
         datum.advert_ref.txHash === opts.advertRef.txHash &&
         datum.advert_ref.index === opts.advertRef.index &&
         datum.prompt_hash === opts.promptHash &&
-        datum.posted_at === opts.postedAt
+        datum.posted_at === opts.postedAt &&
+        agentId === opts.agentId
       ) {
         matches.push({ ref: u.ref, datum });
       }
@@ -608,7 +723,7 @@ export async function main(argv: string[], env: Record<string, string | undefine
 
   try {
     // ── 0. Can we even build the txs? ─────────────────────────────────────
-    preflightBlueprint();
+    preflightBlueprints();
 
     // ── 1. Payload -> the exact bytes both sides commit to ────────────────
     let payloadText: string;
@@ -632,24 +747,66 @@ export async function main(argv: string[], env: Record<string, string | undefine
     log(`advert    ${refStr(args.advertRef)}`);
     log(`prompt    sha256=${promptHash} (${wirePayload.length} bytes on the wire)`);
 
-    // ── 2. Read the advert (price, SLA, capability) ───────────────────────
+    // ── 2. Read the advert (layout, agent, price, SLA, capability) ────────
     const advertUtxo = await chainStep("advert_query_failed", () => chain.queryUtxo(args.advertRef));
     if (advertUtxo === null || !advertUtxo.datumHex) {
       throw new BuyError("advert_not_found", `no advert UTxO with an inline datum at ${refStr(args.advertRef)}`);
     }
-    const advert = decodeAdvertDatum(advertUtxo.datumHex);
+    const advertAnyLayout = decodeAdvert(advertUtxo.datumHex);
+    const advert = advertAnyLayout.datum;
+    const agentId = advertAnyLayout.layout === "identity" ? advertAnyLayout.datum.agent_id : null;
     if (advert.status !== "Active") {
       throw new BuyError("advert_not_active", `advert status is ${advert.status}`);
     }
     const totalLovelace = advert.price_lovelace + advert.buyer_bond_lovelace + advert.supplier_bond_lovelace;
     log(`capability ${advert.capability_id} model=${advert.model}`);
+    log(`agent     ${agentId === null ? "none (legacy advert)" : vectorDid(agentId)}`);
     log(`price     ${advert.price_lovelace} lovelace (+bonds -> ${totalLovelace} locked), sla=${advert.max_processing_ms}ms`);
 
+    // ── 2b. The escrow layout: the advert decides, the switch slot narrows ─
+    const tipSlot = await chainStep("tip_query_failed", () => chain.tip());
+    const escrowLayout = postLayout(tipSlot, cfg.switchSlot);
+    if (escrowLayout === "identity" && agentId === null) {
+      throw new BuyError(
+        "advert_layout_mismatch",
+        `from SWITCH_SLOT ${cfg.switchSlot} on, a Post needs an advert with an agent_id, and ${refStr(args.advertRef)} is a legacy advert, which the marketplace no longer lists — register the agent record and post a new advert`,
+      );
+    }
+    let identityBlueprint: IdentityBlueprint | undefined;
+    let layoutOptions: PostEscrowLayoutOptions = { escrowLayout };
+    if (agentId !== null) {
+      if (cfg.identityPolicyId === null) {
+        throw new BuyError(
+          "identity_not_configured",
+          `the advert names agent ${vectorDid(agentId)}; set IDENTITY_POLICY_ID (the identity registry's policy ID) to post its escrow`,
+        );
+      }
+      if (cfg.indexerUrl === "") {
+        throw new BuyError(
+          "indexer_not_configured",
+          "an advert with an agent_id is checked against the indexer listing; set INDEXER_URL (it has a default on NETWORK_ID=1 only)",
+        );
+      }
+      identityBlueprint = loadIdentityBlueprint({ identityHash: cfg.identityPolicyId });
+      layoutOptions = {
+        escrowLayout,
+        identityBlueprint,
+        lookupRecord: chainRecordLookup(chain, identityBlueprint, cfg.networkId),
+        lookupAdvertSigners: indexerAdvertSigners(chain, cfg.indexerUrl),
+      };
+    }
+
     // ── 3. Wallet pre-flight — the last point where nothing is at stake ───
-    // The escrow lock is payment + both bonds, floored at the live builder's
-    // 2 ADA min-utxo (escrowLockFloor only exceeds the economic total for
-    // locks smaller than that floor).
-    const lockLovelace = totalLovelace < 2_000_000n ? 2_000_000n : totalLovelace;
+    // The escrow lock is payment + both bonds, raised to the escrow output's
+    // min-ada when that is higher (escrowLockLovelace).
+    const lockLovelace = escrowLockLovelace({
+      advert,
+      advertRef: args.advertRef,
+      agentId,
+      buyerKey,
+      promptHash,
+      nowMs: Date.now(),
+    });
     const walletUtxos = await chainStep("wallet_query_failed", () => chain.queryUtxosByAddress(buyerKey.address));
     const funds = checkSettlementFunds(walletUtxos, lockLovelace);
     if (!funds.ok) {
@@ -658,6 +815,8 @@ export async function main(argv: string[], env: Record<string, string | undefine
     log(`wallet    ${walletUtxos.length} UTxO(s), collateral + working balance sufficient for lock ${lockLovelace}`);
 
     // ── 4. Post the escrow ────────────────────────────────────────────────
+    // For an advert with an agent_id the builder first checks the listing
+    // rule through the two lookups, then copies agent_id and sets refund.
     log("post-escrow: building + submitting...");
     const posted = await chainStep("escrow_post_failed", () => buildPostEscrowTx({
       chain,
@@ -665,6 +824,7 @@ export async function main(argv: string[], env: Record<string, string | undefine
       advertRef: args.advertRef,
       messages,
       payment_lovelace: advert.price_lovelace,
+      ...layoutOptions,
     }));
     log(`post-escrow: submitted ${posted.expectedTxHash}, awaiting confirmation`);
     await chainStep("escrow_confirm_failed", () => chain.awaitTx(posted.expectedTxHash, args.awaitTimeoutMs));
@@ -676,11 +836,19 @@ export async function main(argv: string[], env: Record<string, string | undefine
     if (escrowUtxo === null || !escrowUtxo.datumHex) {
       throw new BuyError("escrow_not_found", `escrow UTxO ${refStr(escrowRef)} vanished after confirmation`);
     }
-    const escrowDatum = decodeEscrowDatum(escrowUtxo.datumHex);
+    const escrowAnyLayout = decodeEscrow(escrowUtxo.datumHex);
+    const escrowDatum = escrowAnyLayout.datum;
     if (escrowDatum.prompt_hash !== promptHash) {
       throw new BuyError(
         "prompt_hash_contract_broken",
         `escrow commits ${escrowDatum.prompt_hash} but the payload on the wire hashes to ${promptHash} — the escrow builder no longer hashes the bytes we send; see the builder-choice note in buy-once.ts`,
+      );
+    }
+    const escrowAgentId = escrowAnyLayout.layout === "identity" ? escrowAnyLayout.datum.agent_id : null;
+    if (escrowAgentId !== agentId) {
+      throw new BuyError(
+        "escrow_agent_mismatch",
+        `the posted escrow names agent ${escrowAgentId ?? "none"}, the advert ${agentId ?? "none"} — the escrow builder no longer copies the advert's agent_id`,
       );
     }
     const escrowAddress = escrowUtxo.address;
@@ -726,6 +894,7 @@ export async function main(argv: string[], env: Record<string, string | undefine
       advertRef: args.advertRef,
       promptHash,
       postedAt: escrowDatum.posted_at,
+      agentId: escrowAgentId,
       timeoutMs: SUBMITTED_LOOKUP_TIMEOUT_MS,
       intervalMs: args.pollIntervalMs,
     }));
@@ -755,20 +924,27 @@ export async function main(argv: string[], env: Record<string, string | undefine
       escrowRefPosted: refStr(escrowRef),
       advertSupplierPkh: advert.supplier_pkh,
       supplierPubKeyHex: pubKeyHex,
+      escrowAgentId,
     });
     if (!bound.ok) {
       throw new BuyError("receipt_unbound", `${bound.reason} — ${abortNote}`);
     }
-    log("receipt   verified (prompt hash, response hash, signature) and bound to chain (result_receipt_hash, escrow_ref, supplier identity)");
+    log("receipt   verified (prompt hash, response hash, signature) and bound to chain (result_receipt_hash, escrow_ref, supplier identity, agent)");
 
     // ──10. Accept: releases payment, closes the escrow ────────────────────
     log(`accept    spending ${refStr(submitted.ref)}`);
-    const accepted = await chainStep("accept_failed", () => buildAcceptTx({ chain, buyerKey, escrowRef: submitted.ref }));
+    const accepted = await chainStep("accept_failed", () => buildAcceptTx({
+      chain,
+      buyerKey,
+      escrowRef: submitted.ref,
+      identityBlueprint,
+    }));
     await chainStep("accept_confirm_failed", () => chain.awaitTx(accepted.expectedTxHash, args.awaitTimeoutMs));
 
     process.stdout.write(`${JSON.stringify({
       escrow_ref: refStr(escrowRef),
       submitted_escrow_ref: refStr(submitted.ref),
+      agent_did: escrowAgentId === null ? null : vectorDid(escrowAgentId),
       job_id: jobId,
       accept_tx: accepted.expectedTxHash,
       verified: true,
