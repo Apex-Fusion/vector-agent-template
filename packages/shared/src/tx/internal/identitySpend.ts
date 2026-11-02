@@ -14,7 +14,7 @@ import type { LiveOgmiosProvider } from "../../chain/LiveOgmiosProvider.js";
 import type { BuildResult, WalletKey } from "../types.js";
 import { detectCborBackend } from "./cborBackend.js";
 import { encodeTxBody, sha256Hex } from "./testTxBody.js";
-import type { ValidityWindow } from "./window.js";
+import type { ValidityWindow } from "../../identity/tx/types.js";
 
 /** An address on the given network (0 testnet, 1 mainnet). */
 export type NetworkAddress = (networkId: 0 | 1) => string;

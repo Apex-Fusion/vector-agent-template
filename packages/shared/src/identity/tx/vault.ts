@@ -74,7 +74,11 @@ export function buildVaultOpen(
   return { ...tx, vaultOutput: 0 };
 }
 
-/** One new escrow of a vault payment (§5.3, §6.1). The builder sets the buyer, the state and the refund. */
+/**
+ * One new escrow of a vault payment (§5.3, §6.1). The builder sets the buyer, the state and the refund. The escrow
+ * output holds exactly payment + buyer bond + supplier bond (`valid_escrow_output` in the vault contract): when the
+ * ledger min-UTxO needs more AP3X, the builder adds the difference to the buyer bond.
+ */
 export interface VaultEscrowJob {
   supplierPkh: string;
   advertRef: OutputReference;
@@ -106,7 +110,10 @@ export interface VaultPayArgs {
   escrows: VaultEscrowJob[];
 }
 
-/** Pay: moves AP3X from a Live vault into new escrows whose refunds return to VA as Returned outputs. */
+/**
+ * Pay: moves AP3X from a Live vault into new escrows whose refunds return to VA as Returned outputs. Each escrow output
+ * holds exactly its payment + buyer bond + supplier bond; a min-UTxO top-up goes into the buyer bond.
+ */
 export function buildVaultPay(ctx: TxContext, scripts: VaultScripts, args: VaultPayArgs): UnsignedTx & { escrowOutputs: number[]; vaultOutput: number } {
   const vault = readVault(scripts, args.vault);
   if (vault.datum.type !== "Live") refuse("vault_returned", "Pay needs a Live vault output; Returned outputs only close");

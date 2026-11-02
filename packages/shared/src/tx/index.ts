@@ -11,8 +11,6 @@ export {
   mockSlotToWallclockMs,
   mockWallclockMsToSlot,
   NETWORK_BUFFER_MS,
-  MAX_RANGE_MS,
-  ESCROW_VALUE_CAP_LOVELACE,
   ESCROW_INPUT_CAP_LOVELACE,
 } from "./internal/constants.js";
 export { detectCborBackend, type CborBackend } from "./internal/cborBackend.js";
@@ -29,11 +27,9 @@ export type { MarketplaceLayout } from "./internal/layout.js";
 export { isIdentityAdvertDatum, isIdentityEscrowDatum } from "./internal/layout.js";
 
 // Identity checks of the new escrow and advert builders (Part 2 §6.1, §6.2).
-export type { RecordLookup, AdvertSignersLookup, EffectiveStatus, AgentWorkCheck } from "./identityRecord.js";
+export type { RecordLookup, AdvertSignersLookup, AgentWorkCheck } from "./identityRecord.js";
 export {
   readAgentRecord,
-  rootEffectiveStatus,
-  recordHasKey,
   agentWorkProblem,
   assertAgentCanWork,
 } from "./identityRecord.js";
@@ -85,4 +81,4 @@ export type { ReleaseParams } from "./escrow/release.js";
 export { buildReleaseTx } from "./escrow/release.js";
 export type { RefundRevokedParams } from "./escrow/refundRevoked.js";
 export { buildRefundRevokedTx } from "./escrow/refundRevoked.js";
-export { refundAllowed } from "./escrow/identityEscrow.js";
+export { assertEscrowWithinCap, refundAllowed } from "./escrow/identityEscrow.js";

@@ -4,6 +4,7 @@ import { constants } from "node:fs";
 import { chmod, mkdir, open, rename } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { VECTOR_MAINNET_SLOT_CONFIG } from "@marketplace/shared";
 import { LiveOgmiosProvider, type OutputReference } from "@marketplace/shared/chain";
 import type { AdvertDatum, IdentityAdvertDatum } from "@marketplace/shared/cbor";
 import {
@@ -54,7 +55,7 @@ interface SetupResult {
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api";
 const SHA256_EMPTY = createHash("sha256").update("").digest("hex");
-const MAINNET_ZERO_TIME_MS = "1756485600000";
+const MAINNET_ZERO_TIME_MS = String(VECTOR_MAINNET_SLOT_CONFIG.zeroTimeMs);
 const MAINNET_ESCROW_REF =
   "c8d84c6d67ec67a1efe5e9c6c06d53020e05d1bb96d1c55ecb1eb7d5010c4d54#0";
 const MAINNET_ADVERT_REF =

@@ -1,20 +1,15 @@
 /**
  * tx/internal/constants.ts — shared constants for M1-B tx builders.
+ *
+ * The identity constants of the escrow builders (MAX_RANGE_MS, the value cap
+ * MAX_ESCROW_LOVELACE) come from identity/constants.ts.
  */
-
-import { MAX_ESCROW_LOVELACE, MAX_RANGE_MS } from "../../identity/constants.js";
 
 /** ACCEPT_WINDOW_MS — 10 minutes in ms (escrow.ak: accept_window_ms). */
 export const ACCEPT_WINDOW_MS = 600_000;
 
 /** Buyer-side network-buffer added to deliver_by computation. ARCHITECTURE.md §4.3. */
 export const NETWORK_BUFFER_MS = 30_000;
-
-/** Longest validity range (hi − lo) of every escrow transaction: one hour (Part 2 §6.5). */
-export { MAX_RANGE_MS };
-
-/** Largest payment + buyer bond + supplier bond of an escrow (Part 2 §6.5, F-29): 10,000 AP3X. */
-export const ESCROW_VALUE_CAP_LOVELACE = MAX_ESCROW_LOVELACE;
 
 /** Most AP3X that the escrow input may hold for a Claim (Part 2 §6.1): 10,005 AP3X. */
 export const ESCROW_INPUT_CAP_LOVELACE = 10_005_000_000n;

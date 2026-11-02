@@ -25,11 +25,10 @@ import {
   type IdentityAdvertDatum,
   type IdentityEscrowDatum,
 } from "@marketplace/shared/cbor";
-import { isVectorId, vectorDid } from "@marketplace/shared/identity";
+import { isVectorId, MAX_ESCROW_LOVELACE, vectorDid } from "@marketplace/shared/identity";
 import {
   agentWorkProblem,
   ESCROW_INPUT_CAP_LOVELACE,
-  ESCROW_VALUE_CAP_LOVELACE,
   isIdentityAdvertDatum,
   isIdentityEscrowDatum,
   loadIdentityBlueprint,
@@ -117,7 +116,7 @@ export function newEscrowRefusal(
   }
   const total = escrow.payment_lovelace + escrow.buyer_bond_lovelace + escrow.supplier_bond_lovelace;
   if (escrow.payment_lovelace < 0n || escrow.buyer_bond_lovelace < 0n || escrow.supplier_bond_lovelace < 0n ||
-      total > ESCROW_VALUE_CAP_LOVELACE || escrowLovelace > ESCROW_INPUT_CAP_LOVELACE) {
+      total > MAX_ESCROW_LOVELACE || escrowLovelace > ESCROW_INPUT_CAP_LOVELACE) {
     return { status: 409, reason: "escrow_not_claimable",
       message: `escrow amounts (payment + bonds = ${total}, held ${escrowLovelace}) are outside the value cap` };
   }

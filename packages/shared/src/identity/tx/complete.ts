@@ -78,6 +78,16 @@ export function slotAt(ms: number, slots: SlotConfig): bigint {
   return BigInt(slots.zeroSlot + offset / slots.slotLengthMs);
 }
 
+/** Start of the slot that contains `ms`. */
+export function slotFloor(ms: number, slots: SlotConfig): number {
+  return slots.zeroTimeMs + Math.floor((ms - slots.zeroTimeMs) / slots.slotLengthMs) * slots.slotLengthMs;
+}
+
+/** Start of the first slot at or after `ms`. */
+export function slotCeil(ms: number, slots: SlotConfig): number {
+  return slots.zeroTimeMs + Math.ceil((ms - slots.zeroTimeMs) / slots.slotLengthMs) * slots.slotLengthMs;
+}
+
 /** The window rules of every identity, attestation, delegation and vault transaction: lo < hi and hi − lo ≤ 1 hour. */
 export function checkWindow(window: ValidityWindow, slots: SlotConfig): { start: bigint; ttl: bigint } {
   const start = slotAt(window.lo, slots);
@@ -100,10 +110,8 @@ export function validityWindow(
   slots: SlotConfig,
   options: { pastMs?: number; futureMs?: number } = {},
 ): ValidityWindow {
-  const floor = (ms: number): number =>
-    slots.zeroTimeMs + Math.floor((ms - slots.zeroTimeMs) / slots.slotLengthMs) * slots.slotLengthMs;
-  const lo = floor(nowMs - (options.pastMs ?? 60_000));
-  const hi = floor(nowMs + (options.futureMs ?? 600_000));
+  const lo = slotFloor(nowMs - (options.pastMs ?? 60_000), slots);
+  const hi = slotFloor(nowMs + (options.futureMs ?? 600_000), slots);
   checkWindow({ lo, hi }, slots);
   return { lo, hi };
 }

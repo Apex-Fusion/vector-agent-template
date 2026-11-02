@@ -18,15 +18,14 @@
  * package (buildRegister); registrar.ts wraps it as a RecordRegistrar.
  */
 
+import { activeKey } from "@marketplace/shared";
 import type { ChainProvider } from "@marketplace/shared/chain";
 import type { Key, Party, Signer } from "@marketplace/shared/cbor";
 import {
   CAPABILITY_MAX_BYTES, DESCRIPTION_MAX_BYTES, ENDPOINT_MAX_BYTES, MAX_CAPABILITIES, MAX_RANGE_MS, NAME_MAX_BYTES,
   PURPOSE_AUTHENTICATION, PURPOSE_TRANSACTION, ROLE_MAX_RIGHTS, keyHash, vectorDid,
 } from "@marketplace/shared/identity";
-import {
-  readAgentRecord, recordHasKey, type IdentityBlueprint, type WalletKey,
-} from "@marketplace/shared/tx";
+import { readAgentRecord, type IdentityBlueprint, type WalletKey } from "@marketplace/shared/tx";
 import { decodeAdvert } from "./agent.js";
 
 /** The listed supplier key's purposes: authentication + transaction (§9.2). */
@@ -211,7 +210,7 @@ export async function recordsListingKey(
       continue; // not an authentic record output
     }
     if (record.status.type === "Revoked" || record.status.type === "Retired") continue;
-    if (recordHasKey(record, keyHashHex, PURPOSE_TRANSACTION)) agents.push(agentId);
+    if (activeKey(record, keyHashHex, PURPOSE_TRANSACTION)) agents.push(agentId);
   }
   return agents;
 }

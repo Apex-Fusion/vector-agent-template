@@ -32,7 +32,7 @@ import { readFileSync } from "fs";
 import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 
-import { SLOT_CONFIG_NETWORK, validatorToScriptHash } from "@lucid-evolution/lucid";
+import { validatorToScriptHash } from "@lucid-evolution/lucid";
 import type { LucidEvolution, UTxO as LucidUTxO, Script } from "@lucid-evolution/lucid";
 
 import type { OutputReference, Utxo } from "../../chain/ChainProvider.js";
@@ -55,8 +55,10 @@ import { loadBlueprint } from "../blueprint.js";
 import { pkhToEnterpriseAddress } from "./pkhAddress.js";
 import { OgmiosLucidProvider } from "../../chain/OgmiosLucidProvider.js";
 import { createLucidContext } from "./lucidContext.js";
-import { ACCEPT_WINDOW_MS, LOWER_BOUND_BACKPAD_MS, MAX_RANGE_MS, MIN_UTXO_LOVELACE } from "./constants.js";
-import { postWindow, vectorSlotClock } from "./window.js";
+import { MAX_RANGE_MS } from "../../identity/constants.js";
+import { slotCeil, slotFloor } from "../../identity/tx/complete.js";
+import { ACCEPT_WINDOW_MS, LOWER_BOUND_BACKPAD_MS, MIN_UTXO_LOVELACE } from "./constants.js";
+import { postWindow, SUBMIT_WINDOW_MS, vectorSlotClock } from "./window.js";
 
 // Mainnet network id used for all output addresses produced by the live path.
 const MAINNET_ID: 0 | 1 = 1;
@@ -777,12 +779,9 @@ export async function buildLiveTxForSubmit(params: LiveSubmitParams): Promise<Bu
   // because no slot in [tip, tip] could hold it. Push stamp forward to give
   // the chain SUBMIT_WINDOW_MS of headroom for inclusion, capped at
   // deliver_by so deadline_ok stays satisfied.
-  const { zeroTimeMs: VECTOR_ZERO_TIME, slotLengthMs: SLOT_LENGTH } = vectorSlotClock(); // env override for mainnet; default = testnet genesis
-  const SUBMIT_WINDOW_MS = 120_000;            // 2-minute inclusion window
+  // The slot clock: VECTOR_ZERO_TIME_MS on mainnet, else the testnet genesis.
   const tipMs = params.tipMs;
-  const targetUpperMs = Math.min(tipMs + SUBMIT_WINDOW_MS, params.deliverBy);
-  const stampSlot = Math.floor((targetUpperMs - VECTOR_ZERO_TIME) / SLOT_LENGTH);
-  const stampMs = stampSlot * SLOT_LENGTH + VECTOR_ZERO_TIME;
+  const stampMs = slotFloor(Math.min(tipMs + SUBMIT_WINDOW_MS, params.deliverBy), vectorSlotClock());
   if (stampMs <= tipMs) {
     throw new Error(
       `submit_window_too_tight: tipMs=${tipMs} stampMs=${stampMs} deliverBy=${params.deliverBy}`,
@@ -913,9 +912,8 @@ export async function buildLiveTxForReclaim(params: LiveReclaimParams): Promise<
     realWalletUtxos,
     buyerLovelace - params.escrowUtxo.lovelace,
   ) ?? realWalletUtxos;
-  const { zeroTime, slotLength } = SLOT_CONFIG_NETWORK.Mainnet;
-  const refundNotBefore = zeroTime +
-    Math.ceil((params.datum.deliver_by - zeroTime) / slotLength) * slotLength;
+  // createLucidContext gave lucid this slot clock.
+  const refundNotBefore = slotCeil(params.datum.deliver_by, vectorSlotClock());
 
   let signed;
   try {

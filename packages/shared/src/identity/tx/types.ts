@@ -9,7 +9,7 @@
  */
 
 import type { OutputReference, Utxo } from "../../chain/ChainProvider.js";
-import type { NetworkId } from "../../network.js";
+import { VECTOR_MAINNET, type NetworkId } from "../../network.js";
 import { TxConstructionError } from "../../tx/types.js";
 import type { ExUnits, RedeemerTag, TxOutput } from "./ledger.js";
 
@@ -22,8 +22,12 @@ export interface SlotConfig {
   slotLengthMs: number;
 }
 
-/** Vector mainnet (Part 1 §4): system start 2025-08-29T16:40:00Z, one slot per second. */
-export const VECTOR_MAINNET_SLOT_CONFIG: SlotConfig = { zeroTimeMs: 1_756_485_600_000, zeroSlot: 0, slotLengthMs: 1000 };
+/** Vector mainnet (Part 1 §4), from the genesis values of network.ts: slot 0 starts at the system start. */
+export const VECTOR_MAINNET_SLOT_CONFIG: SlotConfig = {
+  zeroTimeMs: VECTOR_MAINNET.systemStartUnix * 1000,
+  zeroSlot: 0,
+  slotLengthMs: VECTOR_MAINNET.slotLengthMs,
+};
 
 /**
  * The protocol parameters that the builders use. The shape is a subset of

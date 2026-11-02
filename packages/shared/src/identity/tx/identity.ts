@@ -20,8 +20,8 @@ import type { PlutusData } from "../../cbor/plutus-data.js";
 import { buildAllowlistTree, verifyAllowlistProof } from "../allowlist.js";
 import {
   CAPABILITY_MAX_BYTES, DAYS_30_MS, DAYS_7_MS, DESCRIPTION_MAX_BYTES, ENDPOINT_MAX_BYTES, FRAMEWORK_MAX_BYTES,
-  MAX_CAPABILITIES, MAX_DEPTH, MIN_RECORD_LOVELACE, NAME_MAX_BYTES, RIGHT_RECOVER, RIGHT_REVOKE, RIGHT_SUSPEND,
-  ROLE_MAX_RIGHTS,
+  MAX_CAPABILITIES, MAX_DEPTH, MAX_RANGE_MS, MIN_RECORD_LOVELACE, NAME_MAX_BYTES, RIGHT_RECOVER, RIGHT_REVOKE,
+  RIGHT_SUSPEND, ROLE_MAX_RIGHTS,
 } from "../constants.js";
 import { keyHash, utf8FromHex, utf8ToHex, vectorIdFromSeed } from "../id.js";
 import { completeTx, type PlannedMint, type PlannedWithdrawal, type TxPlan } from "./complete.js";
@@ -698,7 +698,10 @@ export interface RevokeArgs extends SpendArgsBase {
   actor: Actor;
   /** Appendix A "Allowed in" Revoke: 0, 1, 3, 4, 5, 9, 65 (64 is Module-1 only). */
   reason: number;
-  /** Empty or in [created_at, lo]; reason 1 (keyCompromise) requires it. */
+  /**
+   * Empty or in [created_at − MAX_RANGE_MS, lo]; reason 1 (keyCompromise) requires it. created_at is the upper
+   * bound of the creating range, so the lower bound reaches back to the creating block.
+   */
   invalidFrom?: number | null;
   /** Only the controller names a successor: its live Root record (reference input); its controller signs. */
   successor?: Utxo;
@@ -713,10 +716,9 @@ export function buildRevoke(ctx: TxContext, scripts: IdentityScripts, args: Revo
   checkReason(args.reason, REVOKE_REASONS, "Revoke");
   const invalidFrom = args.invalidFrom ?? null;
   if (invalidFrom === null && args.reason === REASON_KEY_COMPROMISE) refuse("invalid_from_missing", "reason 1 (keyCompromise) requires invalid_from");
-  // The pinned blueprint (b5d66a6) checks [created_at, lo]. A pending contract fix widens it to
-  // [created_at − 3,600,000, lo]; the narrower range passes both, so the builder keeps it.
-  if (invalidFrom !== null && (invalidFrom < spent.datum.createdAt || invalidFrom > lo)) {
-    refuse("invalid_from_range", `invalid_from must be in [created_at ${spent.datum.createdAt}, lo ${lo}]`);
+  const lowest = spent.datum.createdAt - MAX_RANGE_MS;
+  if (invalidFrom !== null && (invalidFrom < lowest || invalidFrom > lo)) {
+    refuse("invalid_from_range", `invalid_from must be in [created_at − ${MAX_RANGE_MS} = ${lowest}, lo ${lo}]`);
   }
   let successor: string | null = null;
   if (args.successor !== undefined) {

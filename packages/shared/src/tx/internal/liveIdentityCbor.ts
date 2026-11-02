@@ -29,7 +29,7 @@ import {
   assertCollateralCandidate, buildLucidProvider, chainUtxoToLucidScriptInput, reserveScriptSpendCollateral,
   resolveSpendCtx, rethrowAsTxError, withoutInputs, type RefUtxoEnvKey,
 } from "./liveCbor.js";
-import type { ValidityWindow } from "./window.js";
+import type { ValidityWindow } from "../../identity/tx/types.js";
 
 /** The new escrow script (identity_hash applied) and its mainnet address, for publishing as a reference script. */
 export function loadIdentityEscrowScript(

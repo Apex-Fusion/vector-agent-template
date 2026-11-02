@@ -18,20 +18,21 @@ import {
 } from "../../cbor/IdentityEscrowDatum.js";
 import { encodePlutusDataHex } from "../../cbor/plutus-data.js";
 import { plutusAddressToBech32 } from "../../cbor/address.js";
+import { MAX_ESCROW_LOVELACE } from "../../identity/constants.js";
+import type { SlotConfig } from "../../identity/tx/types.js";
 import { loadIdentityBlueprint, type IdentityBlueprint } from "../blueprint.js";
 import { assertAgentCanWork, readAgentRecord, type RecordLookup } from "../identityRecord.js";
 import type { BuildResult, WalletKey } from "../types.js";
 import { TxConstructionError } from "../types.js";
 import { detectCborBackend } from "../internal/cborBackend.js";
 import {
-  ACCEPT_WINDOW_MS, ESCROW_INPUT_CAP_LOVELACE, ESCROW_VALUE_CAP_LOVELACE, MIN_UTXO_LOVELACE, mockSlotToWallclockMs,
+  ACCEPT_WINDOW_MS, ESCROW_INPUT_CAP_LOVELACE, MIN_UTXO_LOVELACE, mockSlotToWallclockMs,
 } from "../internal/constants.js";
 import { submitSpend, type NetworkAddress, type PlannedOutput, type SpendPlan } from "../internal/identitySpend.js";
 import { paidToScript } from "../internal/layout.js";
 import { pkhToEnterpriseAddress } from "../internal/pkhAddress.js";
 import {
   acceptWindow, claimWindow, MOCK_SLOT_CLOCK, nowWindow, reclaimWindow, releaseWindow, submitWindow, vectorSlotClock,
-  type SlotClock,
 } from "../internal/window.js";
 
 export interface IdentityEscrowAt {
@@ -60,7 +61,7 @@ function blueprintFor(escrow: IdentityEscrowAt, given: IdentityBlueprint | undef
 }
 
 /** Tip time and slot clock of the backend: live = wall clock on the Vector slots, mock = slot × 1000. */
-async function chainTime(chain: ChainProvider): Promise<{ tipMs: number; clock: SlotClock }> {
+async function chainTime(chain: ChainProvider): Promise<{ tipMs: number; clock: SlotConfig }> {
   const tipSlot = await chain.tip();
   return detectCborBackend(chain) === "live"
     ? { tipMs: Date.now(), clock: vectorSlotClock() }
@@ -132,11 +133,11 @@ async function agentRecord(
 /**
  * The value cap of Claim (§6.1) and of Post (§6.5, F-29): payment, buyer bond
  * and supplier bond each at least 0, their sum at most 10,000 AP3X, and the
- * escrow output at most 10,005 AP3X.
+ * escrow output, when given, at most 10,005 AP3X.
  */
 export function assertEscrowWithinCap(
   amounts: Pick<IdentityEscrowDatum, "payment_lovelace" | "buyer_bond_lovelace" | "supplier_bond_lovelace">,
-  escrowLovelace: bigint,
+  escrowLovelace?: bigint,
 ): void {
   const { payment_lovelace: payment, buyer_bond_lovelace: buyerBond, supplier_bond_lovelace: supplierBond } = amounts;
   if (payment < 0n || buyerBond < 0n || supplierBond < 0n) {
@@ -146,10 +147,10 @@ export function assertEscrowWithinCap(
     );
   }
   const total = payment + buyerBond + supplierBond;
-  if (total > ESCROW_VALUE_CAP_LOVELACE) {
-    throw new TxConstructionError("escrow above value cap", `payment + bonds = ${total} > ${ESCROW_VALUE_CAP_LOVELACE}`);
+  if (total > MAX_ESCROW_LOVELACE) {
+    throw new TxConstructionError("escrow above value cap", `payment + bonds = ${total} > ${MAX_ESCROW_LOVELACE}`);
   }
-  if (escrowLovelace > ESCROW_INPUT_CAP_LOVELACE) {
+  if (escrowLovelace !== undefined && escrowLovelace > ESCROW_INPUT_CAP_LOVELACE) {
     throw new TxConstructionError("escrow input above cap", `escrow holds ${escrowLovelace} > ${ESCROW_INPUT_CAP_LOVELACE}`);
   }
 }
@@ -307,7 +308,8 @@ export async function acceptIdentity(
  * Reclaim at or after deliver_by. Without `refund` the buyer signs and gets
  * payment + both bonds, as for the legacy escrow. With `refund`, any wallet
  * can submit it, no buyer signature is needed, and the whole escrow value
- * goes to the refund address with exactly the refund datum.
+ * goes to the refund address with exactly the refund datum: the contract
+ * requires the AP3X and every other asset of the escrow input there.
  */
 export async function reclaimIdentity(args: SpendArgs & { walletKey: WalletKey }): Promise<BuildResult> {
   const { chain, escrow, walletKey } = args;
@@ -389,7 +391,8 @@ export async function releaseIdentity(args: SpendArgs & { supplierKey: WalletKey
  * RefundRevoked: any wallet, before or after deliver_by, when the agent's
  * record allows it (refundAllowed). The whole escrow value goes to the refund
  * address with exactly the refund datum, or to the enterprise address of
- * buyer_pkh when `refund` is not set.
+ * buyer_pkh when `refund` is not set: the contract requires the AP3X and
+ * every other asset of the escrow input there.
  */
 export async function refundRevokedIdentity(
   args: SpendArgs & { walletKey: WalletKey; lookupRecord?: RecordLookup; excludeInputs?: readonly OutputReference[] },
