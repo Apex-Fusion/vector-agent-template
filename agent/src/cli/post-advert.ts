@@ -8,6 +8,14 @@
  *
  * Argument parsing uses Node stdlib only (no commander / yargs).
  * Unknown flags throw.
+ *
+ * New advert (Part 2 §6.2, §9.2): --agent-id <64 hex> (default env AGENT_ID)
+ * posts the advert with agent_id at the new advert address. The supplier key
+ * needs a record first (tx:register-record); the flow refuses unless that
+ * record lists the key with the transaction purpose and the capability. The
+ * new advert needs IDENTITY_POLICY_ID (and IDENTITY_ADVERT_REF_UTXO on
+ * mainnet). Without an agent id the CLI posts a legacy advert, which only
+ * lists until the switch (§9.6).
  */
 
 import { createHash } from "crypto";
@@ -19,9 +27,13 @@ import {
   MockChainProvider,
   type ChainProvider,
 } from "@marketplace/shared/chain";
-import type { AdvertDatum } from "@marketplace/shared/cbor";
+import type { AdvertDatum, IdentityAdvertDatum } from "@marketplace/shared/cbor";
 import type { WalletKey } from "@marketplace/shared/tx";
+import { parseAgentId, supplierIdentity } from "../identity/agent.js";
 import { runPostAdvert } from "./postAdvertFlow.js";
+import { PAPER2AGENT_CAPABILITY_ID, PAPER2AGENT_DELIVERY_OVERHEAD_MS, PAPER2AGENT_SUPPLIER_OVERHEAD_MS,
+  paper2AgentManifestHash, paper2AgentModel } from "@marketplace/shared/paper2agent";
+import { readManifest } from "../paper2agent/local.js";
 
 // Wire ed25519 sha512 hook (idempotent — matches buyer/src/index.ts).
 ed.etc.sha512Sync = (...messages: Uint8Array[]): Uint8Array => {
@@ -56,6 +68,8 @@ export interface CliConfig {
   awaitTimeoutMs: number;
   dryRun: boolean;
   useMock: boolean;
+  /** The record's agent for a new advert; undefined posts a legacy advert. */
+  agentId?: string;
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────
@@ -83,6 +97,7 @@ const VALUE_FLAGS = new Set<string>([
   "--detail-uri",
   "--detail-hash",
   "--await-timeout-ms",
+  "--agent-id",
 ]);
 
 // Boolean flags (presence = true; no value follows).
@@ -134,6 +149,7 @@ interface RawFlags {
   detailUri?: string;
   detailHash?: string;
   awaitTimeoutMs?: string;
+  agentId?: string;
   dryRun: boolean;
   useMock: boolean;
 }
@@ -193,6 +209,9 @@ function parseRawArgv(argv: string[]): RawFlags {
         case "--await-timeout-ms":
           out.awaitTimeoutMs = val;
           break;
+        case "--agent-id":
+          out.agentId = val;
+          break;
       }
       i++; // consume the value
       continue;
@@ -228,6 +247,9 @@ export function parseCliArgs(
   env: Record<string, string | undefined>,
 ): CliConfig {
   const flags = parseRawArgv(argv);
+  const toolManifest = env.CAPABILITY_KIND === "paper2agent"
+    ? readManifest(requireEnv(env, "PAPER2AGENT_MANIFEST"))
+    : undefined;
 
   // ── networkId ──
   const networkIdRaw = requireEnv(env, "NETWORK_ID");
@@ -261,22 +283,33 @@ export function parseCliArgs(
   }
 
   // ── advert env required ──
-  const capabilityId = flags.capabilityId ?? requireEnv(env, "ADVERT_CAPABILITY_ID");
-  const model = flags.model ?? requireEnv(env, "ADVERT_MODEL");
+  // An empty variable is absent. Only a Paper2Agent manifest supplies defaults.
+  const advertEnv = (name: string, toolDefault: string | undefined): string =>
+    env[name] || toolDefault || requireEnv(env, name);
+  const capabilityId = flags.capabilityId ??
+    advertEnv("ADVERT_CAPABILITY_ID", toolManifest && PAPER2AGENT_CAPABILITY_ID);
+  const model = flags.model ?? advertEnv("ADVERT_MODEL", toolManifest && paper2AgentModel(toolManifest));
 
-  const maxOutputTokensRaw =
-    flags.maxOutputTokens ?? requireEnv(env, "ADVERT_MAX_OUTPUT_TOKENS");
+  const maxOutputTokensRaw = flags.maxOutputTokens ??
+    advertEnv("ADVERT_MAX_OUTPUT_TOKENS", toolManifest && "0");
   const maxOutputTokens = parseIntStrict(
     "ADVERT_MAX_OUTPUT_TOKENS",
     maxOutputTokensRaw,
   );
 
-  const maxProcessingMsRaw =
-    flags.maxProcessingMs ?? requireEnv(env, "ADVERT_MAX_PROCESSING_MS");
+  // The default also covers the buyer's Post confirmation wait. A shorter
+  // explicit value stays valid while it keeps the supplier's own reserve.
+  const maxProcessingMsRaw = flags.maxProcessingMs ?? advertEnv("ADVERT_MAX_PROCESSING_MS",
+    toolManifest && String(toolManifest.limits.max_runtime_ms + PAPER2AGENT_DELIVERY_OVERHEAD_MS));
   const maxProcessingMs = parseIntStrict(
     "ADVERT_MAX_PROCESSING_MS",
     maxProcessingMsRaw,
   );
+  if (toolManifest && (capabilityId !== PAPER2AGENT_CAPABILITY_ID ||
+      model !== paper2AgentModel(toolManifest) || maxOutputTokens !== 0 ||
+      maxProcessingMs < toolManifest.limits.max_runtime_ms + PAPER2AGENT_SUPPLIER_OVERHEAD_MS)) {
+    throw new Error("Paper2Agent advert must match the manifest and include chain lifecycle time");
+  }
 
   const priceLovelaceRaw =
     flags.priceLovelace ?? requireEnv(env, "ADVERT_PRICE_LOVELACE");
@@ -312,13 +345,18 @@ export function parseCliArgs(
       : env.ADVERT_DETAIL_HASH !== undefined
         ? env.ADVERT_DETAIL_HASH
         : "";
-  const detailHash = detailHashRaw === "" ? SHA256_EMPTY : detailHashRaw;
+  const detailHash = detailHashRaw === ""
+    ? (toolManifest ? paper2AgentManifestHash(toolManifest) : SHA256_EMPTY)
+    : detailHashRaw;
 
   // ── awaitTimeoutMs ──
   const awaitTimeoutMs =
     flags.awaitTimeoutMs === undefined
       ? DEFAULT_AWAIT_TIMEOUT_MS
       : parseIntStrict("--await-timeout-ms", flags.awaitTimeoutMs);
+
+  // ── agentId (new advert; flag overrides env AGENT_ID) ──
+  const agentId = parseAgentId(flags.agentId ?? env.AGENT_ID, "--agent-id / AGENT_ID");
 
   return {
     ogmiosUrl,
@@ -335,6 +373,7 @@ export function parseCliArgs(
     detailUri,
     detailHash,
     awaitTimeoutMs,
+    agentId,
     dryRun: flags.dryRun,
     useMock: flags.useMock,
   };
@@ -407,7 +446,7 @@ export async function main(
     return 1;
   }
 
-  const advertDatum: AdvertDatum = {
+  const legacyDatum: AdvertDatum = {
     supplier_pkh: walletKey.pubKeyHash,
     capability_id: cfg.capabilityId,
     model: cfg.model,
@@ -422,6 +461,9 @@ export async function main(
     advertised_at: 0, // overridden by runPostAdvert from chain tip
     status: "Active",
   };
+  const advertDatum: AdvertDatum | IdentityAdvertDatum = cfg.agentId === undefined
+    ? legacyDatum
+    : { ...legacyDatum, agent_id: cfg.agentId };
 
   const chain: ChainProvider = cfg.useMock
     ? new MockChainProvider()
@@ -443,6 +485,7 @@ export async function main(
       advertDatum,
       awaitTimeoutMs: cfg.awaitTimeoutMs,
       log: (line) => process.stderr.write(`${line}\n`),
+      identity: cfg.agentId === undefined ? undefined : supplierIdentity(chain, cfg.networkId),
     });
     process.stdout.write(`${result.formattedRef}\n`);
     return 0;

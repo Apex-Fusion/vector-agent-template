@@ -10,8 +10,20 @@
  * for vkh enterprise). Input UTxOs may carry testnet-prefixed addresses — lucid
  * does not validate address network for inputs (only for outputs).
  *
- * Deferred builders: only updateAdvert remains on the synthetic testTxBody
- * path. postAdvert, retireAdvert, reclaim, and release all have live builders.
+ * Deferred builders: only the legacy updateAdvert remains on the synthetic
+ * testTxBody path. postAdvert, retireAdvert, reclaim, and release all have
+ * live builders.
+ *
+ * Two layouts (Part 2 §6.5, §9.6): the functions here build the legacy
+ * escrow and advert transactions. buildLiveTxForEscrow and
+ * buildLiveTxForAdvert also create the identity layout when the caller passes
+ * `target` (the new script address and the encoded datum). Spends of the
+ * identity layout are in liveIdentityCbor.ts, which reuses the helpers that
+ * this module exports. Its redeemers come from the IdentityEscrowDatum codec,
+ * which appends RefundRevoked (Constr 5) after Release.
+ *
+ * Validity ranges: every escrow transaction has hi − lo ≤ MAX_RANGE_MS
+ * (Part 2 §6.5), also the legacy PostEscrow and Claim.
  *
  * Catherine M1-F-4-green.
  */
@@ -20,6 +32,7 @@ import { readFileSync } from "fs";
 import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 
+import { SLOT_CONFIG_NETWORK, validatorToScriptHash } from "@lucid-evolution/lucid";
 import type { LucidEvolution, UTxO as LucidUTxO, Script } from "@lucid-evolution/lucid";
 
 import type { OutputReference, Utxo } from "../../chain/ChainProvider.js";
@@ -42,13 +55,11 @@ import { loadBlueprint } from "../blueprint.js";
 import { pkhToEnterpriseAddress } from "./pkhAddress.js";
 import { OgmiosLucidProvider } from "../../chain/OgmiosLucidProvider.js";
 import { createLucidContext } from "./lucidContext.js";
-import { ACCEPT_WINDOW_MS } from "./constants.js";
+import { ACCEPT_WINDOW_MS, LOWER_BOUND_BACKPAD_MS, MAX_RANGE_MS, MIN_UTXO_LOVELACE } from "./constants.js";
+import { postWindow, vectorSlotClock } from "./window.js";
 
 // Mainnet network id used for all output addresses produced by the live path.
 const MAINNET_ID: 0 | 1 = 1;
-
-// Min UTxO floor for outputs (lovelace). 2 ADA matches the test's expectation.
-const MIN_UTXO_LOVELACE = 2_000_000n;
 
 // Redeemer Constr indices per contracts/marketplace/validators/escrow.ak +
 // lib/marketplace/types.ak EscrowRedeemer:
@@ -80,6 +91,12 @@ export interface LivePostEscrowParams {
   totalLocked: bigint;
   deliverBy: number;
   postedAt: number;
+  /** Runs after signing and before any broadcast. Rejection prevents submit. */
+  beforeSubmit?: (built: PostEscrowBuildResult) => Promise<void>;
+  /** Wallet outputs that a submitted, unconfirmed transaction spends; never selected. */
+  excludeInputs?: readonly OutputReference[];
+  /** Identity layout: the new escrow address and the encoded 16-field datum, used instead of the legacy ones. */
+  target?: { address: string; datumHex: string };
 }
 
 export interface LiveClaimParams {
@@ -90,6 +107,7 @@ export interface LiveClaimParams {
   newDatum: EscrowDatum;
   deliverBy: number;
   tipMs: number;
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
 }
 
 export interface LiveSubmitParams {
@@ -101,6 +119,7 @@ export interface LiveSubmitParams {
   deliverBy: number;
   tipMs: number;
   receiptHash: string;
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
 }
 
 export interface LiveAcceptParams {
@@ -111,6 +130,9 @@ export interface LiveAcceptParams {
   datum: EscrowDatum;
   tipMs: number;
   windowEnd: number;
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
+  /** Wallet outputs that a submitted, unconfirmed transaction spends; never selected. */
+  excludeInputs?: readonly OutputReference[];
 }
 
 export interface LiveReclaimParams {
@@ -120,6 +142,7 @@ export interface LiveReclaimParams {
   escrowUtxo: Utxo;
   datum: EscrowDatum;
   tipMs: number;
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
 }
 
 export interface LiveReleaseParams {
@@ -136,6 +159,9 @@ export interface LivePostAdvertParams {
   walletKey: WalletKey;
   advertDatum: AdvertDatum;
   deposit_lovelace: bigint;
+  beforeSubmit?: (built: PostAdvertBuildResult) => Promise<void>;
+  /** Identity layout: the new advert address and the encoded 14-field datum, used instead of the legacy ones. */
+  target?: { address: string; datumHex: string };
 }
 
 export interface LiveRetireAdvertParams {
@@ -170,7 +196,7 @@ function encodeNullaryConstrHex(tag: number): string {
 
 /** Construct an OgmiosLucidProvider that shares the chain's Ogmios endpoint
  * and the chain's injected fetch (so test mocks see lucid's traffic). */
-function buildLucidProvider(chain: LiveOgmiosProvider): OgmiosLucidProvider {
+export function buildLucidProvider(chain: LiveOgmiosProvider): OgmiosLucidProvider {
   return new OgmiosLucidProvider({
     ogmiosUrl: chain.url,
     fetch: chain.fetchImpl,
@@ -257,16 +283,29 @@ function parseRefUtxoEnv(envKey: string): { txHash: string; outputIndex: number 
   return { txHash, outputIndex };
 }
 
+/** Env keys of the reference-script UTxOs. A spender holds the keys of both
+ *  escrows during the drain (Part 2 §6.5): ESCROW_REF_UTXO / ADVERT_REF_UTXO
+ *  for the legacy scripts, IDENTITY_ESCROW_REF_UTXO / IDENTITY_ADVERT_REF_UTXO
+ *  for the new ones. */
+export type RefUtxoEnvKey =
+  | "ESCROW_REF_UTXO"
+  | "ADVERT_REF_UTXO"
+  | "IDENTITY_ESCROW_REF_UTXO"
+  | "IDENTITY_ADVERT_REF_UTXO";
+
 /** Resolve script-witness mode for a spending tx.
  *  - If `<envKey>` is set, fetch the referenced UTxO and use CIP-33 reference-script mode.
  *    The caller threads the UTxO into `tx.readFrom([refUtxo])`; lucid-evolution 0.4.30
  *    auto-extracts `refUtxo.scriptRef` and registers it as a witness
  *    (dist/index.js:1903–1913). No `attach.SpendingValidator` call is needed.
+ *    With `expectedHash`, the reference script must hash to it (the identity
+ *    layout passes the hash of its applied script).
  *  - Otherwise, fall back to the inlined script (current behavior). */
-async function resolveSpendCtx(
+export async function resolveSpendCtx(
   lucid: LucidEvolution,
-  envKey: "ESCROW_REF_UTXO" | "ADVERT_REF_UTXO",
+  envKey: RefUtxoEnvKey,
   inlineScript: Script,
+  expectedHash?: string,
 ): Promise<{ kind: "ref"; refUtxo: LucidUTxO } | { kind: "inline"; script: Script }> {
   const refSpec = parseRefUtxoEnv(envKey);
   if (!refSpec) return { kind: "inline", script: inlineScript };
@@ -281,13 +320,19 @@ async function resolveSpendCtx(
       `${envKey} ${refSpec.txHash}#${refSpec.outputIndex} has no scriptRef attached`,
     );
   }
+  if (expectedHash !== undefined && validatorToScriptHash(refUtxo.scriptRef) !== expectedHash) {
+    throw new TxConstructionError(
+      "reference script mismatch",
+      `${envKey} ${refSpec.txHash}#${refSpec.outputIndex} holds script ${validatorToScriptHash(refUtxo.scriptRef)}, expected ${expectedHash}`,
+    );
+  }
   return { kind: "ref", refUtxo };
 }
 
 /** Build a lucid-shaped UTxO from our chain Utxo, swapping in the live
  * blueprint's mainnet-flavoured script address so output validation passes
  * on Mainnet network even when the test fixture used a testnet header. */
-function chainUtxoToLucidScriptInput(
+export function chainUtxoToLucidScriptInput(
   utxo: Utxo,
   scriptAddress: string,
 ): LucidUTxO {
@@ -303,9 +348,11 @@ function chainUtxoToLucidScriptInput(
 }
 
 /** Lucid 0.4.30's default `setCollateral` is 5_000_000n; its collateral
- * selector needs a pure-AP3X UTxO ≥ this threshold. Mirror that floor
- * here so we can fail fast with an actionable hint instead of waiting
- * for lucid's deep "wallet must hold a pure-ADA UTxO ≥ 5 ADA" error. */
+ * selector takes up to 3 wallet inputs that cover this amount (see
+ * reserveScriptSpendCollateral). Our wallets keep one pure-AP3X UTxO ≥ this
+ * threshold as the dedicated candidate. Mirror that floor here so we can fail
+ * fast with an actionable hint instead of waiting for lucid's deep
+ * "wallet must hold a pure-ADA UTxO ≥ 5 ADA" error. */
 const COLLATERAL_MIN_LOVELACE = 5_000_000n;
 
 /** Pre-check: assert the wallet has a UTxO that can serve as collateral.
@@ -336,7 +383,7 @@ export function assertCollateralCandidate(utxos: LucidUTxO[]): void {
  * Set LIVECBOR_DEBUG=1 to see the full inner error + WASM stack — useful
  * for diagnosing lucid 0.4.30 / CML edge cases (e.g. the set_exunits
  * panic that affects test fixtures but not production). */
-function rethrowAsTxError(err: unknown, fallback: string): never {
+export function rethrowAsTxError(err: unknown, fallback: string): never {
   const msg = err instanceof Error ? err.message : String(err);
   if (process.env.LIVECBOR_DEBUG) {
     // eslint-disable-next-line no-console
@@ -382,7 +429,10 @@ function rethrowAsTxError(err: unknown, fallback: string): never {
  *   - no qualifying pure-ADA collateral UTxO, or
  *   - excluding it would underfund the escrow. The large-single-UTxO case is
  *     safe under default selection anyway: the change output is itself a
- *     pure-ADA UTxO well above the collateral floor. */
+ *     pure-ADA UTxO well above the collateral floor.
+ * Dropping the candidate from the list is enough here only because PostEscrow
+ * needs no collateral. Script spends take their collateral from the same list;
+ * Accept/Reclaim use reserveScriptSpendCollateral instead. */
 export function reserveCollateralInputs(
   utxos: LucidUTxO[],
   lockedLovelace: bigint,
@@ -407,6 +457,100 @@ export function reserveCollateralInputs(
   return remaining;
 }
 
+/** Lovelace the wallet inputs of an Accept/Reclaim must supply besides any
+ * outputs that the escrow input does not cover: the 500_000 fee floor that
+ * every script-spend builder sets (`setMinFee`) plus one change output at the
+ * output floor. */
+const SCRIPT_SPEND_WALLET_CUSHION_LOVELACE = 500_000n + MIN_UTXO_LOVELACE;
+
+/** Lovelace lucid must leave in the collateral return output. Lucid adds a
+ * further collateral input until the return reaches its min-UTxO: 969_750 for
+ * a pure-ADA output at lucid's preset coinsPerUtxoByte (4310), slightly more
+ * for a 9-byte coin. A rounded 1 AP3X covers both. */
+const COLLATERAL_RETURN_CUSHION_LOVELACE = 1_000_000n;
+
+/** lucid 0.4.30 `findCollateral` refuses more inputs than this (Vector's
+ * maxCollateralInputs is also 3). */
+const MAX_COLLATERAL_INPUTS = 3;
+
+/** Pure lovelace and no reference script: the only UTxOs whose collateral
+ * return and change this module can bound without the min-UTxO calculation. */
+function isPlainLovelace(utxo: LucidUTxO): boolean {
+  return !utxo.scriptRef && Object.keys(utxo.assets).every((k) => k === "lovelace");
+}
+
+/** lucid's `sortUTxOs` "LargestFirst": most lovelace first; on a tie, fewer assets first. */
+function lucidLargestFirst(a: LucidUTxO, b: LucidUTxO): number {
+  if (a.assets.lovelace === b.assets.lovelace) {
+    return Object.keys(a.assets).length - Object.keys(b.assets).length;
+  }
+  return a.assets.lovelace > b.assets.lovelace ? -1 : 1;
+}
+
+/** True when lucid's collateral selection over `utxos` surely succeeds:
+ * replay its largest-first walk and require that the inputs it can take are
+ * plain lovelace and reach the collateral plus the return cushion within
+ * MAX_COLLATERAL_INPUTS picks. A token-bearing or script-ref pick returns
+ * false: lucid would take it, but its return min-UTxO is not modelled here. */
+function collateralCoveredBy(utxos: LucidUTxO[]): boolean {
+  const picks = [...utxos].sort(lucidLargestFirst).slice(0, MAX_COLLATERAL_INPUTS);
+  let covered = 0n;
+  for (const utxo of picks) {
+    if (!isPlainLovelace(utxo)) return false;
+    covered += utxo.assets.lovelace;
+    if (covered >= COLLATERAL_MIN_LOVELACE + COLLATERAL_RETURN_CUSHION_LOVELACE) return true;
+  }
+  return false;
+}
+
+/** Choose the `presetWalletInputs` for a buyer script spend (Accept/Reclaim)
+ * that keep the dedicated ≥5-AP3X collateral UTxO out of the tx, or null for
+ * lucid's full-wallet behaviour.
+ *
+ * lucid 0.4.30 `complete()` (verified in dist/index.js) passes
+ * `presetWalletInputs` both to coin selection (`doCoinSelection`) and to
+ * `findCollateral`. Both run `recursive(sortUTxOs(list))`: largest lovelace
+ * first (ties: fewer assets first), greedy until the target is covered, then
+ * more inputs until the leftover (change or collateral return) reaches its
+ * min-UTxO; a leftover of 0 also needs that. `selectUTxOs` is called with
+ * includeUTxOsWithScriptRef=true, so despite lucid's error text, token-bearing
+ * and script-ref UTxOs are taken too; tokens go back in the collateral return.
+ * Collateral = max(150% × fee, setCollateral 5 AP3X); script-spend fees stay
+ * far below 3.33 AP3X, so it is 5 AP3X; more than 3 inputs fails.
+ * With the full wallet, the fee input is the largest UTxO. When that is the
+ * 5-AP3X collateral UTxO, every Accept cut it to 4.5 AP3X, and the wallet
+ * drained into small UTxOs that the buyer preflight refuses.
+ *
+ * Rule: reserve the SMALLEST plain-lovelace UTxO ≥ COLLATERAL_MIN_LOVELACE
+ * and return the other UTxOs only if lucid can still build from them:
+ *   (a) collateralCoveredBy(remaining), and
+ *   (b) their plain lovelace ≥ fee floor + change floor + `outputShortfall`
+ *       (output lovelace that the escrow input does not cover; a token UTxO
+ *       that lucid adds carries at least its own min-UTxO, so it is not counted).
+ * Otherwise null: no candidate, nothing left, or the rest cannot cover the
+ * collateral or the fee. The reservation must never make the tx fail. */
+export function reserveScriptSpendCollateral(
+  utxos: LucidUTxO[],
+  outputShortfall = 0n,
+): LucidUTxO[] | null {
+  const reserved = utxos
+    .filter((u) => isPlainLovelace(u) && u.assets.lovelace >= COLLATERAL_MIN_LOVELACE)
+    .reduce<LucidUTxO | null>((min, u) => (min === null || u.assets.lovelace < min.assets.lovelace ? u : min), null);
+  if (reserved === null) return null;
+  const remaining = utxos.filter((u) => u !== reserved);
+  const plainLovelace = remaining.filter(isPlainLovelace).reduce((s, u) => s + u.assets.lovelace, 0n);
+  const shortfall = outputShortfall > 0n ? outputShortfall : 0n;
+  if (plainLovelace < SCRIPT_SPEND_WALLET_CUSHION_LOVELACE + shortfall) return null;
+  return collateralCoveredBy(remaining) ? remaining : null;
+}
+
+/** Wallet outputs minus the ones that a submitted, unconfirmed transaction already spends. */
+export function withoutInputs(utxos: LucidUTxO[], excluded: readonly OutputReference[] | undefined): LucidUTxO[] {
+  if (!excluded?.length) return utxos;
+  const spent = new Set(excluded.map((ref) => `${ref.txHash}#${ref.index}`));
+  return utxos.filter((utxo) => !spent.has(`${utxo.txHash}#${utxo.outputIndex}`));
+}
+
 // ─── PostEscrow ──────────────────────────────────────────────────────
 
 export async function buildLiveTxForEscrow(
@@ -425,16 +569,17 @@ export async function buildLiveTxForEscrow(
     slotLengthMs: 1000,
   }, { usePresetProtocolParameters: true });
 
-  const blueprint = loadBlueprint();
-  const escrowAddress = blueprint.escrowScriptAddress(MAINNET_ID);
-  const datumHex = encodeEscrowDatum(escrowDatum);
+  const escrowAddress = params.target?.address ?? loadBlueprint().escrowScriptAddress(MAINNET_ID);
+  const datumHex = params.target?.datumHex ?? encodeEscrowDatum(escrowDatum);
+  // hi = min(deliver_by, lo + 1 h): an escrow transaction has hi − lo ≤ MAX_RANGE_MS (Part 2 §6.5).
+  const window = postWindow(postedAt, deliverBy, vectorSlotClock());
 
   const lockedLovelace = totalLocked < MIN_UTXO_LOVELACE ? MIN_UTXO_LOVELACE : totalLocked;
 
   // Preserve a pure-ADA collateral UTxO so the buyer's later Accept/Reclaim
   // script-spend can find collateral. Without this, PostEscrow coin selection
   // can consume the 5-ADA collateral UTxO and strand the escrow at Accept.
-  const walletUtxos = await lucid.wallet().getUtxos();
+  const walletUtxos = withoutInputs(await lucid.wallet().getUtxos(), params.excludeInputs);
   const reservedInputs = reserveCollateralInputs(walletUtxos, lockedLovelace);
 
   let signed;
@@ -447,23 +592,24 @@ export async function buildLiveTxForEscrow(
         { lovelace: lockedLovelace },
       )
       .addSignerKey(buyerKey.pubKeyHash)
-      // -60s past buffer: lucid's slotFromUnixTime rounds UP, so passing
-      // `Date.now()` produces a slot 1 ahead of the chain's current slot,
-      // and Ogmios rejects the tx with code 3118 ("submitted too early")
-      // until the chain catches up. Same fix as Claim/Submit/Accept paths
-      // below — keep the buffer wide enough to absorb build+propagation.
-      .validFrom(postedAt - 60_000)
-      .validTo(deliverBy)
+      // -60s past buffer (window.lo): the builder's clock can run ahead of
+      // the node's tip, and Ogmios rejects a tx whose validity starts after
+      // the tip with code 3118 ("submitted too early") until the chain catches
+      // up. Same fix as Claim/Submit/Accept paths below.
+      .validFrom(window.lo)
+      .validTo(window.hi)
       // lucid 0.4.30 under-estimates Conway fees by ~1K lovelace on
       // PostEscrow (Ogmios 3122). 500K is a comfortable floor; excess
       // becomes change. Same fix as Claim/Submit/Accept paths.
       .setMinFee(500_000n);
 
     // When we can reserve collateral, restrict coin selection to the remaining
-    // (working) UTxOs so the collateral candidate survives for Accept. Else
-    // fall back to lucid's default selection (single/large-UTxO cases are safe).
-    const completed = reservedInputs
-      ? await txBuilder.complete({ presetWalletInputs: reservedInputs, localUPLCEval: false })
+    // (working) UTxOs so the collateral candidate survives for Accept. Excluded
+    // inputs also need an explicit set. Else fall back to lucid's default
+    // selection (single/large-UTxO cases are safe).
+    const presetWalletInputs = reservedInputs ?? (params.excludeInputs?.length ? walletUtxos : null);
+    const completed = presetWalletInputs
+      ? await txBuilder.complete({ presetWalletInputs, localUPLCEval: false })
       : await txBuilder.complete();
     signed = await completed.sign.withWallet().complete();
   } catch (err) {
@@ -472,18 +618,17 @@ export async function buildLiveTxForEscrow(
 
   const txCborHex = signed.toCBOR();
   const expectedTxHash = signed.toHash();
-
-  await chain.submitTx(txCborHex);
-  // Note: awaiting on-chain confirmation is the SDK's responsibility
-  // (Marketplace.submitPrompt awaits before calling the supplier). Keeping
-  // the live builder submit-only matches the Claim/Submit/Accept pattern
-  // and lets unit tests exercise the builder without stubbing awaitTx.
-
-  return {
+  const built: PostEscrowBuildResult = {
     txCborHex,
     expectedTxHash,
     escrowOutputRef: { txHash: expectedTxHash, index: 0 },
   };
+
+  await params.beforeSubmit?.(built);
+  await chain.submitTx(txCborHex);
+  // Note: awaiting on-chain confirmation is the SDK's responsibility.
+
+  return built;
 }
 
 // ─── Claim / Submit / Accept share input-collection scaffolding ─────────
@@ -499,6 +644,7 @@ async function buildSpendOpenOrClaimedTx(opts: {
   validFromMs: number;
   validToMs: number;
   signerPkh: string;
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
 }): Promise<BuildResult> {
   const provider = buildLucidProvider(opts.chain);
   const { lucid } = await createLucidContext(provider, opts.walletKey, {
@@ -585,6 +731,7 @@ async function buildSpendOpenOrClaimedTx(opts: {
 
   const txCborHex = signed.toCBOR();
   const expectedTxHash = signed.toHash();
+  await opts.beforeSubmit?.({ txCborHex, expectedTxHash });
 
   await opts.chain.submitTx(txCborHex);
 
@@ -601,8 +748,10 @@ export async function buildLiveTxForClaim(params: LiveClaimParams): Promise<Buil
     newDatum: params.newDatum,
     redeemerHex: encodeNullaryConstrHex(REDEEMER_CLAIM),
     validFromMs: params.tipMs,
-    validToMs: params.deliverBy,
+    // buildSpendOpenOrClaimedTx starts the range at tipMs − 60 s; hi − lo ≤ MAX_RANGE_MS (Part 2 §6.5).
+    validToMs: Math.min(params.deliverBy, params.tipMs - LOWER_BOUND_BACKPAD_MS + MAX_RANGE_MS),
     signerPkh: params.supplierKey.pubKeyHash,
+    beforeSubmit: params.beforeSubmit,
   });
 }
 
@@ -628,8 +777,7 @@ export async function buildLiveTxForSubmit(params: LiveSubmitParams): Promise<Bu
   // because no slot in [tip, tip] could hold it. Push stamp forward to give
   // the chain SUBMIT_WINDOW_MS of headroom for inclusion, capped at
   // deliver_by so deadline_ok stays satisfied.
-  const VECTOR_ZERO_TIME = Number(process.env.VECTOR_ZERO_TIME_MS) || 1_752_057_484_000;  // ms (env override for mainnet; default = testnet genesis)
-  const SLOT_LENGTH = 1_000;                   // ms
+  const { zeroTimeMs: VECTOR_ZERO_TIME, slotLengthMs: SLOT_LENGTH } = vectorSlotClock(); // env override for mainnet; default = testnet genesis
   const SUBMIT_WINDOW_MS = 120_000;            // 2-minute inclusion window
   const tipMs = params.tipMs;
   const targetUpperMs = Math.min(tipMs + SUBMIT_WINDOW_MS, params.deliverBy);
@@ -650,6 +798,7 @@ export async function buildLiveTxForSubmit(params: LiveSubmitParams): Promise<Bu
     validFromMs: tipMs,
     validToMs: stampMs,
     signerPkh: params.supplierKey.pubKeyHash,
+    beforeSubmit: params.beforeSubmit,
   });
 }
 
@@ -681,11 +830,18 @@ export async function buildLiveTxForAccept(params: LiveAcceptParams): Promise<Bu
   const supplierLovelace = supplierDue < MIN_UTXO_LOVELACE ? MIN_UTXO_LOVELACE : supplierDue;
   const buyerLovelace = buyerDue < MIN_UTXO_LOVELACE ? MIN_UTXO_LOVELACE : buyerDue;
 
-  // Real wallet UTxOs only; the test-side synthetic padding input is removed
-  // (it caused unknownOutputReferences errors against the real ledger).
-  const realWalletUtxos = await lucid.wallet().getUtxos();
+  // Real wallet UTxOs only, minus the ones a pending transaction spends; the
+  // test-side synthetic padding input is removed (it caused
+  // unknownOutputReferences errors against the real ledger).
+  const realWalletUtxos = withoutInputs(await lucid.wallet().getUtxos(), params.excludeInputs);
   assertCollateralCandidate(realWalletUtxos);
-  const presetWalletInputs = realWalletUtxos;
+  // Keep the dedicated collateral UTxO out of the tx so later Accepts and the
+  // buyer preflight still find it. The wallet pays only the fee, the change
+  // and any output lovelace that the escrow input does not cover.
+  const presetWalletInputs = reserveScriptSpendCollateral(
+    realWalletUtxos,
+    supplierLovelace + buyerLovelace - params.escrowUtxo.lovelace,
+  ) ?? realWalletUtxos;
 
   let signed;
   try {
@@ -717,6 +873,7 @@ export async function buildLiveTxForAccept(params: LiveAcceptParams): Promise<Bu
 
   const txCborHex = signed.toCBOR();
   const expectedTxHash = signed.toHash();
+  await params.beforeSubmit?.({ txCborHex, expectedTxHash });
   await params.chain.submitTx(txCborHex);
 
   // Re-export the constant so callers that import from liveCbor still see
@@ -751,7 +908,14 @@ export async function buildLiveTxForReclaim(params: LiveReclaimParams): Promise<
 
   const realWalletUtxos = await lucid.wallet().getUtxos();
   assertCollateralCandidate(realWalletUtxos);
-  const presetWalletInputs = realWalletUtxos;
+  // Same collateral reservation as Accept.
+  const presetWalletInputs = reserveScriptSpendCollateral(
+    realWalletUtxos,
+    buyerLovelace - params.escrowUtxo.lovelace,
+  ) ?? realWalletUtxos;
+  const { zeroTime, slotLength } = SLOT_CONFIG_NETWORK.Mainnet;
+  const refundNotBefore = zeroTime +
+    Math.ceil((params.datum.deliver_by - zeroTime) / slotLength) * slotLength;
 
   let signed;
   try {
@@ -763,11 +927,9 @@ export async function buildLiveTxForReclaim(params: LiveReclaimParams): Promise<
       .collectFrom([lucidInput], reclaimRedeemerHex)
       .pay.ToAddress(buyerAddress, { lovelace: buyerLovelace })
       .addSignerKey(params.buyerKey.pubKeyHash)
-      // Validity range mirrors Accept's pattern: a narrow window centred on
-      // tipMs. The on-chain validator only checks `lower_bound >= deliver_by`,
-      // which holds as long as `tipMs - 60s >= deliver_by` — the caller has
-      // already verified tipMs >= deliver_by, so a 60s back-pad is safe.
-      .validFrom(params.tipMs - 60_000)
+      // Lucid rounds to the enclosing slot. Round the refund deadline up
+      // before applying the back-pad, so no part of the interval is early.
+      .validFrom(Math.max(refundNotBefore, params.tipMs - 60_000))
       .validTo(params.tipMs + 60_000)
       .setMinFee(500_000n);
 
@@ -784,6 +946,7 @@ export async function buildLiveTxForReclaim(params: LiveReclaimParams): Promise<
 
   const txCborHex = signed.toCBOR();
   const expectedTxHash = signed.toHash();
+  await params.beforeSubmit?.({ txCborHex, expectedTxHash });
   await params.chain.submitTx(txCborHex);
   return { txCborHex, expectedTxHash };
 }
@@ -873,9 +1036,8 @@ export async function buildLiveTxForAdvert(
     slotLengthMs: 1000,
   }, { usePresetProtocolParameters: true });
 
-  const blueprint = loadBlueprint();
-  const advertAddress = blueprint.advertScriptAddress(MAINNET_ID);
-  const datumHex = encodeAdvertDatum(advertDatum);
+  const advertAddress = params.target?.address ?? loadBlueprint().advertScriptAddress(MAINNET_ID);
+  const datumHex = params.target?.datumHex ?? encodeAdvertDatum(advertDatum);
 
   // Pad to protocol min-utxo if the supplier bond is below floor — same
   // pattern as PostEscrow. The validator only checks ≥ supplier_bond_lovelace,
@@ -910,14 +1072,16 @@ export async function buildLiveTxForAdvert(
 
   const txCborHex = signed.toCBOR();
   const expectedTxHash = signed.toHash();
-
-  await chain.submitTx(txCborHex);
-
-  return {
+  const built: PostAdvertBuildResult = {
     txCborHex,
     expectedTxHash,
     advertOutputRef: { txHash: expectedTxHash, index: 0 },
   };
+  await params.beforeSubmit?.(built);
+
+  await chain.submitTx(txCborHex);
+
+  return built;
 }
 
 // ─── RetireAdvert ────────────────────────────────────────────────────

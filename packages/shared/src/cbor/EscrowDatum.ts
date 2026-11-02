@@ -19,10 +19,10 @@
  *   13 state                  EscrowState: Open=121 … Released=126, each as Tag t []
  */
 
-import { decode, Tag } from "cbor-x";
+import { Tag } from "cbor-x";
 import type { EscrowDatum, EscrowState } from "./types.js";
 import { plutusTag } from "./plutus-tag.js";
-import { encodePlutus } from "./plutus-encoder.js";
+import { encodePlutus, decodePlutus } from "./plutus-encoder.js";
 
 export type { EscrowDatum };
 
@@ -212,7 +212,7 @@ export function decodeEscrowDatum(hex: string): EscrowDatum {
 
   let decoded: unknown;
   try {
-    decoded = decode(hexToBytes(hex));
+    decoded = decodePlutus(hexToBytes(hex));
   } catch (err) {
     throw new Error(`decodeEscrowDatum: malformed CBOR: ${(err as Error).message}`);
   }

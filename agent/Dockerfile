@@ -29,10 +29,10 @@ RUN corepack enable && corepack prepare pnpm@10.33.2 --activate
 # Workspace manifests first to maximise layer cache reuse. This template
 # vendors only packages/shared + agent (ex-supplier) — no root .npmrc, no
 # patches/ dir (pnpm-lock.yaml here has no patchedDependencies), and no
-# buyer/ or indexer/ siblings (this workspace's lockfile importers are only
-# ".", "agent", "packages/shared" — confirmed via pnpm-lock.yaml), unlike the
-# full upstream monorepo this Dockerfile was vendored from. Omitted rather
-# than COPYing paths that don't exist in this repo.
+# buyer/ or indexer/ siblings, unlike the full upstream monorepo this
+# Dockerfile was vendored from. Omitted rather than COPYing paths that don't
+# exist in this repo. The lockfile's fourth importer, try-it/ (the self-test
+# buyer), stays out of the image too: the --filter below never installs it.
 COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
 COPY packages/shared/package.json ./packages/shared/package.json
 COPY agent/package.json ./agent/package.json
@@ -51,22 +51,28 @@ RUN set -e \
  && cp "$SRC" "$DST/" \
  && echo "patched libsodium wrapper: $DST/libsodium-sumo.mjs"
 
-# Copy the actual source — shared + agent + the Aiken blueprint.
+# Copy the actual source — shared + agent + the Aiken blueprints.
 #
-# The blueprint (contracts/marketplace/plutus.json) IS vendored into this
-# template, pinned to the same upstream commit as the code (VENDORED-FROM.md).
-# loadBlueprint() reads it to derive the escrow/advert script addresses and to
-# attach the spending validator in the live-CBOR builders. It is loaded lazily,
-# inside those builders (buildClaimTx/buildSubmitTx/postEscrow et al.), never at
-# import or boot time — so an image missing it still builds and boots, then
-# fails on the first real job, after the buyer's funds are already locked. That
-# is exactly why it is copied here and checked in CI rather than left implicit.
+# Both blueprints are vendored into this template, pinned to the same
+# upstream commit as the code (VENDORED-FROM.md):
+#   contracts/marketplace/plutus.json           loadBlueprint(): the legacy
+#     escrow and advert scripts.
+#   contracts/identity-marketplace/plutus.json  loadIdentityBlueprint(): the
+#     escrow and advert scripts that carry an agent_id.
+# The tx builders read them to derive the escrow/advert script addresses and
+# to attach the spending validators in the live-CBOR builders. They are loaded
+# lazily, inside those builders (buildClaimTx/buildSubmitTx/postEscrow et al.),
+# never at import or boot time — so an image missing one still builds and
+# boots, then fails on the first real job, after the buyer's funds are already
+# locked. That is exactly why both are copied here and checked in CI rather
+# than left implicit.
 #
 # examples/ carries the demo black box (echo-service.mjs) the quickstart and
 # deploy/docker-compose.yml run as a second service off this same image.
 COPY packages/shared ./packages/shared
 COPY agent ./agent
 COPY contracts/marketplace/plutus.json ./contracts/marketplace/plutus.json
+COPY contracts/identity-marketplace/plutus.json ./contracts/identity-marketplace/plutus.json
 COPY examples ./examples
 
 # Defence-in-depth against a leaked HOST node_modules: on at least one
@@ -102,6 +108,9 @@ COPY --from=builder /repo /repo
 
 # Drop privileges. The official node image ships a non-root `node` user.
 RUN chown -R node:node /repo
+RUN mkdir -p /var/lib/surplus-manager \
+ && chown node:node /var/lib/surplus-manager \
+ && chmod 700 /var/lib/surplus-manager
 USER node
 
 ENV NODE_ENV=production

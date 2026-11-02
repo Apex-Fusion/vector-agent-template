@@ -84,12 +84,16 @@ interface OgmiosProtocolParams {
   governanceActionDeposit?: { ada?: { lovelace?: number | bigint } };
   delegateRepresentativeDeposit?: { ada?: { lovelace?: number | bigint } };
   prices?: { memory?: string | number; steps?: string | number };
-  scriptExecutionPrices?: { memory?: string | number; steps?: string | number };
+  /** Ogmios v6 names the CPU price `cpu`; `steps` is the older name. */
+  scriptExecutionPrices?: { memory?: string | number; cpu?: string | number; steps?: string | number };
   maxExecutionUnitsPerTransaction?: {
     memory?: number | bigint;
     cpu?: number | bigint;
     steps?: number | bigint;
   };
+  /** Ogmios v6: a plain number of base units per byte. */
+  minUtxoDepositCoefficient?: number | bigint;
+  /** The older shape of the same value. */
   coinsPerUtxoByte?: { ada?: { lovelace?: number | bigint } };
   collateralPercentage?: number;
   maxCollateralInputs?: number;
@@ -476,9 +480,10 @@ function mapProtocolParameters(raw: OgmiosProtocolParams): ProtocolParameters {
     throw new Error("Ogmios protocolParameters: malformed (null/undefined result)");
   }
 
-  const prices = raw.scriptExecutionPrices ?? raw.prices ?? {};
+  const prices: { memory?: string | number; cpu?: string | number; steps?: string | number } =
+    raw.scriptExecutionPrices ?? raw.prices ?? {};
   const priceMem = fractionToNumber(prices.memory, 0.0577);
-  const priceStep = fractionToNumber(prices.steps, 0.0000721);
+  const priceStep = fractionToNumber(prices.cpu ?? prices.steps, 0.0000721);
   const exUnits = raw.maxExecutionUnitsPerTransaction ?? {};
   const maxTxExSteps = toBigInt(
     typeof exUnits.steps === "number" || typeof exUnits.steps === "bigint"
@@ -501,7 +506,7 @@ function mapProtocolParameters(raw: OgmiosProtocolParams): ProtocolParameters {
     priceStep,
     maxTxExMem,
     maxTxExSteps,
-    coinsPerUtxoByte: lovelaceToBigInt(raw.coinsPerUtxoByte, 4310n),
+    coinsPerUtxoByte: toBigInt(raw.minUtxoDepositCoefficient, lovelaceToBigInt(raw.coinsPerUtxoByte, 4310n)),
     collateralPercentage: toNumber(raw.collateralPercentage, 150),
     maxCollateralInputs: toNumber(raw.maxCollateralInputs, 3),
     minFeeRefScriptCostPerByte: toNumber(raw.minFeeReferenceScripts?.base, 0),

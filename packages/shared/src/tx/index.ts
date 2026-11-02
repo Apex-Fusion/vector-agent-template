@@ -4,14 +4,39 @@
 
 export type { ChatMessage, ToolCall, WalletKey, BuildResult, PostAdvertBuildResult, PostEscrowBuildResult } from "./types.js";
 export { TxConstructionError } from "./types.js";
-export { normalizeChatMessage, chatMessagesEquivalent, toolCallsEqual } from "./chatMessage.js";
-export { mockSlotToWallclockMs, mockWallclockMsToSlot, NETWORK_BUFFER_MS } from "./internal/constants.js";
+export {
+  BOUNDED_INPUT_DETAIL_MARKER,
+} from "./inputBound.js";
+export {
+  mockSlotToWallclockMs,
+  mockWallclockMsToSlot,
+  NETWORK_BUFFER_MS,
+  MAX_RANGE_MS,
+  ESCROW_VALUE_CAP_LOVELACE,
+  ESCROW_INPUT_CAP_LOVELACE,
+} from "./internal/constants.js";
 export { detectCborBackend, type CborBackend } from "./internal/cborBackend.js";
 export { escrowLockFloor, minAdaForEscrowDatum } from "./internal/minAdaFloor.js";
 export type { Signer } from "./signer.js";
 export { MockSigner } from "./signer.js";
-export type { Blueprint } from "./blueprint.js";
-export { loadBlueprint } from "./blueprint.js";
+export type { Blueprint, IdentityBlueprint, IdentityBlueprintOptions } from "./blueprint.js";
+export { loadBlueprint, loadIdentityBlueprint } from "./blueprint.js";
+// Parameter application (byte-equal to `aiken blueprint apply`) and Plutus V3 script hashes.
+export { applyDataParameter, plutusV3ScriptHash } from "./internal/plutusScript.js";
+
+// Both layouts during the drain (Part 2 §9.6): the datum decides.
+export type { MarketplaceLayout } from "./internal/layout.js";
+export { isIdentityAdvertDatum, isIdentityEscrowDatum } from "./internal/layout.js";
+
+// Identity checks of the new escrow and advert builders (Part 2 §6.1, §6.2).
+export type { RecordLookup, AdvertSignersLookup, EffectiveStatus, AgentWorkCheck } from "./identityRecord.js";
+export {
+  readAgentRecord,
+  rootEffectiveStatus,
+  recordHasKey,
+  agentWorkProblem,
+  assertAgentCanWork,
+} from "./identityRecord.js";
 // Note: live-CBOR helpers (loadEscrowScript, loadAdvertScript,
 // buildLiveTxForPublishReferenceScripts, pkhToEnterpriseAddress) live in
 // "./server.js" — kept OUT of this index so the buyer's vite bundle
@@ -27,6 +52,7 @@ export type { RetireAdvertParams } from "./advert/retireAdvert.js";
 export { buildRetireAdvertTx } from "./advert/retireAdvert.js";
 
 // Escrow builders
+export type { PostEscrowLayoutOptions } from "./escrow/postFromAdvert.js";
 export type { PostEscrowParams } from "./escrow/postEscrow.js";
 export { buildPostEscrowTx } from "./escrow/postEscrow.js";
 export type { PostTtsEscrowParams, TtsRequest } from "./escrow/postTtsEscrow.js";
@@ -57,3 +83,6 @@ export type { ReclaimParams } from "./escrow/reclaim.js";
 export { buildReclaimTx } from "./escrow/reclaim.js";
 export type { ReleaseParams } from "./escrow/release.js";
 export { buildReleaseTx } from "./escrow/release.js";
+export type { RefundRevokedParams } from "./escrow/refundRevoked.js";
+export { buildRefundRevokedTx } from "./escrow/refundRevoked.js";
+export { refundAllowed } from "./escrow/identityEscrow.js";

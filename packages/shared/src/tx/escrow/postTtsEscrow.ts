@@ -2,37 +2,27 @@
  * tx/escrow/postTtsEscrow.ts — PostEscrow tx builder for the
  * `audio.synthesize.piper.v1` capability.
  *
- * Mirrors `postEscrow.ts` (chat) but commits a TTS-shaped prompt_hash
- * over the canonicalised request envelope `{text, voice, format, speed}`
- * — the SAME object the supplier hashes when validating the incoming
- * POST /v1/audio/synthesize body. Any mismatch on either side fails the
- * supplier-side prompt_mismatch gate.
+ * Accepts either the TTS request envelope or a precomputed prompt_hash. The
+ * request path hashes canonical `{text, voice, format, speed}`, the same object
+ * the supplier hashes when validating POST /v1/audio/synthesize.
  *
  * Off-chain invariants (mirror chat's, with TTS-shaped body validation):
  *   1. advert UTxO exists at advertRef
  *   2. advert datum.status === "Active"
  *   3. payment_lovelace === advert.price_lovelace
  *   4. buyerKey.pubKeyHash !== advert.supplier_pkh
- *   5. body.text is a non-empty string
- *   6. body.voice ∈ ALLOWED_VOICES
- *   7. body.format ∈ ALLOWED_FORMATS
- *   8. body.speed is finite and ∈ [0.5, 1.5]
+ *   5. exactly one of request or prompt_hash is provided
+ *   6. a supplied prompt_hash is 32-byte hex, or request passes TTS validation
+ * A new advert (identity layout) gives a new escrow with the checks of
+ * postFromAdvert.ts: listing rule, value cap, agent_id and refund.
  */
 
 import * as nodeCrypto from "crypto";
 import type { ChainProvider, OutputReference } from "../../chain/ChainProvider.js";
-import type { EscrowDatum } from "../../cbor/types.js";
-import { decodeAdvertDatum } from "../../cbor/AdvertDatum.js";
-import { encodeEscrowDatum } from "../../cbor/EscrowDatum.js";
 import { canonicalize } from "../../cbor/canonical.js";
 import type { WalletKey, PostEscrowBuildResult } from "../types.js";
 import { TxConstructionError } from "../types.js";
-import { loadBlueprint } from "../blueprint.js";
-import { encodeTxBody, sha256Hex } from "../internal/testTxBody.js";
-import { mockSlotToWallclockMs, NETWORK_BUFFER_MS } from "../internal/constants.js";
-import { detectCborBackend } from "../internal/cborBackend.js";
-import { escrowLockFloor } from "../internal/minAdaFloor.js";
-import type { LiveOgmiosProvider } from "../../chain/LiveOgmiosProvider.js";
+import { postEscrowFromAdvert, type PostEscrowLayoutOptions } from "./postFromAdvert.js";
 
 /** TTS request envelope. The buyer-side hash and the supplier-side hash
  * MUST agree on this exact set of keys, in this exact JCS-canonical
@@ -49,11 +39,15 @@ export const ALLOWED_TTS_VOICES = new Set([
 ]);
 export const ALLOWED_TTS_FORMATS = new Set(["mp3", "wav", "opus", "aac", "flac"]);
 
-export interface PostTtsEscrowParams {
+export interface PostTtsEscrowParams extends PostEscrowLayoutOptions {
   chain: ChainProvider;
   buyerKey: WalletKey;
   advertRef: OutputReference;
-  request: TtsRequest;
+  request?: TtsRequest;
+  /** Precomputed prompt commitment: 32-byte hex, sha256 over whatever canonical
+   * envelope the caller and supplier agreed on. When provided, the builder uses
+   * it verbatim and does not require or hash request. */
+  prompt_hash?: string;
   payment_lovelace: bigint;
 }
 
@@ -75,157 +69,59 @@ export function ttsPromptHash(req: TtsRequest): string {
 export async function buildPostTtsEscrowTx(
   params: PostTtsEscrowParams,
 ): Promise<PostEscrowBuildResult> {
-  const { chain, buyerKey, advertRef, request, payment_lovelace } = params;
+  const { request, prompt_hash } = params;
 
-  // 5. Body validation.
-  if (typeof request?.text !== "string" || request.text.length === 0) {
-    throw new TxConstructionError("text required",
-      "request.text must be a non-empty string");
-  }
-  if (!ALLOWED_TTS_VOICES.has(request.voice)) {
-    throw new TxConstructionError("voice invalid",
-      `voice must be one of: ${[...ALLOWED_TTS_VOICES].join(", ")}`);
-  }
-  if (!ALLOWED_TTS_FORMATS.has(request.format)) {
-    throw new TxConstructionError("format invalid",
-      `format must be one of: ${[...ALLOWED_TTS_FORMATS].join(", ")}`);
-  }
-  if (!Number.isFinite(request.speed) || request.speed < 0.5 || request.speed > 1.5) {
-    throw new TxConstructionError("speed out of range",
-      "speed must be a finite number in [0.5, 1.5]");
-  }
-
-  // 1. Advert UTxO must exist.
-  const advertUtxo = await chain.queryUtxo(advertRef);
-  if (advertUtxo === null) {
+  if (request === undefined && prompt_hash === undefined) {
     throw new TxConstructionError(
-      "advert ref not on chain",
-      `no UTxO at ${advertRef.txHash}#${advertRef.index}`,
+      "request required",
+      "provide request or a precomputed prompt_hash",
     );
   }
-  if (!advertUtxo.datumHex) {
+  if (request !== undefined && prompt_hash !== undefined) {
     throw new TxConstructionError(
-      "advert datum missing",
-      `UTxO ${advertRef.txHash}#${advertRef.index} has no inline datum`,
+      "ambiguous prompt commitment",
+      "provide either request or prompt_hash, not both",
     );
   }
 
-  const advertDatum = decodeAdvertDatum(advertUtxo.datumHex);
-
-  // 2. Advert must be Active.
-  if (advertDatum.status !== "Active") {
-    throw new TxConstructionError(
-      "advert is retired",
-      `advert.status is ${advertDatum.status}, expected Active`,
-    );
+  let promptHash: string;
+  if (prompt_hash !== undefined) {
+    if (!/^[0-9a-fA-F]{64}$/.test(prompt_hash)) {
+      throw new TxConstructionError(
+        "prompt_hash malformed",
+        "prompt_hash must be 32-byte hex",
+      );
+    }
+    promptHash = prompt_hash.toLowerCase();
+  } else {
+    if (typeof request?.text !== "string" || request.text.length === 0) {
+      throw new TxConstructionError("text required",
+        "request.text must be a non-empty string");
+    }
+    if (!ALLOWED_TTS_VOICES.has(request.voice)) {
+      throw new TxConstructionError("voice invalid",
+        `voice must be one of: ${[...ALLOWED_TTS_VOICES].join(", ")}`);
+    }
+    if (!ALLOWED_TTS_FORMATS.has(request.format)) {
+      throw new TxConstructionError("format invalid",
+        `format must be one of: ${[...ALLOWED_TTS_FORMATS].join(", ")}`);
+    }
+    if (!Number.isFinite(request.speed) || request.speed < 0.5 || request.speed > 1.5) {
+      throw new TxConstructionError("speed out of range",
+        "speed must be a finite number in [0.5, 1.5]");
+    }
+    promptHash = ttsPromptHash(request);
   }
 
-  // 3. Payment must equal advertised price.
-  if (payment_lovelace !== advertDatum.price_lovelace) {
-    throw new TxConstructionError(
-      "payment must equal advertised price",
-      `payment ${payment_lovelace} != advert.price ${advertDatum.price_lovelace}`,
-    );
-  }
-
-  // 4. Buyer cannot be supplier.
-  if (buyerKey.pubKeyHash === advertDatum.supplier_pkh) {
-    throw new TxConstructionError(
-      "buyer cannot be supplier",
-      `buyerKey pkh ${buyerKey.pubKeyHash} equals advert.supplier_pkh`,
-    );
-  }
-
-  // Time source: same convention as chat.
-  const tipSlot = await chain.tip();
-  const isLive = detectCborBackend(chain) === "live";
-  const postedAt = isLive ? Date.now() : mockSlotToWallclockMs(tipSlot);
-  const deliverBy = postedAt + advertDatum.max_processing_ms + NETWORK_BUFFER_MS;
-
-  const requestSpecCanonical = canonicalize({
-    capability_id: advertDatum.capability_id,
-    max_output_tokens: advertDatum.max_output_tokens,
-    model: advertDatum.model,
+  return postEscrowFromAdvert({
+    chain: params.chain,
+    buyerKey: params.buyerKey,
+    advertRef: params.advertRef,
+    promptHash,
+    payment_lovelace: params.payment_lovelace,
+    escrowLayout: params.escrowLayout,
+    lookupRecord: params.lookupRecord,
+    lookupAdvertSigners: params.lookupAdvertSigners,
+    identityBlueprint: params.identityBlueprint,
   });
-  const requestSpecHash = sha256Utf8Hex(requestSpecCanonical);
-  const promptHash = ttsPromptHash(request);
-
-  const economicTotal =
-    advertDatum.price_lovelace +
-    advertDatum.buyer_bond_lovelace +
-    advertDatum.supplier_bond_lovelace;
-
-  const escrowDatum: EscrowDatum = {
-    buyer_pkh: buyerKey.pubKeyHash,
-    supplier_pkh: advertDatum.supplier_pkh,
-    advert_ref: advertRef,
-    capability_id: advertDatum.capability_id,
-    request_spec_hash: requestSpecHash,
-    prompt_hash: promptHash,
-    payment_lovelace: advertDatum.price_lovelace,
-    buyer_bond_lovelace: advertDatum.buyer_bond_lovelace,
-    supplier_bond_lovelace: advertDatum.supplier_bond_lovelace,
-    deliver_by: deliverBy,
-    posted_at: postedAt,
-    submitted_at: null,
-    result_receipt_hash: null,
-    state: "Open",
-  };
-
-  // Lock enough that the escrow output satisfies min-ada in its LARGEST
-  // future state (Submitted) - value_equal on Claim/Submit forbids any
-  // later bump (min-ada floor).
-  const totalLocked = escrowLockFloor(escrowDatum, economicTotal);
-
-  // Live path: reuse the chat builder. The live cbor path is already
-  // capability-agnostic — `messages` is `void`-marked there. We pass an
-  // empty array so the type checker is satisfied; the actual on-chain
-  // commitment is the escrowDatum (which carries our TTS prompt_hash).
-  if (isLive) {
-    const liveCborPath = "../internal/liveCbor.js";
-    const { buildLiveTxForEscrow } = await import(/* @vite-ignore */ liveCborPath);
-    return buildLiveTxForEscrow({
-      chain: chain as LiveOgmiosProvider,
-      buyerKey,
-      advertRef,
-      messages: [],
-      escrowDatum,
-      totalLocked,
-      deliverBy,
-      postedAt,
-    });
-  }
-
-  // Mock backend path (synthetic JSON-in-hex tx body).
-  const blueprint = loadBlueprint();
-  const escrowAddress = blueprint.escrowScriptAddress(0);
-
-  const body = {
-    type: "post-escrow",
-    inputs: [],
-    outputs: [
-      {
-        ref: { txHash: "$self", index: 0 },
-        address: escrowAddress,
-        lovelace: totalLocked,
-        assets: {},
-        datumHex: encodeEscrowDatum(escrowDatum),
-        scriptRef: null,
-      },
-    ],
-    requiredSigners: [buyerKey.pubKeyHash],
-    validityRange: { lowerBoundMs: postedAt, upperBoundMs: deliverBy },
-    meta: { script_hash: blueprint.escrowScriptHash, advert_ref: advertRef },
-  };
-
-  const txCborHex = encodeTxBody(body);
-  const expectedTxHash = sha256Hex(txCborHex);
-
-  await chain.submitTx(txCborHex);
-
-  return {
-    txCborHex,
-    expectedTxHash,
-    escrowOutputRef: { txHash: expectedTxHash, index: 0 },
-  };
 }

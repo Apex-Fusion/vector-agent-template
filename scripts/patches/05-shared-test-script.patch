@@ -1,8 +1,8 @@
-diff --git a/packages/shared/package.json b/packages/shared/package.json
-index ad5b45e..e919ef7 100644
---- a/packages/shared/package.json
-+++ b/packages/shared/package.json
-@@ -14,7 +14,8 @@
+diff --git i/packages/shared/package.json w/packages/shared/package.json
+index 17a9976..56acceb 100644
+--- i/packages/shared/package.json
++++ w/packages/shared/package.json
+@@ -18,7 +18,8 @@
      "./tx/server": "./src/tx/server.ts"
    },
    "scripts": {
@@ -11,4 +11,4 @@ index ad5b45e..e919ef7 100644
 +    "test": "vitest run src"
    },
    "devDependencies": {
-     "cbor-x": "^1.5.4",
+     "typescript": "^5.7.2"

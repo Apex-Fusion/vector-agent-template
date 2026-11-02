@@ -24,27 +24,17 @@
  * recovers (out of scope for v1) or the buyer `Reclaim`s after `deliver_by`.
  */
 
+import type { ResponseObject } from "@marketplace/shared/responses";
+
 export type JobStatus = "accepted" | "running" | "done" | "failed";
 
-/**
- * Chat-flavoured terminal payload. Stored when a `runChatJob` succeeds.
- * Shape mirrors the OpenAI chat-completion response so the buyer-side SDK
- * can parse it without translation.
- */
-export interface ChatJobResponsePayload {
+/** Terminal Responses payload stored when a one-shot LLM job succeeds. */
+export interface ChatJobResponsePayload extends ResponseObject {
   kind?: "chat";
-  choices: Array<{
-    index: number;
-    message: { role: "assistant"; content: string };
-    finish_reason: string;
-  }>;
-  usage: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
   receipt: Record<string, unknown>;
   receipt_signature: string;
+  /** The Submitted escrow UTxO ("<submitTxHash>#0") the buyer must Accept. */
+  submitted_ref: string;
 }
 
 /**
@@ -61,6 +51,7 @@ export interface TtsJobResponsePayload {
   byte_length: number;
   receipt: Record<string, unknown>;
   receipt_signature: string;
+  submitted_ref: string;
 }
 
 /**
@@ -80,6 +71,7 @@ export interface OcrJobResponsePayload {
   };
   receipt: Record<string, unknown>;
   receipt_signature: string;
+  submitted_ref: string;
 }
 
 /**

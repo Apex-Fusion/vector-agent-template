@@ -8,21 +8,33 @@
  *   1. walletKey.pubKeyHash === datum.buyer_pkh
  *   2. datum.state === "Open" || datum.state === "Claimed"
  *   3. validity lower-bound ≥ datum.deliver_by (chain tip past deliver_by)
+ *
+ * Both layouts (Part 2 §9.6): the escrow datum decides. For a 16-field
+ * escrow with `refund` set, invariant 1 does not apply: any wallet key can
+ * submit the Reclaim (it pays the fee and the collateral), no buyer
+ * signature is needed, and the whole escrow value goes to refund.address with
+ * exactly the refund datum (§6.1; identityEscrow.ts reclaimIdentity).
  */
 
 import type { ChainProvider, OutputReference } from "../../chain/ChainProvider.js";
-import { decodeEscrowDatum } from "../../cbor/EscrowDatum.js";
+import type { IdentityBlueprint } from "../blueprint.js";
 import type { WalletKey, BuildResult } from "../types.js";
 import { TxConstructionError } from "../types.js";
 import { encodeTxBody, sha256Hex } from "../internal/testTxBody.js";
-import { mockSlotToWallclockMs } from "../internal/constants.js";
+import { LOWER_BOUND_BACKPAD_MS, mockSlotToWallclockMs } from "../internal/constants.js";
 import { detectCborBackend } from "../internal/cborBackend.js";
+import { readEscrow } from "../internal/layout.js";
+import { reclaimIdentity } from "./identityEscrow.js";
 import type { LiveOgmiosProvider } from "../../chain/LiveOgmiosProvider.js";
 
 export interface ReclaimParams {
   chain: ChainProvider;
+  /** The buyer key; for an identity escrow with `refund` set, any wallet key. */
   buyerKey: WalletKey;
   escrowRef: OutputReference;
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
+  /** Identity layout only. Default: loadIdentityBlueprint() (env IDENTITY_POLICY_ID). */
+  identityBlueprint?: IdentityBlueprint;
 }
 
 export async function buildReclaimTx(
@@ -30,21 +42,17 @@ export async function buildReclaimTx(
 ): Promise<BuildResult> {
   const { chain, buyerKey, escrowRef } = params;
 
-  const utxo = await chain.queryUtxo(escrowRef);
-  if (utxo === null) {
-    throw new TxConstructionError(
-      "escrow ref not on chain",
-      `no UTxO at ${escrowRef.txHash}#${escrowRef.index}`,
-    );
+  const escrow = await readEscrow(chain, escrowRef);
+  if (escrow.layout === "identity") {
+    return reclaimIdentity({
+      chain,
+      escrow,
+      walletKey: buyerKey,
+      identityBlueprint: params.identityBlueprint,
+      beforeSubmit: params.beforeSubmit,
+    });
   }
-  if (!utxo.datumHex) {
-    throw new TxConstructionError(
-      "escrow datum missing",
-      `UTxO ${escrowRef.txHash}#${escrowRef.index} has no inline datum`,
-    );
-  }
-
-  const datum = decodeEscrowDatum(utxo.datumHex);
+  const { utxo, datum } = escrow;
 
   // 1. Signer must match buyer identity.
   if (buyerKey.pubKeyHash !== datum.buyer_pkh) {
@@ -85,6 +93,7 @@ export async function buildReclaimTx(
       escrowUtxo: utxo,
       datum,
       tipMs,
+      beforeSubmit: params.beforeSubmit,
     });
   }
 
@@ -106,12 +115,14 @@ export async function buildReclaimTx(
       },
     ],
     requiredSigners: [buyerKey.pubKeyHash],
-    validityRange: { lowerBoundMs: datum.deliver_by, upperBoundMs: tipMs + 60_000 },
+    // Same range as the live builder: no time before deliver_by, hi − lo ≤ MAX_RANGE_MS (Part 2 §6.5).
+    validityRange: { lowerBoundMs: Math.max(datum.deliver_by, tipMs - LOWER_BOUND_BACKPAD_MS), upperBoundMs: tipMs + 60_000 },
     redeemer: "Reclaim",
   };
 
   const txCborHex = encodeTxBody(body);
   const expectedTxHash = sha256Hex(txCborHex);
+  await params.beforeSubmit?.({ txCborHex, expectedTxHash });
 
   await chain.submitTx(txCborHex);
 

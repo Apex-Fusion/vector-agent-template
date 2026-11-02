@@ -33,6 +33,9 @@
  *                            client the chat job runner uses. Only meaningful
  *                            when CAPABILITY_KIND="chat".
  *   PORT                   — listen port (default 8080)
+ *   SUPPLIER_BIND_HOST     — IP literal to bind (default: all interfaces). A
+ *                            parent process that proxies a local supplier sets
+ *                            127.0.0.1 so the child port is not exposed.
  *   OLLAMA_TIMEOUT_MS      — ollama request timeout in ms (default 120_000)
  *   OPENAI_TIMEOUT_MS      — openai request timeout in ms (default 180_000 — GPT
  *                            first-token latency is longer than local Ollama)
@@ -53,15 +56,32 @@
  *                          — periodic wallet self-consolidate tick interval
  *                            (default 600_000 = 10 min). "0" disables the
  *                            ticker. Only fires while LIVE_CHAIN=1.
+ *   AGENT_ID               — the supplier's own agent: 64 lowercase hex characters
+ *                            (the identifier that tx:register-record prints). The
+ *                            supplier works a new (16-field) escrow only for its own
+ *                            agent. Unset: the agent of the configured new advert,
+ *                            else none (legacy escrows only). When both are set they
+ *                            must name the same agent.
+ *   IDENTITY_POLICY_ID     — the identity hash (56 hex), read by the shared builders.
+ *                            Required to Claim and Submit new escrows.
+ *   IDENTITY_ESCROW_REF_UTXO / IDENTITY_ADVERT_REF_UTXO
+ *                          — reference scripts of the new escrow and advert
+ *                            (tx:publish-reference-scripts). ESCROW_REF_UTXO and
+ *                            ADVERT_REF_UTXO stay for legacy escrows until the
+ *                            drain ends (Part 2 §9.6).
  *
  * On error: throws Error whose message names the offending field (matches
  * supplier-config.test.ts assertion that error message mentions field name).
  */
 
+import { isIP } from "node:net";
+import { parseAgentId } from "./identity/agent.js";
+
 const HEX64_RE = /^[0-9a-fA-F]{64}$/;
 const TX_HASH_RE = /^[0-9a-fA-F]{64}$/;
 const NON_NEG_INT_RE = /^(?:0|[1-9]\d*)$/;
 const POS_INT_RE = /^[1-9]\d*$/;
+const USD_RE = /^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/;
 
 /** Lowercased hostname of a URL, or "" if it doesn't parse. */
 function hostnameOf(url: string): string {
@@ -69,6 +89,24 @@ function hostnameOf(url: string): string {
     return new URL(url).hostname.toLowerCase();
   } catch {
     return "";
+  }
+}
+
+function isOpenRouterApiBaseUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      url.hostname === "openrouter.ai" &&
+      url.port === "" &&
+      url.username === "" &&
+      url.password === "" &&
+      (url.pathname === "/api" || url.pathname === "/api/") &&
+      url.search === "" &&
+      url.hash === ""
+    );
+  } catch {
+    return false;
   }
 }
 
@@ -86,7 +124,7 @@ export interface AdvertRef {
  *                    image → one extraction). Upstream is an OpenAI-compatible
  *                    VISION endpoint (OPENAI_BASE_URL), e.g. vLLM serving
  *                    datalab-to/chandra-ocr-2. */
-export type CapabilityKind = "chat" | "tts" | "chat-session" | "ocr" | "custom";
+export type CapabilityKind = "chat" | "tts" | "chat-session" | "ocr" | "paper2agent" | "custom";
 
 /** Served-checkpoint probe cadence for the ocr capability.
  *   "per_job" — probe the upstream before every Claim (default when
@@ -105,12 +143,46 @@ export type OcrUpstream = "openai-vision" | "datalab";
 /** LLM backend selected for the chat capability. */
 export type LlmBackend = "ollama" | "openai";
 
+/** Wire protocol used by the OpenAI-compatible LLM upstream. */
+export type OpenAiUpstreamApi = "responses" | "chat-completions";
+
 /** Chain settlement mode for chat sessions.
  *   "full"   — Claim at start, Submit receipt at end (buyer Accepts). Default.
  *   "ticket" — the buyer's escrow post is the only chain op; the supplier
  *              verifies it as an entry ticket but never Claims/Submits, and
  *              the buyer's sweeper Reclaims the Open escrow after deliver_by. */
 export type ChatSettleMode = "full" | "ticket";
+
+export type ResellerProvider = "openrouter";
+
+export interface ResellerConfig {
+  provider: ResellerProvider;
+  databaseUrl: string;
+  /** Fixed protected amount in provider USD credits. Parsed exactly at runtime. */
+  reserveUsd: string;
+  /** Conservative off-chain input bound advertised by /capability. */
+  maxInputTokens: number;
+  pollIntervalMs: number;
+  staleAfterMs: number;
+  providerTimeoutMs: number;
+  previewMaxChars: number;
+}
+
+
+export interface Paper2AgentConfig {
+  executable: string;
+  argv: string[];
+  cwd: string;
+  packagePath: string;
+  manifestPath: string;
+  journalDir: string;
+  /**
+   * PAPER2AGENT_FREE_CALLS=1 enables the unpaid POST /v1/paper2agent/call route.
+   * The route has no authentication: enable it only behind a proxy that
+   * authenticates callers, such as the Paper2Agent publisher.
+   */
+  freeCalls?: boolean;
+}
 
 export interface SupplierConfig {
   supplierPrivKeyHex: string;
@@ -125,17 +197,21 @@ export interface SupplierConfig {
    * proxies). Required for hosted OpenAI-compatible APIs (DeepSeek, OpenAI, etc.).
    */
   openaiApiKey: string;
+  /** Explicit upstream protocol. Defaults to the native Responses API. */
+  openaiUpstreamApi: OpenAiUpstreamApi;
+  /** Optional full native Responses endpoint. Empty uses OPENAI_BASE_URL/v1/responses. */
+  openaiResponsesUrl: string;
+  /** Collect the native SSE result for providers whose JSON aggregate omits output. */
+  openaiResponsesStreamOnly: boolean;
   /**
-   * When true, upstream OpenAI/OpenRouter calls send `reasoning:{enabled:false}`
-   * to disable "thinking" tokens (faster/cheaper straight answers; avoids
-   * reasoning starving the completion into a length-truncated empty answer).
-   * Set via OPENAI_REASONING=off. Default false. OpenRouter-only.
+   * When true, native Responses calls send `reasoning:{effort:"none"}`.
+   * Explicit Chat Completions adapters send the documented OpenRouter
+   * `reasoning:{enabled:false}` extension. Set via OPENAI_REASONING=off.
    */
   openaiReasoningDisabled: boolean;
   /**
-   * Optional `max_tokens` ceiling forwarded on upstream calls. 0 = omit (the
-   * provider then grants the max available = context − prompt). Must stay below
-   * the model context or the provider 400s (e.g. kimi context = 262144).
+   * Optional upstream output-token ceiling. 0 means omit it unless the buyer
+   * explicitly supplies max_output_tokens.
    */
   openaiMaxTokens: number;
   /**
@@ -163,8 +239,12 @@ export interface SupplierConfig {
   /** Empty string when capabilityKind="chat". */
   piperUrl: string;
   advertRef: AdvertRef;
+  /** AGENT_ID: the supplier's own agent (64 lowercase hex). Undefined when unset. */
+  agentId?: string;
   networkId: 0 | 1;
   port: number;
+  /** IP literal to bind. Undefined keeps the default all-interfaces listener. */
+  bindHost?: string;
   ollamaTimeoutMs: number;
   openaiTimeoutMs: number;
   piperTimeoutMs: number;
@@ -246,6 +326,9 @@ export interface SupplierConfig {
    * Default 600_000 (10 min). Only fires while liveChain=true.
    */
   walletHealthIntervalMs: number;
+  /** Optional balance-aware provider resale mode. Null preserves legacy behavior. */
+  reseller: ResellerConfig | null;
+  paper2agent?: Paper2AgentConfig;
 }
 
 function requireField(env: Record<string, string | undefined>, name: string): string {
@@ -291,11 +374,15 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
     capKindStr !== "tts" &&
     capKindStr !== "chat-session" &&
     capKindStr !== "ocr" &&
+    capKindStr !== "paper2agent" &&
     capKindStr !== "custom"
   ) {
-    throw new Error('loadConfig: CAPABILITY_KIND must be "chat", "tts", "chat-session", "ocr", or "custom"');
+    throw new Error('loadConfig: CAPABILITY_KIND must be "chat", "tts", "chat-session", "ocr", "paper2agent", or "custom"');
   }
   const capabilityKind: CapabilityKind = capKindStr;
+  const paper2agent = capabilityKind === "paper2agent"
+    ? loadPaper2AgentConfig(env)
+    : undefined;
 
   // LLM_BACKEND selects which HTTP client the chat job runner uses. Only
   // meaningful for capabilityKind="chat"; ignored when capabilityKind="tts".
@@ -349,13 +436,14 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
       openaiBaseUrl = env.OPENAI_BASE_URL ?? "";
     }
     piperUrl = env.PIPER_URL ?? "";
-  } else {
+  } else if (capabilityKind === "tts") {
     piperUrl = requireField(env, "PIPER_URL");
     ollamaUrl = env.OLLAMA_URL ?? "";
     openaiBaseUrl = env.OPENAI_BASE_URL ?? "";
   }
 
   const advertRefStr = requireField(env, "ADVERT_REF");
+  const agentId = parseAgentId(env.AGENT_ID, "loadConfig: AGENT_ID");
   const advertRef = parseAdvertRef(advertRefStr);
 
   const networkIdStr = requireField(env, "NETWORK_ID");
@@ -371,6 +459,15 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
       throw new Error("loadConfig: PORT must be a positive integer");
     }
     port = Number(portStr);
+  }
+
+  const bindHostStr = env.SUPPLIER_BIND_HOST;
+  let bindHost: string | undefined;
+  if (bindHostStr !== undefined && bindHostStr !== "") {
+    if (isIP(bindHostStr) === 0) {
+      throw new Error("loadConfig: SUPPLIER_BIND_HOST must be an IP address literal");
+    }
+    bindHost = bindHostStr;
   }
 
   const timeoutStr = env.OLLAMA_TIMEOUT_MS;
@@ -393,11 +490,22 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
 
   const openaiApiKey = env.OPENAI_API_KEY ?? "";
 
-  // OPENAI_REASONING — "off"/"false"/"0"/"no" disables OpenRouter reasoning
-  // ("thinking") by sending reasoning:{enabled:false} on every upstream call.
-  // Unset/any other value leaves the model's own default untouched (no param
-  // sent). Only valid for OpenRouter-backed suppliers — do NOT set for
-  // ChatMock/DeepSeek-direct, which reject the param.
+  const upstreamApiRaw = env.OPENAI_UPSTREAM_API ?? "responses";
+  if (upstreamApiRaw !== "responses" && upstreamApiRaw !== "chat-completions") {
+    throw new Error(
+      'loadConfig: OPENAI_UPSTREAM_API must be "responses" or "chat-completions"',
+    );
+  }
+  const openaiUpstreamApi: OpenAiUpstreamApi = upstreamApiRaw;
+  const openaiResponsesUrl = env.OPENAI_RESPONSES_URL ?? "";
+  const openaiResponsesStreamOnly = env.OPENAI_RESPONSES_STREAM_ONLY === "1";
+  if (openaiResponsesStreamOnly && openaiUpstreamApi !== "responses") {
+    throw new Error("loadConfig: OPENAI_RESPONSES_STREAM_ONLY requires OPENAI_UPSTREAM_API=responses");
+  }
+
+  // OPENAI_REASONING — "off"/"false"/"0"/"no" disables upstream reasoning.
+  // Native Responses calls send reasoning:{effort:"none"}. Explicit
+  // Chat Completions adapters retain the documented OpenRouter extension.
   const reasoningRaw = (env.OPENAI_REASONING ?? "").trim().toLowerCase();
   const openaiReasoningDisabled =
     reasoningRaw === "off" ||
@@ -405,28 +513,23 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
     reasoningRaw === "0" ||
     reasoningRaw === "no";
 
-  // HuggingFace router guard. The `reasoning:{enabled:false}` param is
-  // OpenRouter-specific; the HF Inference Providers router
-  // (router.huggingface.co) rejects it with HTTP 400 on EVERY request. This is
-  // the easy footgun when copying an OpenRouter env to the HF preset, so fail
-  // fast at boot with a clear message instead of 400-ing every job.
-  // See docs/HUGGINGFACE_ROUTER_SETUP.md.
+  // The Hugging Face Chat Completions endpoint rejects OpenRouter's
+  // reasoning:{enabled:false} extension. Its native Responses endpoint uses
+  // the standard effort control instead, so only guard explicit Chat mode.
   if (
     llmBackend === "openai" &&
     openaiReasoningDisabled &&
+    openaiUpstreamApi === "chat-completions" &&
     hostnameOf(openaiBaseUrl) === "router.huggingface.co"
   ) {
     throw new Error(
-      "loadConfig: OPENAI_REASONING must be unset for the HuggingFace router " +
-        "(OPENAI_BASE_URL=https://router.huggingface.co) — it rejects " +
-        "reasoning:{enabled:false} with HTTP 400. Remove OPENAI_REASONING.",
+      "loadConfig: OPENAI_REASONING must be unset for the HuggingFace " +
+        "Chat Completions upstream — it rejects reasoning:{enabled:false}.",
     );
   }
 
-  // OPENAI_MAX_TOKENS — optional hard ceiling forwarded as `max_tokens`. Unset
-  // or non-positive omits it (provider grants max available = context − prompt).
-  // Keep it below the model context (kimi 262144) or the provider 400s when
-  // prompt+max_tokens exceeds context.
+  // OPENAI_MAX_TOKENS — optional operator output-token ceiling. Unset omits
+  // the field unless the buyer explicitly supplies max_output_tokens.
   const maxTokStr = env.OPENAI_MAX_TOKENS;
   let openaiMaxTokens = 0;
   if (maxTokStr !== undefined && maxTokStr !== "") {
@@ -586,20 +689,140 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
     walletHealthIntervalMs = Number(whIntervalStr);
   }
 
+  const resellerFields = [
+    "RESELLER_DATABASE_URL",
+    "RESELLER_RESERVE_USD",
+    "RESELLER_MAX_INPUT_TOKENS",
+    "RESELLER_POLL_INTERVAL_MS",
+    "RESELLER_PROVIDER_TIMEOUT_MS",
+    "RESELLER_PREVIEW_MAX_CHARS",
+  ] as const;
+  const resellerProviderRaw = (env.RESELLER_PROVIDER ?? "").trim();
+  const hasResellerFields = resellerFields.some(
+    (name) => env[name] !== undefined && env[name] !== "",
+  );
+  let reseller: ResellerConfig | null = null;
+  if (resellerProviderRaw === "") {
+    if (hasResellerFields) {
+      throw new Error(
+        "loadConfig: RESELLER_PROVIDER is required when reseller fields are set",
+      );
+    }
+  } else {
+    if (resellerProviderRaw !== "openrouter") {
+      throw new Error('loadConfig: RESELLER_PROVIDER must be "openrouter"');
+    }
+    if (capabilityKind !== "chat" || llmBackend !== "openai") {
+      throw new Error(
+        'loadConfig: RESELLER_PROVIDER requires CAPABILITY_KIND="chat" and LLM_BACKEND="openai"',
+      );
+    }
+    if (!isOpenRouterApiBaseUrl(openaiBaseUrl)) {
+      throw new Error(
+        "loadConfig: RESELLER_PROVIDER=openrouter requires OPENAI_BASE_URL=https://openrouter.ai/api",
+      );
+    }
+    if (openaiApiKey === "") {
+      throw new Error(
+        "loadConfig: RESELLER_PROVIDER=openrouter requires OPENAI_API_KEY",
+      );
+    }
+    if (openaiMaxTokens <= 0) {
+      throw new Error(
+        "loadConfig: RESELLER_PROVIDER requires a positive OPENAI_MAX_TOKENS",
+      );
+    }
+
+    const databaseUrl = requireField(env, "RESELLER_DATABASE_URL");
+    let databaseProtocol = "";
+    try {
+      databaseProtocol = new URL(databaseUrl).protocol;
+    } catch {
+      throw new Error(
+        "loadConfig: RESELLER_DATABASE_URL must be a valid PostgreSQL URL",
+      );
+    }
+    if (databaseProtocol !== "postgres:" && databaseProtocol !== "postgresql:") {
+      throw new Error(
+        "loadConfig: RESELLER_DATABASE_URL must use postgres:// or postgresql://",
+      );
+    }
+
+    const reserveUsd = requireField(env, "RESELLER_RESERVE_USD").trim();
+    if (!USD_RE.test(reserveUsd)) {
+      throw new Error(
+        "loadConfig: RESELLER_RESERVE_USD must be a non-negative decimal with at most 9 places",
+      );
+    }
+
+    const maxInputRaw = requireField(env, "RESELLER_MAX_INPUT_TOKENS");
+    if (!POS_INT_RE.test(maxInputRaw) || !Number.isSafeInteger(Number(maxInputRaw))) {
+      throw new Error(
+        "loadConfig: RESELLER_MAX_INPUT_TOKENS must be a positive safe integer",
+      );
+    }
+
+    const pollRaw = env.RESELLER_POLL_INTERVAL_MS ?? "30000";
+    if (!POS_INT_RE.test(pollRaw) || !Number.isSafeInteger(Number(pollRaw))) {
+      throw new Error(
+        "loadConfig: RESELLER_POLL_INTERVAL_MS must be a positive safe integer",
+      );
+    }
+    const pollIntervalMs = Number(pollRaw);
+
+    const providerTimeoutRaw = env.RESELLER_PROVIDER_TIMEOUT_MS ?? "10000";
+    if (
+      !POS_INT_RE.test(providerTimeoutRaw) ||
+      !Number.isSafeInteger(Number(providerTimeoutRaw))
+    ) {
+      throw new Error(
+        "loadConfig: RESELLER_PROVIDER_TIMEOUT_MS must be a positive safe integer",
+      );
+    }
+
+    const previewMaxRaw = env.RESELLER_PREVIEW_MAX_CHARS ?? "160";
+    if (
+      !POS_INT_RE.test(previewMaxRaw) ||
+      !Number.isSafeInteger(Number(previewMaxRaw)) ||
+      Number(previewMaxRaw) > 1000
+    ) {
+      throw new Error(
+        "loadConfig: RESELLER_PREVIEW_MAX_CHARS must be an integer from 1 to 1000",
+      );
+    }
+
+    reseller = {
+      provider: "openrouter",
+      databaseUrl,
+      reserveUsd,
+      maxInputTokens: Number(maxInputRaw),
+      pollIntervalMs,
+      staleAfterMs: Math.max(pollIntervalMs * 2, pollIntervalMs + 5000),
+      providerTimeoutMs: Number(providerTimeoutRaw),
+      previewMaxChars: Number(previewMaxRaw),
+    };
+  }
+
+
   return {
     supplierPrivKeyHex,
     ogmiosUrl,
     ollamaUrl,
     openaiBaseUrl,
     openaiApiKey,
+    openaiUpstreamApi,
+    openaiResponsesUrl,
+    openaiResponsesStreamOnly,
     openaiReasoningDisabled,
     openaiMaxTokens,
     openaiSessionPassthrough,
     openaiModelOverride,
     piperUrl,
     advertRef,
+    agentId,
     networkId,
     port,
+    bindHost,
     ollamaTimeoutMs,
     openaiTimeoutMs,
     piperTimeoutMs,
@@ -624,5 +847,27 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
     advertMaxProcessingMs,
     liveChain,
     walletHealthIntervalMs,
+    reseller,
+    paper2agent,
   };
+}
+
+export function loadPaper2AgentConfig(env: Record<string, string | undefined>): Paper2AgentConfig {
+  const executable = requireField(env, "PAPER2AGENT_EXECUTABLE");
+  const cwd = requireField(env, "PAPER2AGENT_CWD");
+  const packagePath = requireField(env, "PAPER2AGENT_PACKAGE");
+  const manifestPath = requireField(env, "PAPER2AGENT_MANIFEST");
+  const journalDir = requireField(env, "PAPER2AGENT_JOURNAL_DIR");
+  for (const [name, value] of Object.entries({ executable, cwd, packagePath, manifestPath, journalDir })) {
+    if (!value.startsWith("/") || value.includes("\0")) {
+      throw new Error(`PAPER2AGENT ${name} must be an absolute local path`);
+    }
+  }
+  const argv: unknown = JSON.parse(requireField(env, "PAPER2AGENT_ARGV_JSON"));
+  if (!Array.isArray(argv) || argv.length > 64 ||
+      argv.some((arg) => typeof arg !== "string" || arg.includes("\0") || arg.length > 4096)) {
+    throw new Error("PAPER2AGENT_ARGV_JSON must be a bounded string array");
+  }
+  // Strict "1" only, mirroring LIVE_CHAIN.
+  return { executable, argv, cwd, packagePath, manifestPath, journalDir, freeCalls: env.PAPER2AGENT_FREE_CALLS === "1" };
 }

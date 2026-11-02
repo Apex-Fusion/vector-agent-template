@@ -8,21 +8,39 @@
  *   1. walletKey.pubKeyHash === oldDatum.supplier_pkh
  *   2. newDatum.supplier_pkh === oldDatum.supplier_pkh (supplier unchanged)
  *   3. newDatum.advertised_at >= oldDatum.advertised_at (no regress)
+ *
+ * Both layouts (Part 2 §9.6): the advert datum on chain decides, and the new
+ * datum must have the same layout. A new advert (14 fields) also keeps
+ * agent_id (§6.2), passes the listing rule after the update (`lookupRecord`)
+ * and has a live builder (identityAdvert.ts). The legacy layout keeps its
+ * synthetic testTxBody path only.
  */
 
 import type { ChainProvider, OutputReference } from "../../chain/ChainProvider.js";
 import type { AdvertDatum } from "../../cbor/types.js";
-import { encodeAdvertDatum, decodeAdvertDatum } from "../../cbor/AdvertDatum.js";
+import { encodeAdvertDatum } from "../../cbor/AdvertDatum.js";
+import type { IdentityAdvertDatum } from "../../cbor/IdentityAdvertDatum.js";
+import type { IdentityBlueprint } from "../blueprint.js";
+import type { RecordLookup } from "../identityRecord.js";
 import type { WalletKey, BuildResult } from "../types.js";
 import { TxConstructionError } from "../types.js";
 import { encodeTxBody, sha256Hex } from "../internal/testTxBody.js";
+import { isIdentityAdvertDatum, readAdvert } from "../internal/layout.js";
+import { updateIdentityAdvert } from "./identityAdvert.js";
 
 export interface UpdateAdvertParams {
   chain: ChainProvider;
   walletKey: WalletKey;
   advertRef: OutputReference;
-  newAdvertDatum: AdvertDatum;
+  /** Same layout as the advert on chain: with agent_id for a new advert. */
+  newAdvertDatum: AdvertDatum | IdentityAdvertDatum;
   deposit_lovelace: bigint;
+  /** New advert only: finds the agent record (required). */
+  lookupRecord?: RecordLookup;
+  /** New advert only. Default: loadIdentityBlueprint() (env IDENTITY_POLICY_ID). */
+  identityBlueprint?: IdentityBlueprint;
+  /** New advert only: runs after signing and before broadcast. */
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
 }
 
 export async function buildUpdateAdvertTx(
@@ -30,21 +48,29 @@ export async function buildUpdateAdvertTx(
 ): Promise<BuildResult> {
   const { chain, walletKey, advertRef, newAdvertDatum, deposit_lovelace } = params;
 
-  const utxo = await chain.queryUtxo(advertRef);
-  if (utxo === null) {
+  const advert = await readAdvert(chain, advertRef);
+  if (advert.layout === "identity") {
+    if (!isIdentityAdvertDatum(newAdvertDatum)) {
+      throw new TxConstructionError("advert layout mismatch", "the advert on chain has agent_id; the new datum has none");
+    }
+    return updateIdentityAdvert({
+      chain,
+      walletKey,
+      advert,
+      newAdvertDatum,
+      deposit_lovelace,
+      lookupRecord: params.lookupRecord,
+      identityBlueprint: params.identityBlueprint,
+      beforeSubmit: params.beforeSubmit,
+    });
+  }
+  if (isIdentityAdvertDatum(newAdvertDatum)) {
     throw new TxConstructionError(
-      "advert ref not on chain",
-      `no UTxO at ${advertRef.txHash}#${advertRef.index}`,
+      "advert layout mismatch",
+      "a legacy advert cannot take agent_id; retire it and post a new advert",
     );
   }
-  if (!utxo.datumHex) {
-    throw new TxConstructionError(
-      "advert datum missing",
-      `UTxO ${advertRef.txHash}#${advertRef.index} has no inline datum`,
-    );
-  }
-
-  const oldDatum = decodeAdvertDatum(utxo.datumHex);
+  const { utxo, datum: oldDatum } = advert;
 
   // 1. Signer must match the existing supplier identity.
   if (walletKey.pubKeyHash !== oldDatum.supplier_pkh) {

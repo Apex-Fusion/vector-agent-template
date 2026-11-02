@@ -30,21 +30,19 @@ import type { ChainProvider, OutputReference, Utxo } from "@marketplace/shared/c
 import { encodeAdvertDatum, encodeEscrowDatum, canonicalize } from "@marketplace/shared/cbor";
 import type { AdvertDatum, EscrowDatum } from "@marketplace/shared/cbor";
 import type { WalletKey } from "@marketplace/shared/tx";
+import type * as TxModule from "@marketplace/shared/tx";
 
-// custom.ts statically imports buildClaimTx/mockSlotToWallclockMs/
-// detectCborBackend from "@marketplace/shared/tx" (and, via runCustomJob,
-// buildSubmitTx from the same barrel); walletHealth.ts (pulled in for
-// triggerOnFailureConsolidate) separately imports runConsolidateWallet from
-// "@marketplace/shared/tx/server". Both barrels trace into lucid-evolution/
-// CML WASM (and, in this pnpm layout, a broken libsodium-wrappers-sumo
-// relative import). The prompt_mismatch path under test never reaches Claim
-// or consolidate, so none of these are actually called — mock both modules
-// wholesale, same workaround ../customJobRunner.test.ts uses for buildSubmitTx.
-vi.mock("@marketplace/shared/tx", () => ({
+// The paths under test all answer before the Claim, so the two tx builders the
+// route can reach (buildClaimTx here, buildSubmitTx via runCustomJob) are
+// replaced and must never run. The rest of the barrel stays real: the vendored
+// identity helpers the route calls read the escrow layout through it.
+// walletHealth.ts (pulled in for triggerOnFailureConsolidate) imports
+// runConsolidateWallet from "@marketplace/shared/tx/server"; no consolidate
+// may run either, so that module is replaced as well.
+vi.mock("@marketplace/shared/tx", async (importOriginal) => ({
+  ...(await importOriginal<typeof TxModule>()),
   buildClaimTx: vi.fn(),
   buildSubmitTx: vi.fn(),
-  mockSlotToWallclockMs: vi.fn(),
-  detectCborBackend: vi.fn(),
 }));
 vi.mock("@marketplace/shared/tx/server", () => ({
   runConsolidateWallet: vi.fn(),
@@ -53,7 +51,22 @@ vi.mock("@marketplace/shared/tx/server", () => ({
 import type { SupplierConfig } from "../config.js";
 import { SupplierState } from "../state.js";
 import { JobStore } from "../jobs.js";
+import type { SupplierIdentity } from "../identity/agent.js";
 import { makeCustomHandler, type CustomRouteDeps } from "./custom.js";
+
+/**
+ * Every escrow in this file has the legacy layout, which needs no agent
+ * record. Any read of the identity registry here is a bug, so both members
+ * fail loudly. custom.identity.test.ts covers the layout with agent_id.
+ */
+const legacyOnlyIdentity: SupplierIdentity = {
+  lookupRecord: async () => {
+    throw new Error("a legacy escrow must not read an agent record");
+  },
+  blueprint: () => {
+    throw new Error("a legacy escrow must not load the identity blueprint");
+  },
+};
 
 function sha256Hex(s: string): string {
   return createHash("sha256").update(s, "utf8").digest("hex");
@@ -176,6 +189,7 @@ describe("makeCustomHandler — prompt_hash check", () => {
       config,
       supplierKey,
       jobs: new JobStore(),
+      identity: legacyOnlyIdentity,
       executor: { execute: vi.fn() },
     };
     const handler = makeCustomHandler(deps);
@@ -218,6 +232,7 @@ describe("makeCustomHandler — advert SLA against the configured one", () => {
         config,
         supplierKey,
         jobs: new JobStore(),
+        identity: legacyOnlyIdentity,
         executor: { execute: vi.fn() },
       },
     };
@@ -271,6 +286,7 @@ describe("makeCustomHandler — executor presence", () => {
       config,
       supplierKey,
       jobs: new JobStore(),
+      identity: legacyOnlyIdentity,
       // executor deliberately absent: a mount that never attached one
     };
     const next = vi.fn();

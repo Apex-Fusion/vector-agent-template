@@ -4,10 +4,10 @@
  * M1-F-async-chat-green — Catherine, 2026-04-28.
  * M1-F-async-chat-cleanup-green — Catherine, 2026-04-24.
  *
- * Invoked fire-and-forget from the POST chat handler after Claim tx confirms.
- * Steps (per Caroline's tests, ordering pinned):
- *   1. jobs.setRunning(jobId)                    [BEFORE callOllama — ordering pin]
- *   2. callOllama(...)                            [on rejection: jobs.fail("ollama_failure")]
+ * Invoked fire-and-forget from POST /v1/responses after Claim confirms.
+ * Steps:
+ *   1. jobs.setRunning(jobId)
+ *   2. call the configured Responses or Ollama adapter
  *   3. build + sign receipt
  *   4. construct + submit Submit tx via buildSubmitTx()
  *      [on rejection: jobs.fail("submit_failed")]
@@ -28,9 +28,16 @@
 import type { ChainProvider, OutputReference } from "@marketplace/shared/chain";
 import type { AdvertDatum, EscrowDatum } from "@marketplace/shared/cbor";
 import { canonicalize } from "@marketplace/shared/cbor";
-import type { WalletKey, ChatMessage } from "@marketplace/shared/tx";
+import type { WalletKey } from "@marketplace/shared/tx";
 import { buildSubmitTx } from "@marketplace/shared/tx";
 import { buildReceipt, signReceipt, receiptResultHash } from "@marketplace/shared/receipt";
+import {
+  createResponse,
+  responseInputToChatMessages,
+  responseResultCommitment,
+  type ResponseObject,
+  type ResponseRequest,
+} from "@marketplace/shared/responses";
 import { createHash } from "crypto";
 
 import type { SupplierState } from "./state.js";
@@ -43,11 +50,13 @@ import * as datalabOcr from "./datalabOcr.js";
 import type { OcrRequest } from "@marketplace/shared/tx";
 import type {
   JobStore,
-  JobResponsePayload,
   ChatJobResponsePayload,
   TtsJobResponsePayload,
   OcrJobResponsePayload,
 } from "./jobs.js";
+import type { ResellerRuntime } from "./reseller/runtime.js";
+import { parseUsdNumberCeil } from "./reseller/money.js";
+import { identityOptions, receiptAgentDid, type SupplierIdentity } from "./identity/agent.js";
 
 export interface RunChatJobDeps {
   chain: ChainProvider;
@@ -55,6 +64,9 @@ export interface RunChatJobDeps {
   config: SupplierConfig;
   supplierKey: WalletKey;
   jobs: JobStore;
+  reseller?: ResellerRuntime;
+  /** Record lookup and identity blueprint for the Submit of a new escrow. */
+  identity?: SupplierIdentity;
 }
 
 export interface RunChatJobParams {
@@ -64,17 +76,26 @@ export interface RunChatJobParams {
   claimedRef: OutputReference;
   advert: AdvertDatum;
   escrowDatum: EscrowDatum;
-  requestBody: { messages: ChatMessage[] };
+  requestBody: ResponseRequest;
 }
 
 function sha256Hex(s: string): string {
   return createHash("sha256").update(s, "utf8").digest("hex");
 }
 
+async function recordResellerFailure(
+  reseller: ResellerRuntime | undefined,
+  escrowRef: string,
+  reason: string,
+): Promise<void> {
+  if (!reseller) return;
+  await reseller.recordFailed(escrowRef, reason).catch(() => undefined);
+}
+
 /**
- * Run Ollama → receipt → Submit in the background.
- * Always resolves (never rejects). Terminal state written to jobs store.
- * Supplier lock is released in try/finally regardless of outcome.
+ * Run the configured LLM → receipt → Submit in the background.
+ * Always resolves (never rejects). Terminal state is written to the job store.
+ * The supplier lock is released in try/finally regardless of outcome.
  */
 export async function runChatJob(params: RunChatJobParams): Promise<void> {
   const { deps, jobId, escrowRef, claimedRef, advert, escrowDatum, requestBody } = params;
@@ -83,29 +104,79 @@ export async function runChatJob(params: RunChatJobParams): Promise<void> {
   deps.jobs.setRunning(jobId);
 
   try {
+    if (deps.reseller) {
+      try {
+        await deps.reseller.recordInferenceStarted(escrowRef);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        deps.jobs.fail(jobId, {
+          httpStatus: 503,
+          reason: "evidence_unavailable",
+          message,
+        });
+        return;
+      }
+    }
+
     // ── 2. Call upstream LLM ───────────────────────────────────────────
-    // Both backends return the same { content, prompt_tokens,
-    // completion_tokens, wallclock_ms } shape so receipt construction
-    // downstream is identical.
-    let inference: { content: string; prompt_tokens: number; completion_tokens: number; wallclock_ms: number };
+    let inference: {
+      response: ResponseObject;
+      content: string;
+      prompt_tokens: number;
+      completion_tokens: number;
+      wallclock_ms: number;
+      cost_usd?: number;
+    };
     try {
       if (deps.config.llmBackend === "openai") {
-        inference = await openai.callOpenAi({
+        inference = await openai.callResponses({
           baseUrl: deps.config.openaiBaseUrl,
+          responsesUrl: deps.config.openaiResponsesUrl || undefined,
+          responsesStreamOnly: deps.config.openaiResponsesStreamOnly,
+          upstreamApi: deps.config.openaiUpstreamApi,
           model: deps.config.openaiModelOverride || advert.model,
-          messages: requestBody.messages,
+          ...requestBody,
           timeoutMs: deps.config.openaiTimeoutMs,
           apiKey: deps.config.openaiApiKey,
           maxTokens: deps.config.openaiMaxTokens,
           disableReasoning: deps.config.openaiReasoningDisabled,
         });
       } else {
-        inference = await ollama.callOllama({
+        const ollamaResult = await ollama.callOllama({
           ollamaUrl: deps.config.ollamaUrl,
           model: advert.model,
-          messages: requestBody.messages,
+          messages: responseInputToChatMessages(requestBody.input, requestBody.instructions),
           timeoutMs: deps.config.ollamaTimeoutMs,
+          maxOutputTokens: requestBody.max_output_tokens,
         });
+        const responseStatus =
+          ollamaResult.done_reason === "length" ? "incomplete" : "completed";
+        const response = createResponse({
+          id: `resp_${jobId}`,
+          model: advert.model,
+          status: responseStatus,
+          incomplete_details:
+            responseStatus === "incomplete" ? { reason: "max_output_tokens" } : null,
+          output: [{
+            type: "message",
+            id: `msg_${jobId}`,
+            role: "assistant",
+            status: responseStatus,
+            content: [{ type: "output_text", text: ollamaResult.content, annotations: [] }],
+          }],
+          usage: {
+            input_tokens: ollamaResult.prompt_tokens,
+            output_tokens: ollamaResult.completion_tokens,
+            total_tokens: ollamaResult.prompt_tokens + ollamaResult.completion_tokens,
+          },
+        });
+        inference = {
+          response,
+          content: ollamaResult.content,
+          prompt_tokens: ollamaResult.prompt_tokens,
+          completion_tokens: ollamaResult.completion_tokens,
+          wallclock_ms: ollamaResult.wallclock_ms,
+        };
       }
     } catch (err) {
       const rawReason =
@@ -127,12 +198,12 @@ export async function runChatJob(params: RunChatJobParams): Promise<void> {
         reason: collapsedReason,
         message,
       });
+      await recordResellerFailure(deps.reseller, escrowRef, collapsedReason);
       return;
     }
 
     // ── 3. Build + sign receipt ────────────────────────────────────────
-    const assistantMessage = { role: "assistant" as const, content: inference.content };
-    const responseHash = sha256Hex(canonicalize(assistantMessage));
+    const responseHash = sha256Hex(canonicalize(responseResultCommitment(inference.response)));
 
     const receipt = buildReceipt({
       prompt_hash: escrowDatum.prompt_hash,
@@ -143,11 +214,43 @@ export async function runChatJob(params: RunChatJobParams): Promise<void> {
       wallclock_ms: inference.wallclock_ms,
       supplier_pkh: deps.supplierKey.pubKeyHash,
       escrow_ref: escrowRef,
+      ...receiptAgentDid(escrowDatum),
     });
     const signed = signReceipt(receipt, deps.supplierKey.privateKeyHex);
     const resultHash = receiptResultHash(signed);
+    if (deps.reseller) {
+      try {
+        await deps.reseller.recordOutput(escrowRef, {
+          response: inference.response,
+          receipt: {
+            receipt: signed.receipt,
+            signature: signed.signature,
+          },
+          promptTokens: inference.prompt_tokens,
+          completionTokens: inference.completion_tokens,
+          outputText: inference.content,
+          actualCostUsdNanos: inference.cost_usd === undefined
+            ? null
+            : parseUsdNumberCeil(inference.cost_usd, "OpenRouter usage cost"),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        deps.jobs.fail(jobId, {
+          httpStatus: 503,
+          reason: "evidence_unavailable",
+          message,
+        });
+        await recordResellerFailure(
+          deps.reseller,
+          escrowRef,
+          "output_persistence_failed",
+        );
+        return;
+      }
+    }
 
-    // ── 4+5. Submit tx: build + confirm as ONE wallet critical section ──
+
+    // ── 4+5. Broadcast, journal, then confirm Submit under one wallet lock ─
     const submitOutcome = await deps.state.walletMutex.run(async () => {
       let built: { txCborHex: string; expectedTxHash: string };
       try {
@@ -156,19 +259,31 @@ export async function runChatJob(params: RunChatJobParams): Promise<void> {
           supplierKey: deps.supplierKey,
           escrowRef: claimedRef,
           receiptHash: resultHash,
+          ...identityOptions(escrowDatum, deps.identity),
+          beforeSubmit: deps.reseller
+            ? async (candidate) => {
+                await deps.reseller!.recordSubmitting(
+                  escrowRef,
+                  `${candidate.expectedTxHash}#0`,
+                );
+              }
+            : undefined,
         });
       } catch (err) {
         return { kind: "build_failed" as const, err };
       }
+      const submittedRef = `${built.expectedTxHash}#0`;
       try {
         await deps.chain.awaitTx(built.expectedTxHash, 60_000);
       } catch (err) {
-        return { kind: "await_failed" as const, err };
+        return { kind: "await_failed" as const, err, built, submittedRef };
       }
-      return { kind: "ok" as const };
+      return { kind: "ok" as const, built, submittedRef };
     });
     if (submitOutcome.kind === "build_failed") {
-      const message = submitOutcome.err instanceof Error ? submitOutcome.err.message : String(submitOutcome.err);
+      const message = submitOutcome.err instanceof Error
+        ? submitOutcome.err.message
+        : String(submitOutcome.err);
       console.warn(
         `[job_failed] jobId=${jobId} reason=submit_failed httpStatus=502 msg=${message}`,
       );
@@ -177,41 +292,59 @@ export async function runChatJob(params: RunChatJobParams): Promise<void> {
         reason: "submit_failed",
         message: `Submit tx failed: ${message}`,
       });
+      await recordResellerFailure(deps.reseller, escrowRef, "submit_failed");
       return;
     }
     if (submitOutcome.kind === "await_failed") {
-      const msg = submitOutcome.err instanceof Error ? submitOutcome.err.message : String(submitOutcome.err);
+      const message = submitOutcome.err instanceof Error
+        ? submitOutcome.err.message
+        : String(submitOutcome.err);
       console.warn(
-        `[job_failed] jobId=${jobId} reason=submit_timeout httpStatus=502 msg=${msg}`,
+        `[job_failed] jobId=${jobId} reason=submit_timeout httpStatus=502 msg=${message}`,
       );
       deps.jobs.fail(jobId, {
         httpStatus: 502,
         reason: "submit_timeout",
-        message: `Submit awaitTx failed: ${msg}`,
+        message: `Submit awaitTx failed: ${message}`,
       });
+      deps.reseller?.watchSubmitting(escrowRef, submitOutcome.submittedRef);
       return;
     }
+    if (deps.reseller) {
+      try {
+        await deps.reseller.recordSubmitConfirmed(
+          escrowRef,
+          submitOutcome.submittedRef,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        deps.jobs.fail(jobId, {
+          httpStatus: 503,
+          reason: "evidence_unavailable",
+          message,
+        });
+        deps.reseller.watchSubmitting(escrowRef, submitOutcome.submittedRef);
+        return;
+      }
+    }
+
 
     // ── 6. Mark complete ────────────────────────────────────────────────
     const payload: ChatJobResponsePayload = {
+      ...inference.response,
+      // The marketplace model is the advert's routing identity; providers may
+      // return a resolved snapshot name or an explicitly configured override.
+      model: advert.model,
       kind: "chat",
-      choices: [
-        {
-          index: 0,
-          message: assistantMessage,
-          finish_reason: "stop",
-        },
-      ],
-      usage: {
-        prompt_tokens: inference.prompt_tokens,
-        completion_tokens: inference.completion_tokens,
-        total_tokens: inference.prompt_tokens + inference.completion_tokens,
-      },
       receipt: signed.receipt as unknown as Record<string, unknown>,
       receipt_signature: signed.signature,
+      submitted_ref: submitOutcome.submittedRef,
     };
     deps.jobs.complete(jobId, payload);
   } finally {
+    if (deps.reseller) {
+      await deps.reseller.refreshCapacity().catch(() => undefined);
+    }
     // ── 7. Always release this job's slot ───────────────────────────────
     try {
       deps.state.release(escrowRef);
@@ -227,13 +360,10 @@ export async function runChatJob(params: RunChatJobParams): Promise<void> {
 // 7-step shape (setRunning → upstream → receipt → buildSubmit → awaitTx →
 // complete → finally release). Differences from chat path:
 //
-//   - Upstream is `piper.callPiper` returning audio bytes + content-type,
-//     not Ollama returning text + token counts.
-//   - response_hash = sha256(audio_bytes) — opaque-bytes commitment, in
-//     contrast to chat which hashes a canonicalised assistant message JSON.
-//   - prompt_tokens / completion_tokens are reported as 0 in the receipt;
-//     Piper has no token concept and the on-chain validator doesn't read
-//     these fields (they're off-chain billing metadata only).
+//   - Upstream is `piper.callPiper` returning audio bytes + content-type.
+//   - response_hash = sha256(audio_bytes), unlike the LLM terminal-result commitment.
+//   - prompt_tokens / completion_tokens are 0 because Piper has no token usage;
+//     the on-chain validator does not read these off-chain billing fields.
 //   - JobStore terminal payload is `TtsJobResponsePayload` with audio_b64.
 
 export interface RunTtsJobParams {
@@ -299,6 +429,7 @@ export async function runTtsJob(params: RunTtsJobParams): Promise<void> {
       wallclock_ms: inference.wallclock_ms,
       supplier_pkh: deps.supplierKey.pubKeyHash,
       escrow_ref: escrowRef,
+      ...receiptAgentDid(escrowDatum),
     });
     const signed = signReceipt(receipt, deps.supplierKey.privateKeyHex);
     const resultHash = receiptResultHash(signed);
@@ -312,16 +443,19 @@ export async function runTtsJob(params: RunTtsJobParams): Promise<void> {
           supplierKey: deps.supplierKey,
           escrowRef: claimedRef,
           receiptHash: resultHash,
+          ...identityOptions(escrowDatum, deps.identity),
         });
       } catch (err) {
         return { kind: "build_failed" as const, err };
       }
+      // The Submit tx output (index 0) is the new Submitted UTxO the buyer Accepts.
+      const submittedRef = `${built.expectedTxHash}#0`;
       try {
         await deps.chain.awaitTx(built.expectedTxHash, 60_000);
       } catch (err) {
         return { kind: "await_failed" as const, err };
       }
-      return { kind: "ok" as const };
+      return { kind: "ok" as const, submittedRef };
     });
     if (submitOutcome.kind === "build_failed") {
       const message = submitOutcome.err instanceof Error ? submitOutcome.err.message : String(submitOutcome.err);
@@ -358,6 +492,7 @@ export async function runTtsJob(params: RunTtsJobParams): Promise<void> {
       byte_length: inference.audio.byteLength,
       receipt: signed.receipt as unknown as Record<string, unknown>,
       receipt_signature: signed.signature,
+      submitted_ref: submitOutcome.submittedRef,
     };
     deps.jobs.complete(jobId, payload);
   } finally {
@@ -467,6 +602,7 @@ export async function runOcrJob(params: RunOcrJobParams): Promise<void> {
       wallclock_ms: inference.wallclock_ms,
       supplier_pkh: deps.supplierKey.pubKeyHash,
       escrow_ref: escrowRef,
+      ...receiptAgentDid(escrowDatum),
     });
     const signed = signReceipt(receipt, deps.supplierKey.privateKeyHex);
     const resultHash = receiptResultHash(signed);
@@ -480,16 +616,18 @@ export async function runOcrJob(params: RunOcrJobParams): Promise<void> {
           supplierKey: deps.supplierKey,
           escrowRef: claimedRef,
           receiptHash: resultHash,
+          ...identityOptions(escrowDatum, deps.identity),
         });
       } catch (err) {
         return { kind: "build_failed" as const, err };
       }
+      const submittedRef = `${built.expectedTxHash}#0`;
       try {
         await deps.chain.awaitTx(built.expectedTxHash, 60_000);
       } catch (err) {
         return { kind: "await_failed" as const, err };
       }
-      return { kind: "ok" as const };
+      return { kind: "ok" as const, submittedRef };
     });
     if (submitOutcome.kind === "build_failed") {
       const message = submitOutcome.err instanceof Error ? submitOutcome.err.message : String(submitOutcome.err);
@@ -528,6 +666,7 @@ export async function runOcrJob(params: RunOcrJobParams): Promise<void> {
       },
       receipt: signed.receipt as unknown as Record<string, unknown>,
       receipt_signature: signed.signature,
+      submitted_ref: submitOutcome.submittedRef,
     };
     deps.jobs.complete(jobId, payload);
   } finally {

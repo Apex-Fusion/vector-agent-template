@@ -44,6 +44,8 @@ export interface ValidityRange {
 export interface TestTxBody {
   type: string;
   inputs: OutputReference[];
+  /** Read, not spent (the agent record of an identity-layout Claim, Submit or RefundRevoked). */
+  referenceInputs?: OutputReference[];
   outputs: PlannedOutput[];
   requiredSigners: string[];
   validityRange?: ValidityRange;

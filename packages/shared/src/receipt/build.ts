@@ -4,6 +4,9 @@
  * Receipt schema per ARCHITECTURE.md §5.1:
  *   { prompt_hash, response_hash, model, prompt_tokens, completion_tokens,
  *     wallclock_ms, supplier_pkh, escrow_ref }
+ * A receipt for a new escrow (Part 2 §6.3) has a 9th field:
+ *   agent_did = "did:vector:<agent_id>"
+ * A receipt for a legacy escrow keeps the 8 fields. Signing and hashing do not change.
  *
  * response_hash = sha256(canonical(<the assistant message object>))
  * escrow_ref    = "<64-char-hex>#<index>"
@@ -14,8 +17,17 @@
  * field presence/values so we keep declaration order for readability.
  */
 
+import { parseVectorDid } from "../identity/id.js";
+
 const HEX32_RE = /^[0-9a-fA-F]{64}$/;
 const ESCROW_REF_RE = /^[0-9a-fA-F]{64}#(?:0|[1-9]\d*)$/;
+
+/** The 8 fields of a receipt for a legacy escrow. */
+export const RECEIPT_FIELDS = [
+  "prompt_hash", "response_hash", "model", "prompt_tokens", "completion_tokens", "wallclock_ms", "supplier_pkh", "escrow_ref",
+] as const;
+/** The 9 fields of a receipt for a new escrow: the 8 fields and agent_did. */
+export const AGENT_RECEIPT_FIELDS = [...RECEIPT_FIELDS, "agent_did"] as const;
 
 export interface Receipt {
   prompt_hash: string;        // 32-byte hex
@@ -26,6 +38,8 @@ export interface Receipt {
   wallclock_ms: number;
   supplier_pkh: string;       // 28-byte hex
   escrow_ref: string;         // "<txHash>#<index>"
+  /** "did:vector:<agent_id>"; present only for a new escrow. */
+  agent_did?: string;
 }
 
 export interface BuildReceiptParams {
@@ -37,6 +51,8 @@ export interface BuildReceiptParams {
   wallclock_ms: number;
   supplier_pkh: string;
   escrow_ref: string;
+  /** Set for a new escrow: "did:vector:<agent_id>" of the escrow's agent_id. */
+  agent_did?: string;
 }
 
 function assertHex32(name: string, value: string): void {
@@ -69,8 +85,11 @@ export function buildReceipt(params: BuildReceiptParams): Receipt {
   if (!Number.isFinite(params.wallclock_ms) || params.wallclock_ms < 0) {
     throw new Error("buildReceipt: wallclock_ms must be a non-negative number");
   }
+  if (params.agent_did !== undefined && parseVectorDid(params.agent_did)?.form !== "canonical") {
+    throw new Error('buildReceipt: agent_did must be "did:vector:<64 lowercase hex characters>"');
+  }
 
-  return {
+  const receipt: Receipt = {
     prompt_hash: params.prompt_hash,
     response_hash: params.response_hash,
     model: params.model,
@@ -80,4 +99,6 @@ export function buildReceipt(params: BuildReceiptParams): Receipt {
     supplier_pkh: params.supplier_pkh,
     escrow_ref: params.escrow_ref,
   };
+  if (params.agent_did !== undefined) receipt.agent_did = params.agent_did;
+  return receipt;
 }

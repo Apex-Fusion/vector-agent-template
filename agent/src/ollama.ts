@@ -3,16 +3,17 @@
  *
  * callOllama({ ollamaUrl, model, messages, timeoutMs })
  *   POST to ${ollamaUrl}/api/chat with body { model, messages, stream: false }
- *   Returns { content, prompt_tokens, completion_tokens, wallclock_ms }
+ *   Returns { content, done_reason, prompt_tokens, completion_tokens, wallclock_ms }
  *
  * Error reasons:
  *   "ollama_failure"   — non-2xx HTTP response, network error, or unexpected fetch failure
  *   "ollama_timeout"   — request exceeded timeoutMs (AbortError surfaced from AbortController)
- *   "ollama_malformed" — response body missing message.content (or content is empty/null)
+ *   "ollama_malformed" — response lacks a terminal reason or valid message content
  *
  * Ollama /api/chat response shape:
  *   { message: { role: "assistant", content: string },
  *     done: boolean,
+ *     done_reason: string,
  *     prompt_eval_count: number,
  *     eval_count: number,
  *     total_duration: number }   // nanoseconds — divide by 1e6 to get ms
@@ -21,7 +22,7 @@
  *   - Uses global fetch + AbortController so tests can vi.stubGlobal("fetch", ...).
  *   - wallclock_ms is Math.floor(total_duration_ns / 1e6) — matches test that
  *     1_500_999_999 ns ⇒ 1500 ms (test accepts either 1500 or 1501; we floor).
- *   - Empty-string content is treated as malformed (test asserts).
+ *   - Empty-string content is valid only when done_reason is "length".
  */
 
 import type { ChatMessage } from "@marketplace/shared/tx";
@@ -31,10 +32,12 @@ export interface CallOllamaParams {
   model: string;
   messages: ChatMessage[];
   timeoutMs: number;
+  maxOutputTokens?: number;
 }
 
 export interface OllamaResult {
   content: string;
+  done_reason: string;
   prompt_tokens: number;
   completion_tokens: number;
   wallclock_ms: number;
@@ -61,9 +64,13 @@ function isAbortError(err: unknown): boolean {
 }
 
 export async function callOllama(params: CallOllamaParams): Promise<OllamaResult> {
-  const { ollamaUrl, model, messages, timeoutMs } = params;
+  const { ollamaUrl, model, messages, timeoutMs, maxOutputTokens } = params;
   const url = `${ollamaUrl}/api/chat`;
-  const body = JSON.stringify({ model, messages, stream: false });
+  const payload: Record<string, unknown> = { model, messages, stream: false };
+  if (maxOutputTokens !== undefined) {
+    payload.options = { num_predict: maxOutputTokens };
+  }
+  const body = JSON.stringify(payload);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -116,13 +123,17 @@ export async function callOllama(params: CallOllamaParams): Promise<OllamaResult
   }
 
   const obj = parsed as Record<string, unknown>;
+  const doneReason = obj.done_reason;
+  if (obj.done !== true || typeof doneReason !== "string" || doneReason.length === 0) {
+    throw new OllamaError("ollama_malformed", "Ollama response missing terminal done_reason");
+  }
   const messageRaw = obj.message;
   if (!messageRaw || typeof messageRaw !== "object") {
     throw new OllamaError("ollama_malformed", "Ollama response missing 'message' field");
   }
   const message = messageRaw as Record<string, unknown>;
   const content = message.content;
-  if (typeof content !== "string" || content.length === 0) {
+  if (typeof content !== "string" || (content.length === 0 && doneReason !== "length")) {
     throw new OllamaError("ollama_malformed", "Ollama response missing/empty message.content");
   }
 
@@ -133,6 +144,7 @@ export async function callOllama(params: CallOllamaParams): Promise<OllamaResult
 
   return {
     content,
+    done_reason: doneReason,
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
     wallclock_ms: wallclockMs,

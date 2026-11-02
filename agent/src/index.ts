@@ -22,37 +22,133 @@ import { JobStore } from "./jobs.js";
 import { createApp, type SupplierDeps } from "./server.js";
 import { buildChainProvider } from "./chain.js";
 import { startWalletHealthTicker } from "./walletHealth.js";
+import { decodeAdvert, ownAgentId, supplierIdentity } from "./identity/agent.js";
+import { BOUNDED_INPUT_DETAIL_MARKER } from "@marketplace/shared/tx";
+import { OpenRouterCapacityProvider } from "./reseller/openRouterCapacity.js";
+import { CapacityGate } from "./reseller/capacityGate.js";
+import { ResellerEvidenceStore } from "./reseller/evidenceStore.js";
+import { ResellerRuntime } from "./reseller/runtime.js";
+import { deriveSupplierKey } from "./paper2agent/identity.js";
+import { Paper2AgentRuntime } from "./paper2agent/runtime.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig(process.env);
 
-  // Derive a WalletKey from the configured private key. v1 receipt-signing
-  // uses the same key as on-chain signing — see ARCHITECTURE.md §9 open
-  // follow-up (sub-keys are a future tightening, not v1).
-  // Public key + pkh are NOT derived here yet: M1-D will plug in the proper
-  // Ed25519 + blake2b-224 pipeline. For boot correctness today we read them
-  // from optional env vars; tests inject WalletKey directly.
-  const supplierKey = {
+  // Tool suppliers bind the actual signing key to every advertised identity.
+  // Keep the existing injected identities for other capability kinds.
+  const supplierKey = cfg.capabilityKind === "paper2agent"
+    ? deriveSupplierKey(cfg.supplierPrivKeyHex, cfg.networkId)
+    : {
     privateKeyHex: cfg.supplierPrivKeyHex,
     pubKeyHex: process.env.SUPPLIER_PUB_KEY_HEX ?? "",
     pubKeyHash: process.env.SUPPLIER_PKH ?? "",
     address: process.env.SUPPLIER_ADDRESS ?? "",
   };
+  if (cfg.capabilityKind === "paper2agent") {
+    for (const [name, derived] of [
+      ["SUPPLIER_PUB_KEY_HEX", supplierKey.pubKeyHex],
+      ["SUPPLIER_PKH", supplierKey.pubKeyHash],
+      ["SUPPLIER_ADDRESS", supplierKey.address],
+    ]) {
+      if (process.env[name] && process.env[name] !== derived) {
+        throw new Error(`${name} does not match the supplier signing key`);
+      }
+    }
+  }
 
   // M1-F-2: provider selection is driven by cfg.liveChain (LIVE_CHAIN=1).
   // ReadOnly is the safe default; live mode is explicit opt-in.
   const chain = buildChainProvider(cfg);
+  // Record lookup and identity blueprint for new escrows; the blueprint loads on first use.
+  const identity = supplierIdentity(chain, cfg.networkId);
   // chat-session kind serves N concurrent sessions; one-shot kinds stay 1.
   const state = new SupplierState(cfg.capabilityKind === "chat-session" ? cfg.maxChatSessions : 1);
   const jobs = new JobStore();
+  const paper2agent = cfg.capabilityKind === "paper2agent"
+    ? await Paper2AgentRuntime.create({ chain, state, supplierKey, networkId: cfg.networkId,
+      advertRef: cfg.advertRef, config: cfg.paper2agent!, agentId: cfg.agentId, identity })
+    : undefined;
+  let reseller: ResellerRuntime | undefined;
+  if (cfg.reseller) {
+    const advertUtxo = await chain.queryUtxo(cfg.advertRef);
+    if (!advertUtxo?.datumHex) {
+      throw new Error("reseller boot: configured advert UTxO is unavailable");
+    }
+    const advert = decodeAdvert(advertUtxo.datumHex).datum;
+    // Throws when AGENT_ID and a new advert name different agents.
+    ownAgentId(cfg.agentId, advert);
+    if (advert.status !== "Active") {
+      throw new Error(`reseller boot: advert status is ${advert.status}`);
+    }
+    if (advert.capability_id !== "llm.text.generate.v1") {
+      throw new Error(
+        `reseller boot: advert capability must be llm.text.generate.v1, got ${advert.capability_id}`,
+      );
+    }
+    if (!advert.detail_uri.endsWith(BOUNDED_INPUT_DETAIL_MARKER)) {
+      throw new Error("reseller boot: advert is missing bounded-input metadata");
+    }
+    if (advert.max_output_tokens !== cfg.openaiMaxTokens) {
+      throw new Error(
+        "reseller boot: OPENAI_MAX_TOKENS must equal advert max_output_tokens",
+      );
+    }
+    if (advert.supplier_pkh !== supplierKey.pubKeyHash) {
+      throw new Error("reseller boot: advert supplier does not match SUPPLIER_PKH");
+    }
 
-  const deps: SupplierDeps = { chain, state, config: cfg, supplierKey, jobs };
+    const providerModel = cfg.openaiModelOverride || advert.model;
+    const provider = new OpenRouterCapacityProvider({
+      baseUrl: cfg.openaiBaseUrl,
+      apiKey: cfg.openaiApiKey,
+      timeoutMs: cfg.reseller.providerTimeoutMs,
+    });
+    const gate = new CapacityGate({
+      provider,
+      model: providerModel,
+      reserveUsd: cfg.reseller.reserveUsd,
+      maxInputTokens: cfg.reseller.maxInputTokens,
+      maxOutputTokens: advert.max_output_tokens,
+      staleAfterMs: cfg.reseller.staleAfterMs,
+    });
+    const store = new ResellerEvidenceStore(
+      cfg.reseller.databaseUrl,
+      cfg.reseller.previewMaxChars,
+    );
+    reseller = new ResellerRuntime({
+      chain,
+      state,
+      gate,
+      store,
+      advert,
+      advertRef: cfg.advertRef,
+      providerModel,
+      pollIntervalMs: cfg.reseller.pollIntervalMs,
+      maxInputTokens: cfg.reseller.maxInputTokens,
+    });
+    await reseller.initialize();
+  }
+
+
+  const deps: SupplierDeps = {
+    chain,
+    state,
+    config: cfg,
+    supplierKey,
+    jobs,
+    reseller,
+    paper2agent,
+    identity,
+  };
   const app = createApp(deps);
 
-  const server = app.listen(cfg.port, () => {
+  const onListening = () => {
     // eslint-disable-next-line no-console
-    console.log(`supplier listening on :${cfg.port}`);
-  });
+    console.log(`supplier listening on ${cfg.bindHost ?? ""}:${cfg.port}`);
+  };
+  const server = cfg.bindHost
+    ? app.listen(cfg.port, cfg.bindHost, onListening)
+    : app.listen(cfg.port, onListening);
 
   // M1-F-async-chat: evict expired terminal jobs every 60s (TTL = 10min).
   // .unref() prevents the timer from keeping the event loop alive after
@@ -80,7 +176,11 @@ async function main(): Promise<void> {
     clearInterval(evictInterval);
     walletHealthTicker?.stop();
     state.markOffline();
-    server.close(() => process.exit(0));
+    const runtimeCleanup = Promise.all([reseller?.close(), paper2agent?.close()])
+      .then(() => 0, () => 1);
+    server.close(() => {
+      void runtimeCleanup.then((code) => process.exit(code));
+    });
     setTimeout(() => process.exit(1), 5_000).unref();
   };
   process.on("SIGINT", () => shutdown("SIGINT"));

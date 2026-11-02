@@ -6,20 +6,27 @@
  *
  * Off-chain invariants enforced:
  *   1. walletKey.pubKeyHash === datum.supplier_pkh
+ *
+ * Both layouts (Part 2 §9.6): the advert datum decides. A new advert
+ * (14 fields) is spent with the new advert script (identityAdvert.ts).
  */
 
 import type { ChainProvider, OutputReference } from "../../chain/ChainProvider.js";
 import type { LiveOgmiosProvider } from "../../chain/LiveOgmiosProvider.js";
-import { decodeAdvertDatum } from "../../cbor/AdvertDatum.js";
+import type { IdentityBlueprint } from "../blueprint.js";
 import type { WalletKey, BuildResult } from "../types.js";
 import { TxConstructionError } from "../types.js";
 import { encodeTxBody, sha256Hex } from "../internal/testTxBody.js";
 import { detectCborBackend } from "../internal/cborBackend.js";
+import { readAdvert } from "../internal/layout.js";
+import { retireIdentityAdvert } from "./identityAdvert.js";
 
 export interface RetireAdvertParams {
   chain: ChainProvider;
   walletKey: WalletKey;
   advertRef: OutputReference;
+  /** New advert only. Default: loadIdentityBlueprint() (env IDENTITY_POLICY_ID). */
+  identityBlueprint?: IdentityBlueprint;
 }
 
 export async function buildRetireAdvertTx(
@@ -27,21 +34,11 @@ export async function buildRetireAdvertTx(
 ): Promise<BuildResult> {
   const { chain, walletKey, advertRef } = params;
 
-  const utxo = await chain.queryUtxo(advertRef);
-  if (utxo === null) {
-    throw new TxConstructionError(
-      "advert ref not on chain",
-      `no UTxO at ${advertRef.txHash}#${advertRef.index}`,
-    );
+  const advert = await readAdvert(chain, advertRef);
+  if (advert.layout === "identity") {
+    return retireIdentityAdvert({ chain, walletKey, advert, identityBlueprint: params.identityBlueprint });
   }
-  if (!utxo.datumHex) {
-    throw new TxConstructionError(
-      "advert datum missing",
-      `UTxO ${advertRef.txHash}#${advertRef.index} has no inline datum`,
-    );
-  }
-
-  const datum = decodeAdvertDatum(utxo.datumHex);
+  const { utxo, datum } = advert;
 
   // 1. Signer must match the supplier identity.
   if (walletKey.pubKeyHash !== datum.supplier_pkh) {

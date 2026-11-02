@@ -19,7 +19,7 @@
 
 import type { OutputReference } from "@marketplace/shared/chain";
 import type { AdvertDatum, EscrowDatum } from "@marketplace/shared/cbor";
-import type { ChatMessage } from "@marketplace/shared/tx";
+import type { ResponseItem, ResponseObject } from "@marketplace/shared/responses";
 
 export type ChatSessionStatus = "active" | "ending" | "ended";
 
@@ -39,13 +39,15 @@ export interface ChatSessionRecord {
   settleMode: "full" | "ticket";
   advert: AdvertDatum;
   escrowDatum: EscrowDatum;
-  /** Full ordered conversation (user + assistant turns). Hashed at End. */
-  transcript: ChatMessage[];
+  /** Full ordered Responses item transcript. Hashed at End. */
+  transcript: ResponseItem[];
   promptTokens: number;
   completionTokens: number;
   startedAtMs: number;
   lastActivityMs: number;
   status: ChatSessionStatus;
+  /** Prevents overlapping turns from interleaving one transcript. */
+  turnInFlight?: boolean;
   idleTimer?: ReturnType<typeof setTimeout>;
   hardCapTimer?: ReturnType<typeof setTimeout>;
   endResult?: ChatSessionEndResult;
@@ -92,31 +94,21 @@ export class ChatSessionStore {
     return r !== undefined && r.status !== "ended";
   }
 
-  appendUser(escrowRef: string, content: string): void {
+  /** Append a whole turn delta verbatim. */
+  appendInput(escrowRef: string, input: ResponseItem[]): void {
     const r = this.records.get(escrowRef);
     if (!r) return;
-    r.transcript.push({ role: "user", content });
+    r.transcript.push(...input);
     r.lastActivityMs = Date.now();
   }
 
-  /** Append a whole turn delta (e.g. user msg, or tool results) verbatim. */
-  appendMessages(escrowRef: string, messages: ChatMessage[]): void {
+  /** Append a validated terminal response atomically. */
+  appendResponse(escrowRef: string, response: ResponseObject): void {
     const r = this.records.get(escrowRef);
     if (!r) return;
-    r.transcript.push(...messages);
-    r.lastActivityMs = Date.now();
-  }
-
-  appendAssistant(
-    escrowRef: string,
-    message: ChatMessage,
-    usage: { prompt_tokens: number; completion_tokens: number },
-  ): void {
-    const r = this.records.get(escrowRef);
-    if (!r) return;
-    r.transcript.push(message);
-    r.promptTokens += usage.prompt_tokens;
-    r.completionTokens += usage.completion_tokens;
+    r.transcript.push(...response.output);
+    r.promptTokens += response.usage?.input_tokens ?? 0;
+    r.completionTokens += response.usage?.output_tokens ?? 0;
     r.lastActivityMs = Date.now();
   }
 
