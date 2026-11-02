@@ -11,6 +11,7 @@
     "./cbor": "./src/cbor/index.ts",
     "./identity": "./src/identity/index.ts",
     "./receipt": "./src/receipt/index.ts",
+    "./receipt-fields": "./src/receipt/fields.ts",
     "./paper2agent": "./src/paper2agent/index.ts",
     "./paper2agent/workflow": "./src/paper2agent/workflow.ts",
     "./responses": "./src/responses.ts",

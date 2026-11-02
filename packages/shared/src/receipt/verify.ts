@@ -24,7 +24,7 @@
 import * as ed from "@noble/ed25519";
 import { canonicalize } from "../cbor/canonical.js";
 import { isVectorId, keyHash, vectorDid } from "../identity/id.js";
-import { AGENT_RECEIPT_FIELDS, RECEIPT_FIELDS } from "./build.js";
+import { AGENT_RECEIPT_FIELDS, RECEIPT_FIELDS } from "./fields.js";
 import type { SignedReceipt } from "./sign.js";
 // Side-effect import: ensure etc.sha512Sync is wired even if a caller imports
 // verify.js without first importing sign.js.

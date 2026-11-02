@@ -22,13 +22,6 @@ import { parseVectorDid } from "../identity/id.js";
 const HEX32_RE = /^[0-9a-fA-F]{64}$/;
 const ESCROW_REF_RE = /^[0-9a-fA-F]{64}#(?:0|[1-9]\d*)$/;
 
-/** The 8 fields of a receipt for a legacy escrow. */
-export const RECEIPT_FIELDS = [
-  "prompt_hash", "response_hash", "model", "prompt_tokens", "completion_tokens", "wallclock_ms", "supplier_pkh", "escrow_ref",
-] as const;
-/** The 9 fields of a receipt for a new escrow: the 8 fields and agent_did. */
-export const AGENT_RECEIPT_FIELDS = [...RECEIPT_FIELDS, "agent_did"] as const;
-
 export interface Receipt {
   prompt_hash: string;        // 32-byte hex
   response_hash: string;      // 32-byte hex

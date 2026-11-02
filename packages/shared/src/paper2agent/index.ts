@@ -4,7 +4,8 @@ import { Point } from "@noble/ed25519";
 import { blake2b } from "@noble/hashes/blake2b";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import { canonicalize } from "../cbor/canonical.js";
-import { AGENT_RECEIPT_FIELDS, buildReceipt, RECEIPT_FIELDS, type Receipt } from "../receipt/build.js";
+import { buildReceipt, type Receipt } from "../receipt/build.js";
+import { AGENT_RECEIPT_FIELDS, RECEIPT_FIELDS } from "../receipt/fields.js";
 import { verifyReceipt } from "../receipt/verify.js";
 import { isVectorId, vectorDid } from "../identity/id.js";
 
