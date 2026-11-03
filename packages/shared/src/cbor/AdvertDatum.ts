@@ -22,10 +22,10 @@
  * re-register it (buyer-side and supplier-side fixtures do the same).
  */
 
-import { decode, Tag } from "cbor-x";
+import { Tag } from "cbor-x";
 import type { AdvertDatum, AdvertStatus } from "./types.js";
 import { plutusTag } from "./plutus-tag.js";
-import { encodePlutus } from "./plutus-encoder.js";
+import { encodePlutus, decodePlutus } from "./plutus-encoder.js";
 
 export type { AdvertDatum };
 
@@ -162,7 +162,7 @@ export function decodeAdvertDatum(hex: string): AdvertDatum {
 
   let decoded: unknown;
   try {
-    decoded = decode(hexToBytes(hex));
+    decoded = decodePlutus(hexToBytes(hex));
   } catch (err) {
     throw new Error(`decodeAdvertDatum: malformed CBOR: ${(err as Error).message}`);
   }

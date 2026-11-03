@@ -28,3 +28,10 @@ jobs:
       - name: blueprint loads inside the image
         run: >-
           docker run --rm --entrypoint sh vector-agent-template:ci -c "cd packages/shared && ../../node_modules/.bin/tsx -e \"import('./src/tx/blueprint.js').then(m=>{m.loadBlueprint();console.log('blueprint OK')}).catch(e=>{console.error('blueprint FAILED - '+e.message);process.exit(1)})\""
+      # The same for the second blueprint: the escrow and advert that carry an
+      # agent_id. loadIdentityBlueprint applies the identity registry's policy
+      # ID (a deployment value) to the escrow; a stand-in value is enough to
+      # prove the file is in the image and its code matches its hashes.
+      - name: identity blueprint loads inside the image
+        run: >-
+          docker run --rm --entrypoint sh vector-agent-template:ci -c "cd packages/shared && ../../node_modules/.bin/tsx -e \"import('./src/tx/blueprint.js').then(m=>{m.loadIdentityBlueprint({identityHash:'00'.repeat(28)});console.log('identity blueprint OK')}).catch(e=>{console.error('identity blueprint FAILED - '+e.message);process.exit(1)})\""

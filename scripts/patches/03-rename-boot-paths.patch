@@ -1,17 +1,17 @@
-diff --git a/agent/.dockerignore b/agent/.dockerignore
-index 98900cb..fe7a0b0 100644
---- a/agent/.dockerignore
-+++ b/agent/.dockerignore
+diff --git i/agent/.dockerignore w/agent/.dockerignore
+index 8ddea75..7acf6df 100644
+--- i/agent/.dockerignore
++++ w/agent/.dockerignore
 @@ -1,4 +1,4 @@
 -# supplier/.dockerignore — only consulted if `docker build` uses ./supplier
 +# agent/.dockerignore — only consulted if `docker build` uses ./agent
  # as its context. The project's documented build invocation uses the repo
  # root, so the top-level .dockerignore is the primary gate. This file is a
  # defence-in-depth duplicate.
-diff --git a/agent/Dockerfile b/agent/Dockerfile
-index 0036f3c..5ef7962 100644
---- a/agent/Dockerfile
-+++ b/agent/Dockerfile
+diff --git i/agent/Dockerfile w/agent/Dockerfile
+index e76d753..75d7040 100644
+--- i/agent/Dockerfile
++++ w/agent/Dockerfile
 @@ -1,6 +1,6 @@
  # syntax=docker/dockerfile:1.7
  #
@@ -48,10 +48,10 @@ index 0036f3c..5ef7962 100644
 +# Workspace manifests first to maximise layer cache reuse. This template
 +# vendors only packages/shared + agent (ex-supplier) — no root .npmrc, no
 +# patches/ dir (pnpm-lock.yaml here has no patchedDependencies), and no
-+# buyer/ or indexer/ siblings (this workspace's lockfile importers are only
-+# ".", "agent", "packages/shared" — confirmed via pnpm-lock.yaml), unlike the
-+# full upstream monorepo this Dockerfile was vendored from. Omitted rather
-+# than COPYing paths that don't exist in this repo.
++# buyer/ or indexer/ siblings, unlike the full upstream monorepo this
++# Dockerfile was vendored from. Omitted rather than COPYing paths that don't
++# exist in this repo. The lockfile's fourth importer, try-it/ (the self-test
++# buyer), stays out of the image too: the --filter below never installs it.
 +COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
  COPY packages/shared/package.json ./packages/shared/package.json
 -COPY supplier/package.json ./supplier/package.json
@@ -63,23 +63,28 @@ index 0036f3c..5ef7962 100644
  
  # Install only what supplier needs (and its transitive workspace deps).
  RUN pnpm install --frozen-lockfile --filter '@marketplace/supplier...'
-@@ -50,12 +51,43 @@ RUN set -e \
+@@ -50,14 +51,49 @@ RUN set -e \
   && cp "$SRC" "$DST/" \
   && echo "patched libsodium wrapper: $DST/libsodium-sumo.mjs"
  
 -# Copy the actual source — shared + supplier + Aiken blueprint (loadBlueprint
 -# reads contracts/marketplace/plutus.json at runtime to derive escrow addr +
 -# attach the spending validator script in M1-F-4 live-CBOR builders).
-+# Copy the actual source — shared + agent + the Aiken blueprint.
++# Copy the actual source — shared + agent + the Aiken blueprints.
 +#
-+# The blueprint (contracts/marketplace/plutus.json) IS vendored into this
-+# template, pinned to the same upstream commit as the code (VENDORED-FROM.md).
-+# loadBlueprint() reads it to derive the escrow/advert script addresses and to
-+# attach the spending validator in the live-CBOR builders. It is loaded lazily,
-+# inside those builders (buildClaimTx/buildSubmitTx/postEscrow et al.), never at
-+# import or boot time — so an image missing it still builds and boots, then
-+# fails on the first real job, after the buyer's funds are already locked. That
-+# is exactly why it is copied here and checked in CI rather than left implicit.
++# Both blueprints are vendored into this template, pinned to the same
++# upstream commit as the code (VENDORED-FROM.md):
++#   contracts/marketplace/plutus.json           loadBlueprint(): the legacy
++#     escrow and advert scripts.
++#   contracts/identity-marketplace/plutus.json  loadIdentityBlueprint(): the
++#     escrow and advert scripts that carry an agent_id.
++# The tx builders read them to derive the escrow/advert script addresses and
++# to attach the spending validators in the live-CBOR builders. They are loaded
++# lazily, inside those builders (buildClaimTx/buildSubmitTx/postEscrow et al.),
++# never at import or boot time — so an image missing one still builds and
++# boots, then fails on the first real job, after the buyer's funds are already
++# locked. That is exactly why both are copied here and checked in CI rather
++# than left implicit.
 +#
 +# examples/ carries the demo black box (echo-service.mjs) the quickstart and
 +# deploy/docker-compose.yml run as a second service off this same image.
@@ -87,6 +92,8 @@ index 0036f3c..5ef7962 100644
 -COPY supplier ./supplier
 +COPY agent ./agent
  COPY contracts/marketplace/plutus.json ./contracts/marketplace/plutus.json
+-# loadIdentityBlueprint reads the new escrow and advert (Part 2 §6.1, §6.2).
+ COPY contracts/identity-marketplace/plutus.json ./contracts/identity-marketplace/plutus.json
 +COPY examples ./examples
 +
 +# Defence-in-depth against a leaked HOST node_modules: on at least one
@@ -111,17 +118,17 @@ index 0036f3c..5ef7962 100644
  
  # ─── runtime ──────────────────────────────────────────────────────────────
  FROM node:${NODE_VERSION}-alpine AS runtime
-@@ -85,4 +117,4 @@ HEALTHCHECK --interval=20s --timeout=5s --start-period=15s --retries=3 \
+@@ -90,4 +126,4 @@ HEALTHCHECK --interval=20s --timeout=5s --start-period=15s --retries=3 \
  
  # tsx is hoisted to /repo/node_modules/.bin by pnpm — invoke via the workspace bin.
  ENTRYPOINT ["/sbin/tini", "--"]
 -CMD ["node_modules/.bin/tsx", "supplier/src/index.ts"]
 +CMD ["node_modules/.bin/tsx", "agent/src/index.ts"]
-diff --git a/agent/src/index.ts b/agent/src/index.ts
-index 51ab719..4d40867 100644
---- a/agent/src/index.ts
-+++ b/agent/src/index.ts
-@@ -87,9 +87,17 @@ async function main(): Promise<void> {
+diff --git i/agent/src/index.ts w/agent/src/index.ts
+index 5b1a388..d94187d 100644
+--- i/agent/src/index.ts
++++ w/agent/src/index.ts
+@@ -187,9 +187,17 @@ async function main(): Promise<void> {
    process.on("SIGTERM", () => shutdown("SIGTERM"));
  }
  

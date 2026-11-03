@@ -8,21 +8,37 @@
  *   1. walletKey.pubKeyHash === datum.supplier_pkh
  *   2. datum.state === "Open"
  *   3. validity upper-bound ≤ datum.deliver_by (chain tip < deliver_by)
+ *   4. hi − lo ≤ MAX_RANGE_MS (Part 2 §6.5): hi = min(deliver_by, lo + 1 h)
+ *
+ * Both layouts (Part 2 §9.6): the escrow datum decides. A 16-field escrow
+ * (identity layout) also needs `lookupRecord`: the agent record becomes a
+ * reference input, and the builder refuses when a Claim check of §6.1 fails
+ * (identityEscrow.ts claimIdentity).
  */
 
 import type { ChainProvider, OutputReference } from "../../chain/ChainProvider.js";
-import { decodeEscrowDatum, encodeEscrowDatum } from "../../cbor/EscrowDatum.js";
+import { encodeEscrowDatum } from "../../cbor/EscrowDatum.js";
+import type { IdentityBlueprint } from "../blueprint.js";
+import type { RecordLookup } from "../identityRecord.js";
 import type { WalletKey, BuildResult } from "../types.js";
 import { TxConstructionError } from "../types.js";
 import { encodeTxBody, sha256Hex } from "../internal/testTxBody.js";
+import { MAX_RANGE_MS } from "../../identity/constants.js";
 import { mockSlotToWallclockMs } from "../internal/constants.js";
 import { detectCborBackend } from "../internal/cborBackend.js";
+import { readEscrow } from "../internal/layout.js";
+import { claimIdentity } from "./identityEscrow.js";
 import type { LiveOgmiosProvider } from "../../chain/LiveOgmiosProvider.js";
 
 export interface ClaimParams {
   chain: ChainProvider;
   supplierKey: WalletKey;
   escrowRef: OutputReference;
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
+  /** Identity layout only: finds the agent record (required for a 16-field escrow). */
+  lookupRecord?: RecordLookup;
+  /** Identity layout only. Default: loadIdentityBlueprint() (env IDENTITY_POLICY_ID). */
+  identityBlueprint?: IdentityBlueprint;
 }
 
 export async function buildClaimTx(
@@ -30,21 +46,18 @@ export async function buildClaimTx(
 ): Promise<BuildResult> {
   const { chain, supplierKey, escrowRef } = params;
 
-  const utxo = await chain.queryUtxo(escrowRef);
-  if (utxo === null) {
-    throw new TxConstructionError(
-      "escrow ref not on chain",
-      `no UTxO at ${escrowRef.txHash}#${escrowRef.index}`,
-    );
+  const escrow = await readEscrow(chain, escrowRef);
+  if (escrow.layout === "identity") {
+    return claimIdentity({
+      chain,
+      escrow,
+      supplierKey,
+      lookupRecord: params.lookupRecord,
+      identityBlueprint: params.identityBlueprint,
+      beforeSubmit: params.beforeSubmit,
+    });
   }
-  if (!utxo.datumHex) {
-    throw new TxConstructionError(
-      "escrow datum missing",
-      `UTxO ${escrowRef.txHash}#${escrowRef.index} has no inline datum`,
-    );
-  }
-
-  const datum = decodeEscrowDatum(utxo.datumHex);
+  const { utxo, datum } = escrow;
 
   // 1. Signer must match supplier identity.
   if (supplierKey.pubKeyHash !== datum.supplier_pkh) {
@@ -79,7 +92,7 @@ export async function buildClaimTx(
   const newDatum = { ...datum, state: "Claimed" as const };
 
   // Live path: real Cardano CBOR via lucid-evolution.
-  if (detectCborBackend(chain) === "live") {
+  if (isLive) {
     const liveCborPath = "../internal/liveCbor.js";
     const { buildLiveTxForClaim } = await import(/* @vite-ignore */ liveCborPath);
     return buildLiveTxForClaim({
@@ -90,6 +103,7 @@ export async function buildClaimTx(
       newDatum,
       deliverBy: datum.deliver_by,
       tipMs,
+      beforeSubmit: params.beforeSubmit,
     });
   }
 
@@ -107,12 +121,13 @@ export async function buildClaimTx(
       },
     ],
     requiredSigners: [supplierKey.pubKeyHash],
-    validityRange: { lowerBoundMs: tipMs, upperBoundMs: datum.deliver_by },
+    validityRange: { lowerBoundMs: tipMs, upperBoundMs: Math.min(datum.deliver_by, tipMs + MAX_RANGE_MS) },
     redeemer: "Claim",
   };
 
   const txCborHex = encodeTxBody(body);
   const expectedTxHash = sha256Hex(txCborHex);
+  await params.beforeSubmit?.({ txCborHex, expectedTxHash });
 
   await chain.submitTx(txCborHex);
 

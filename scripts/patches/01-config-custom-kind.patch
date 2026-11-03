@@ -1,17 +1,17 @@
-diff --git a/agent/src/config.ts b/agent/src/config.ts
-index 0ed01b1..47a57b0 100644
---- a/agent/src/config.ts
-+++ b/agent/src/config.ts
-@@ -86,7 +86,7 @@ export interface AdvertRef {
+diff --git i/agent/src/config.ts w/agent/src/config.ts
+index feb0804..dcc9458 100644
+--- i/agent/src/config.ts
++++ w/agent/src/config.ts
+@@ -124,7 +124,7 @@ export interface AdvertRef {
   *                    image → one extraction). Upstream is an OpenAI-compatible
   *                    VISION endpoint (OPENAI_BASE_URL), e.g. vLLM serving
   *                    datalab-to/chandra-ocr-2. */
--export type CapabilityKind = "chat" | "tts" | "chat-session" | "ocr";
-+export type CapabilityKind = "chat" | "tts" | "chat-session" | "ocr" | "custom";
+-export type CapabilityKind = "chat" | "tts" | "chat-session" | "ocr" | "paper2agent";
++export type CapabilityKind = "chat" | "tts" | "chat-session" | "ocr" | "paper2agent" | "custom";
  
  /** Served-checkpoint probe cadence for the ocr capability.
   *   "per_job" — probe the upstream before every Claim (default when
-@@ -215,6 +215,26 @@ export interface SupplierConfig {
+@@ -295,6 +295,26 @@ export interface SupplierConfig {
    revisionProbeUrl: string;
    /** Probe cadence; see RevisionProbeMode. Env: REVISION_PROBE_MODE. */
    revisionProbeMode: RevisionProbeMode;
@@ -38,20 +38,20 @@ index 0ed01b1..47a57b0 100644
    /**
     * When true, the supplier boots a LiveOgmiosProvider (real submitTx/awaitTx).
     * Default false → ReadOnlyOgmiosProvider (safe; no chain writes).
-@@ -270,9 +290,10 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
-     capKindStr !== "chat" &&
+@@ -354,9 +374,10 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
      capKindStr !== "tts" &&
      capKindStr !== "chat-session" &&
--    capKindStr !== "ocr"
-+    capKindStr !== "ocr" &&
+     capKindStr !== "ocr" &&
+-    capKindStr !== "paper2agent"
++    capKindStr !== "paper2agent" &&
 +    capKindStr !== "custom"
    ) {
--    throw new Error('loadConfig: CAPABILITY_KIND must be "chat", "tts", "chat-session", or "ocr"');
-+    throw new Error('loadConfig: CAPABILITY_KIND must be "chat", "tts", "chat-session", "ocr", or "custom"');
+-    throw new Error('loadConfig: CAPABILITY_KIND must be "chat", "tts", "chat-session", "ocr", or "paper2agent"');
++    throw new Error('loadConfig: CAPABILITY_KIND must be "chat", "tts", "chat-session", "ocr", "paper2agent", or "custom"');
    }
    const capabilityKind: CapabilityKind = capKindStr;
- 
-@@ -292,7 +313,12 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+   const paper2agent = capabilityKind === "paper2agent"
+@@ -379,7 +400,12 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
    let ollamaUrl = "";
    let openaiBaseUrl = "";
    let piperUrl = "";
@@ -65,7 +65,7 @@ index 0ed01b1..47a57b0 100644
      // Multi-turn chat streams via callOpenAiStream, which only speaks the
      // OpenAI-compatible wire format — so chat-session is openai-only.
      if (llmBackend !== "openai") {
-@@ -508,6 +534,34 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+@@ -611,6 +637,34 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
    }
    const revisionProbeMode: RevisionProbeMode = probeModeStr;
  
@@ -100,7 +100,7 @@ index 0ed01b1..47a57b0 100644
    const piperTimeoutStr = env.PIPER_TIMEOUT_MS;
    let piperTimeoutMs = 120_000;
    if (piperTimeoutStr !== undefined && piperTimeoutStr !== "") {
-@@ -563,6 +617,11 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+@@ -786,6 +840,11 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
      hfModelRevision,
      revisionProbeUrl,
      revisionProbeMode,
@@ -111,4 +111,4 @@ index 0ed01b1..47a57b0 100644
 +    advertMaxProcessingMs,
      liveChain,
      walletHealthIntervalMs,
-   };
+     reseller,

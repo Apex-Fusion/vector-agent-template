@@ -27,7 +27,7 @@ function sortKeys(value: unknown): unknown {
   const entries = Object.entries(value as Record<string, unknown>)
     .filter(([, v]) => v !== undefined)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  const out: Record<string, unknown> = {};
+  const out: Record<string, unknown> = Object.create(null);
   for (const [k, v] of entries) {
     out[k.normalize("NFC")] = sortKeys(v);
   }

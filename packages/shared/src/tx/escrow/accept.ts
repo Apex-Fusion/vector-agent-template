@@ -10,22 +10,33 @@
  *   1. walletKey.pubKeyHash === datum.buyer_pkh
  *   2. datum.state === "Submitted"
  *   3. validity upper-bound ≤ datum.submitted_at + ACCEPT_WINDOW
+ *
+ * Both layouts (Part 2 §9.6): the escrow datum decides. For a 16-field
+ * escrow with `refund` set, the buyer bond goes to the refund address with
+ * the refund datum; the buyer still signs (identityEscrow.ts acceptIdentity).
  */
 
 import type { ChainProvider, OutputReference } from "../../chain/ChainProvider.js";
-import { decodeEscrowDatum } from "../../cbor/EscrowDatum.js";
+import type { IdentityBlueprint } from "../blueprint.js";
 import type { WalletKey, BuildResult } from "../types.js";
 import { TxConstructionError } from "../types.js";
 import { encodeTxBody, sha256Hex } from "../internal/testTxBody.js";
 import { ACCEPT_WINDOW_MS, mockSlotToWallclockMs } from "../internal/constants.js";
 import { pkhToEnterpriseAddress } from "../internal/pkhAddress.js";
 import { detectCborBackend } from "../internal/cborBackend.js";
+import { readEscrow } from "../internal/layout.js";
+import { acceptIdentity } from "./identityEscrow.js";
 import type { LiveOgmiosProvider } from "../../chain/LiveOgmiosProvider.js";
 
 export interface AcceptParams {
   chain: ChainProvider;
   buyerKey: WalletKey;
   escrowRef: OutputReference;
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
+  /** Wallet outputs that a submitted, unconfirmed transaction spends; never selected (live backend). */
+  excludeInputs?: readonly OutputReference[];
+  /** Identity layout only. Default: loadIdentityBlueprint() (env IDENTITY_POLICY_ID). */
+  identityBlueprint?: IdentityBlueprint;
 }
 
 export { ACCEPT_WINDOW_MS };
@@ -35,21 +46,18 @@ export async function buildAcceptTx(
 ): Promise<BuildResult> {
   const { chain, buyerKey, escrowRef } = params;
 
-  const utxo = await chain.queryUtxo(escrowRef);
-  if (utxo === null) {
-    throw new TxConstructionError(
-      "escrow ref not on chain",
-      `no UTxO at ${escrowRef.txHash}#${escrowRef.index}`,
-    );
+  const escrow = await readEscrow(chain, escrowRef);
+  if (escrow.layout === "identity") {
+    return acceptIdentity({
+      chain,
+      escrow,
+      buyerKey,
+      excludeInputs: params.excludeInputs,
+      identityBlueprint: params.identityBlueprint,
+      beforeSubmit: params.beforeSubmit,
+    });
   }
-  if (!utxo.datumHex) {
-    throw new TxConstructionError(
-      "escrow datum missing",
-      `UTxO ${escrowRef.txHash}#${escrowRef.index} has no inline datum`,
-    );
-  }
-
-  const datum = decodeEscrowDatum(utxo.datumHex);
+  const { utxo, datum } = escrow;
 
   // 1. Signer must match buyer identity.
   if (buyerKey.pubKeyHash !== datum.buyer_pkh) {
@@ -108,6 +116,8 @@ export async function buildAcceptTx(
       datum,
       tipMs,
       windowEnd,
+      beforeSubmit: params.beforeSubmit,
+      excludeInputs: params.excludeInputs,
     });
   }
 
@@ -139,6 +149,7 @@ export async function buildAcceptTx(
 
   const txCborHex = encodeTxBody(body);
   const expectedTxHash = sha256Hex(txCborHex);
+  await params.beforeSubmit?.({ txCborHex, expectedTxHash });
 
   await chain.submitTx(txCborHex);
 

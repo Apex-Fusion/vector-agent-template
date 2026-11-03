@@ -8,9 +8,9 @@
  * Vector L2 inherits Cardano slot semantics: 1 slot = 1 second on Vector
  * chains, so `slotLengthMs = 1000`.
  *
- * For mainnet, `systemStartUnix` is intentionally NaN so any caller who
- * accidentally targets mainnet without supplying real params fails loudly.
- * TODO M3+: fill in mainnet systemStartUnix once the network is live.
+ * These are the Vector genesis values of the shared package. The slot clocks
+ * of the transaction builders derive from them: VECTOR_MAINNET_SLOT_CONFIG
+ * (identity/tx) and the testnet default of tx/internal/window.ts.
  */
 
 export type NetworkId = 0 | 1; // 0 = testnet, 1 = mainnet
@@ -36,14 +36,14 @@ export const VECTOR_TESTNET: NetworkParams = {
 };
 
 /**
- * Vector mainnet parameters.
- * TODO M3+: replace `systemStartUnix` placeholder with the real genesis time.
- * Currently NaN so any caller that targets mainnet without supplying real
- * params will produce NaN slots — a loud failure rather than silent garbage.
+ * Vector mainnet parameters (Part 1 §4): system start 2025-08-29T16:40:00Z,
+ * one slot per second. The Koios genesis of Vector mainnet
+ * (https://v2.koios.vector.mainnet.apexfusion.org/api/v1/genesis) gives
+ * `systemstart` 1756485600 and `slotlength` 1.
  */
 export const VECTOR_MAINNET: NetworkParams = {
   networkId: 1,
-  systemStartUnix: Number.NaN,
+  systemStartUnix: 1756485600,
   slotLengthMs: 1000,
 };
 

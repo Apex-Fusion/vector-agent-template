@@ -4,24 +4,36 @@
  * Exports:
  *   runPostAdvert(params) — validate, build, submit, await, return ref.
  *
+ * Both advert layouts (Part 2 §9.6): a datum with agent_id posts a new advert
+ * at the new advert address. Before it builds, the flow checks the listing
+ * rule's record part (§6.2, §9.2): the record of agent_id is authentic,
+ * independent and effectively Active, and lists the supplier key with the
+ * transaction purpose and the advert's capability_id. The shared builder
+ * checks the same rules again and makes the supplier key a required signer.
+ *
  * Tests are written against the interface + behaviours declared here; do not
  * change the exported types without updating tests first.
  */
 
 import type { ChainProvider, OutputReference } from "@marketplace/shared/chain";
-import type { AdvertDatum } from "@marketplace/shared/cbor";
+import type { AdvertDatum, IdentityAdvertDatum } from "@marketplace/shared/cbor";
 import {
   buildPostAdvertTx,
   detectCborBackend,
+  isIdentityAdvertDatum,
   mockSlotToWallclockMs,
   TxConstructionError,
+  type PostAdvertBuildResult,
+  type PostAdvertParams,
   type WalletKey,
 } from "@marketplace/shared/tx";
+import { advertRecordProblem, type SupplierIdentity } from "../identity/agent.js";
 
 export interface PostAdvertFlowParams {
   chain: ChainProvider;
   walletKey: WalletKey;
-  advertDatum: AdvertDatum;
+  /** A datum with agent_id (IdentityAdvertDatum) posts a new advert. */
+  advertDatum: AdvertDatum | IdentityAdvertDatum;
   /** Milliseconds to wait for on-chain confirmation. Default: 120_000. */
   awaitTimeoutMs?: number;
   /**
@@ -34,6 +46,10 @@ export interface PostAdvertFlowParams {
    * in that order. Defaults to console.log.
    */
   log?: (line: string) => void;
+  /** Durable journal hook invoked with the signed transaction before broadcast. */
+  beforeSubmit?: (built: PostAdvertBuildResult) => Promise<void>;
+  /** New advert only: the record lookup and the identity blueprint. */
+  identity?: SupplierIdentity;
 }
 
 export interface PostAdvertFlowResult {
@@ -53,6 +69,8 @@ export interface PostAdvertFlowResult {
  *   - advertDatum.status === "Active"                    (TxConstructionError "fresh advert must be Active")
  *   - advertDatum.endpoint_url non-empty                 (TxConstructionError "endpoint_url required")
  *   - advertDatum.detail_hash is exactly 64 hex chars    (TxConstructionError "detail_hash must be 32 bytes")
+ *   - new advert: the record of agent_id lists the key and the capability
+ *     (TxConstructionError with the failed rule, for example "supplier key not listed")
  *
  * On chain.submitTx rejection: re-throws underlying error as-is.
  * On awaitTx timeout: rejects with a timeout error that includes the txHash so
@@ -96,10 +114,26 @@ export async function runPostAdvert(
   const tipSlot = await chain.tip();
   const isLive = detectCborBackend(chain) === "live";
   const advertisedAt = isLive ? Date.now() : mockSlotToWallclockMs(tipSlot);
-  const datumToSubmit: AdvertDatum = {
+  const datumToSubmit: AdvertDatum | IdentityAdvertDatum = {
     ...advertDatum,
     advertised_at: advertisedAt,
   };
+
+  let identityOptions: Pick<PostAdvertParams, "lookupRecord" | "identityBlueprint"> = {};
+  if (isIdentityAdvertDatum(datumToSubmit)) {
+    const identity = params.identity;
+    if (identity === undefined) {
+      throw new TxConstructionError("agent record lookup required", "a new advert needs the record lookup of its agent");
+    }
+    const problem = await advertRecordProblem(identity, datumToSubmit.agent_id, datumToSubmit.supplier_pkh,
+      datumToSubmit.capability_id, advertisedAt);
+    if (problem !== null) {
+      throw new TxConstructionError(problem,
+        `the record of agent ${datumToSubmit.agent_id} does not list supplier key ${datumToSubmit.supplier_pkh} ` +
+        `with the transaction purpose and capability ${datumToSubmit.capability_id} as an Active, independent agent: ${problem}`);
+    }
+    identityOptions = { lookupRecord: identity.lookupRecord, identityBlueprint: identity.blueprint() };
+  }
 
   writeLog("posting advert");
 
@@ -110,6 +144,8 @@ export async function runPostAdvert(
     walletKey,
     advertDatum: datumToSubmit,
     deposit_lovelace: datumToSubmit.supplier_bond_lovelace,
+    beforeSubmit: params.beforeSubmit,
+    ...identityOptions,
   });
 
   writeLog(`submitted tx ${built.expectedTxHash}`);

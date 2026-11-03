@@ -26,6 +26,7 @@ import { createHash } from "crypto";
 
 import type { RunChatJobDeps } from "./jobRunner.js";
 import type { ChatSessionStore, ChatSessionRecord } from "./chatSession.js";
+import { identityOptions, receiptAgentDid } from "./identity/agent.js";
 
 function sha256Hex(s: string): string {
   return createHash("sha256").update(s, "utf8").digest("hex");
@@ -87,6 +88,7 @@ export async function endChatSession(
       wallclock_ms: Math.max(0, Date.now() - record.startedAtMs),
       supplier_pkh: deps.supplierKey.pubKeyHash,
       escrow_ref: record.escrowRef,
+      ...receiptAgentDid(record.escrowDatum),
     });
     const signed = signReceipt(receipt, deps.supplierKey.privateKeyHex);
     const resultHash = receiptResultHash(signed);
@@ -100,6 +102,7 @@ export async function endChatSession(
           supplierKey: deps.supplierKey,
           escrowRef: claimedRef,
           receiptHash: resultHash,
+          ...identityOptions(record.escrowDatum, deps.identity),
         });
       } catch (err) {
         return { kind: "build_failed" as const, err };

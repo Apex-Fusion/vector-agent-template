@@ -1,41 +1,58 @@
 /**
  * publish-reference-scripts.ts — CLI entry point for
- *   `pnpm --filter @marketplace/supplier tx:publish-reference-scripts`.
+ *   `pnpm --filter @marketplace/supplier tx:publish-reference-scripts [--legacy]`.
  *
- * Publishes the escrow + advert validator scripts as CIP-33 reference UTxOs
- * at a known burn address (header 0x60 testnet / 0x61 mainnet, all-zero pkh).
- * After this tx confirms, set the printed refs in supplier/.env + buyer/.env:
+ * Publishes the escrow + advert validator scripts as CIP-33 reference UTxOs in
+ * one transaction, with the shared publisher (buildPublishReferenceScripts of
+ * @marketplace/shared/tx/server). The outputs go to its default address: the
+ * enterprise address of the all-zero key hash, which nobody can spend.
+ *
+ * Default: the new escrow and advert (Part 2 §6.1, §6.2, §9.6 step 1). The
+ * escrow script has IDENTITY_POLICY_ID applied, so its hash is the deployed
+ * hash. After this tx confirms, set the printed refs in the supplier, buyer
+ * and gateway env:
+ *   IDENTITY_ESCROW_REF_UTXO=<txhash>#0
+ *   IDENTITY_ADVERT_REF_UTXO=<txhash>#1
+ * --legacy: the legacy escrow and advert, as before the identity release:
  *   ESCROW_REF_UTXO=<txhash>#0
  *   ADVERT_REF_UTXO=<txhash>#1
+ * Spenders keep both pairs until the drain ends.
  *
- * Reads env (no flags):
+ * Reads env:
  *   SUPPLIER_PRIV_KEY_HEX     64-hex Ed25519 private key (also accepts buyer
  *                             key value if you want to fund publish from buyer
  *                             wallet — env name stays the same internally)
- *   OGMIOS_URL                https:// or wss:// endpoint (HTTPS preferred)
+ *   OGMIOS_URL                https:// endpoint (protocol parameters, wallet
+ *                             UTxOs and submission)
  *   NETWORK_ID                "0" (testnet) or "1" (mainnet)
- *   VECTOR_ZERO_TIME_MS       optional, mainnet override; defaults to testnet genesis
- *   ESCROW_PUBLISH_LOVELACE   optional, lovelace for the escrow output (default 30_000_000)
- *   ADVERT_PUBLISH_LOVELACE   optional, lovelace for the advert output (default 30_000_000)
+ *   IDENTITY_POLICY_ID        56-hex identity hash (the new escrow's parameter);
+ *                             required without --legacy
+ *   VECTOR_ZERO_TIME_MS       the testnet system start in ms; required on
+ *                             NETWORK_ID=0 (the validity interval needs the slot clock)
+ *   ESCROW_PUBLISH_LOVELACE   optional, lovelace for the escrow output (default: the ledger minimum)
+ *   ADVERT_PUBLISH_LOVELACE   optional, lovelace for the advert output (default: the ledger minimum)
  *
- * stdout (success):
- *   ESCROW_REF_UTXO=<txhash>#0
- *   ADVERT_REF_UTXO=<txhash>#1
- * stderr: progress lines.
+ * stdout (success): the two env lines above.
+ * stderr: progress lines, including both script hashes, the fee and the
+ * AP3X of each reference output.
  */
 
 import { createHash } from "crypto";
 import * as ed from "@noble/ed25519";
 import { blake2b } from "@noble/hashes/blake2b";
 import { bech32 } from "bech32";
+import { signTransaction, validityWindow } from "@marketplace/shared";
 import { LiveOgmiosProvider } from "@marketplace/shared/chain";
-import type { WalletKey } from "@marketplace/shared/tx";
+import { loadBlueprint, loadIdentityBlueprint, type WalletKey } from "@marketplace/shared/tx";
 import {
-  buildLiveTxForPublishReferenceScripts,
+  buildPublishReferenceScripts,
   loadEscrowScript,
   loadAdvertScript,
-  pkhToEnterpriseAddress,
+  loadIdentityAdvertScript,
+  loadIdentityEscrowScript,
+  referenceScriptAddress,
 } from "@marketplace/shared/tx/server";
+import { ogmiosProtocolParameters, vectorSlotConfig } from "../identity/registrar.js";
 
 ed.etc.sha512Sync = (...messages: Uint8Array[]): Uint8Array => {
   const h = createHash("sha512");
@@ -44,7 +61,6 @@ ed.etc.sha512Sync = (...messages: Uint8Array[]): Uint8Array => {
 };
 
 const HEX64_RE = /^[0-9a-f]{64}$/;
-const ZERO_PKH_HEX = "0".repeat(56);
 
 function hexToBytes(hex: string): Uint8Array {
   const bytes = new Uint8Array(hex.length / 2);
@@ -80,7 +96,51 @@ function deriveWalletKey(privHex: string, networkId: 0 | 1): WalletKey {
   };
 }
 
-export async function main(env: Record<string, string | undefined>): Promise<number> {
+/** The pair to publish: output #0 is the escrow, output #1 the advert. */
+export interface ReferenceScriptSet {
+  escrowEnv: "IDENTITY_ESCROW_REF_UTXO" | "ESCROW_REF_UTXO";
+  advertEnv: "IDENTITY_ADVERT_REF_UTXO" | "ADVERT_REF_UTXO";
+  /** CIP-57 compiled code and script hash of each script. */
+  escrow: { compiledCode: string; hash: string };
+  advert: { compiledCode: string; hash: string };
+}
+
+/**
+ * The new pair (identity hash from env IDENTITY_POLICY_ID applied to the
+ * escrow), or the legacy pair with --legacy. Throws on another argument or
+ * a missing identity hash.
+ */
+export function referenceScriptSet(argv: string[], env: Record<string, string | undefined>): ReferenceScriptSet {
+  const unknown = argv.find((arg) => arg !== "--legacy");
+  if (unknown !== undefined) throw new Error(`unknown flag: ${unknown}`);
+  if (argv.includes("--legacy")) {
+    const blueprint = loadBlueprint();
+    return {
+      escrowEnv: "ESCROW_REF_UTXO",
+      advertEnv: "ADVERT_REF_UTXO",
+      escrow: { compiledCode: loadEscrowScript().script.script, hash: blueprint.escrowScriptHash },
+      advert: { compiledCode: loadAdvertScript().script.script, hash: blueprint.advertScriptHash },
+    };
+  }
+  const blueprint = loadIdentityBlueprint({ identityHash: env.IDENTITY_POLICY_ID ?? "" });
+  const escrow = loadIdentityEscrowScript(blueprint);
+  const advert = loadIdentityAdvertScript(blueprint);
+  return {
+    escrowEnv: "IDENTITY_ESCROW_REF_UTXO",
+    advertEnv: "IDENTITY_ADVERT_REF_UTXO",
+    escrow: { compiledCode: escrow.script.script, hash: escrow.hash },
+    advert: { compiledCode: advert.script.script, hash: advert.hash },
+  };
+}
+
+export async function main(argv: string[], env: Record<string, string | undefined>): Promise<number> {
+  let scripts: ReferenceScriptSet;
+  try {
+    scripts = referenceScriptSet(argv, env);
+  } catch (err) {
+    process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`);
+    return 1;
+  }
   const privHex = (env.SUPPLIER_PRIV_KEY_HEX ?? "").toLowerCase();
   const ogmiosUrl = env.OGMIOS_URL ?? "";
   const networkIdStr = env.NETWORK_ID ?? "";
@@ -110,33 +170,36 @@ export async function main(env: Record<string, string | undefined>): Promise<num
   }
 
   const walletKey = deriveWalletKey(privHex, networkId);
-  const burnAddr = pkhToEnterpriseAddress(ZERO_PKH_HEX, networkId);
-  const { script: escrowScript } = loadEscrowScript();
-  const { script: advertScript } = loadAdvertScript();
 
   process.stderr.write(`wallet:    ${walletKey.address}\n`);
-  process.stderr.write(`burn addr: ${burnAddr}\n`);
+  process.stderr.write(`burn addr: ${referenceScriptAddress(networkId)}\n`);
   process.stderr.write(`ogmios:    ${ogmiosUrl}\n`);
   process.stderr.write(`network:   ${networkId === 0 ? "testnet" : "mainnet"}\n`);
-  process.stderr.write(`escrow lovelace: ${escrowLovelace ?? "30000000 (default)"}\n`);
-  process.stderr.write(`advert lovelace: ${advertLovelace ?? "30000000 (default)"}\n`);
+  process.stderr.write(`escrow script hash: ${scripts.escrow.hash} (output #0, ${scripts.escrowEnv})\n`);
+  process.stderr.write(`advert script hash: ${scripts.advert.hash} (output #1, ${scripts.advertEnv})\n`);
 
   const chain = new LiveOgmiosProvider({ ogmiosUrl });
 
   try {
     process.stderr.write(`building publish tx...\n`);
-    const result = await buildLiveTxForPublishReferenceScripts({
-      chain,
-      walletKey,
-      burnAddr,
-      escrowScript,
-      advertScript,
-      escrowLovelace,
-      advertLovelace,
-    });
-    process.stderr.write(`submitted: ${result.expectedTxHash}\n`);
-    process.stdout.write(`ESCROW_REF_UTXO=${result.formattedEscrowRef}\n`);
-    process.stdout.write(`ADVERT_REF_UTXO=${result.formattedAdvertRef}\n`);
+    const slotConfig = vectorSlotConfig(networkId, env.VECTOR_ZERO_TIME_MS);
+    const [protocol, wallet] = await Promise.all([ogmiosProtocolParameters(ogmiosUrl), chain.queryUtxosByAddress(walletKey.address)]);
+    const tx = buildPublishReferenceScripts(
+      { networkId, slotConfig, protocol, wallet, changeAddress: walletKey.address },
+      {
+        scripts: [
+          { compiledCode: scripts.escrow.compiledCode, lovelace: escrowLovelace },
+          { compiledCode: scripts.advert.compiledCode, lovelace: advertLovelace },
+        ],
+        window: validityWindow(Date.now(), slotConfig),
+      },
+    );
+    const [escrowRef, advertRef] = tx.references;
+    process.stderr.write(`fee: ${tx.fee} lovelace; escrow output ${escrowRef!.lovelace}, advert output ${advertRef!.lovelace} lovelace\n`);
+    const txHash = await chain.submitTx(await signTransaction(tx.txCborHex, privHex));
+    process.stderr.write(`submitted: ${txHash}\n`);
+    process.stdout.write(`${scripts.escrowEnv}=${txHash}#${escrowRef!.ref.index}\n`);
+    process.stdout.write(`${scripts.advertEnv}=${txHash}#${advertRef!.ref.index}\n`);
     return 0;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -149,5 +212,5 @@ if (
   process.argv[1]?.endsWith("publish-reference-scripts.ts") ||
   process.argv[1]?.endsWith("publish-reference-scripts.js")
 ) {
-  main(process.env).then((code) => process.exit(code));
+  main(process.argv.slice(2), process.env).then((code) => process.exit(code));
 }

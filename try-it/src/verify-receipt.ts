@@ -10,8 +10,8 @@
  * No network, no chain, no trust in the agent that served the response.
  *
  * `verifyChainBindings` (below) answers the fourth question — is this the
- * receipt the CHAIN commits, from the supplier the buyer paid? — and both must
- * pass before Accept.
+ * receipt the CHAIN commits, from the supplier and agent the buyer paid? — and
+ * both must pass before Accept.
  *
  * SIGNATURE-LAYOUT MIRROR — the load-bearing detail. The supplier signs
  * `ed25519(utf8(canonicalize(receipt)), privKey)` (packages/shared/src/receipt/sign.ts),
@@ -33,9 +33,12 @@
 
 import { createHash } from "crypto";
 import { blake2b } from "@noble/hashes/blake2b";
+import { vectorDid } from "@marketplace/shared/identity";
 import {
   verifyReceipt as verifyVendoredSignature,
   receiptResultHash,
+  RECEIPT_FIELDS,
+  AGENT_RECEIPT_FIELDS,
 } from "@marketplace/shared/receipt";
 import type { Receipt, SignedReceipt } from "@marketplace/shared/receipt";
 
@@ -132,7 +135,7 @@ export function verifyReceipt(
  *
  * Everything in `verifyReceipt` arrives over one HTTP connection — the receipt,
  * the output, and (from `GET /capability`) the key that signs it. A dishonest
- * endpoint can serve a self-consistent set of all three. These four checks
+ * endpoint can serve a self-consistent set of all three. These five checks
  * break that circularity by anchoring each piece to something the endpoint does
  * not control:
  *
@@ -141,6 +144,11 @@ export function verifyReceipt(
  *   - the key itself — blake2b-224(pub_key_hex) must equal that same advert
  *                      pkh, so a swapped signing key cannot pass by simply
  *                      being served alongside a matching signature
+ *   - the agent      — the field set follows the escrow layout (upstream
+ *                      docs/IDENTITY_REGISTRY.md §6.3): an escrow with an
+ *                      `agent_id` needs exactly the 9 receipt fields, with
+ *                      `agent_did = "did:vector:<agent_id>"`; a legacy escrow
+ *                      exactly the 8 fields, without `agent_did`
  *   - the receipt hash — `receiptResultHash({receipt, signature})` must equal
  *                      the `result_receipt_hash` the supplier wrote on chain in
  *                      its Submit tx. This is the binding: the bytes verified
@@ -148,10 +156,12 @@ export function verifyReceipt(
  *
  * `receiptResultHash` is the vendored helper the supplier's Submit path uses
  * (`customJobRunner.ts` → `buildSubmitTx({receiptHash})`), so this recomputes
- * the same value the same way rather than mirroring it.
+ * the same value the same way rather than mirroring it. The field lists and
+ * the DID string come from the vendored receipt and identity modules too.
  *
  * Reason strings follow the upstream buyer SDK where it has equivalents
- * (`wrong_supplier`, `wrong_escrow_ref` — buyer/src/sdk/Marketplace.ts).
+ * (`wrong_supplier`, `wrong_escrow_ref` — buyer/src/sdk/Marketplace.ts;
+ * `agent_did_mismatch`, `malformed_receipt` — buyer/src/sdk/identity.ts).
  */
 export interface ChainBindings {
   /** `result_receipt_hash` read from the Submitted-state escrow datum. */
@@ -162,6 +172,8 @@ export interface ChainBindings {
   advertSupplierPkh: string;
   /** `pub_key_hex` served by `GET /capability`. */
   supplierPubKeyHex: string;
+  /** `agent_id` of the escrow datum this buyer posted; null for a legacy escrow. */
+  escrowAgentId: string | null;
 }
 
 export function verifyChainBindings(signed: SignedReceiptLike, bindings: ChainBindings): VerifyResult {
@@ -185,6 +197,18 @@ export function verifyChainBindings(signed: SignedReceiptLike, bindings: ChainBi
   const keyPkh = bytesToHex(blake2b(hexToBytes(bindings.supplierPubKeyHex), { dkLen: 28 }));
   if (keyPkh !== bindings.advertSupplierPkh.toLowerCase()) {
     return { ok: false, reason: "pub_key_not_supplier" };
+  }
+
+  // The receipt names the escrow's agent exactly as the escrow layout says.
+  const agentDidOk = bindings.escrowAgentId === null
+    ? !Object.hasOwn(fields, "agent_did")
+    : fields.agent_did === vectorDid(bindings.escrowAgentId);
+  if (!agentDidOk) {
+    return { ok: false, reason: "agent_did_mismatch" };
+  }
+  const expectedFields: readonly string[] = bindings.escrowAgentId === null ? RECEIPT_FIELDS : AGENT_RECEIPT_FIELDS;
+  if (Object.keys(fields).length !== expectedFields.length || !expectedFields.every((field) => Object.hasOwn(fields, field))) {
+    return { ok: false, reason: "malformed_receipt" };
   }
 
   if (typeof bindings.resultReceiptHashOnChain !== "string" || !HEX64_RE.test(bindings.resultReceiptHashOnChain)) {

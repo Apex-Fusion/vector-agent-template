@@ -17,6 +17,12 @@
  * `Executor.execute` call against the operator's black box (the template's
  * single integration seam). Everything else is the proven money path.
  *
+ * Both escrow layouts, as runChatJob does: the receipt of a new (16-field)
+ * escrow carries agent_did = "did:vector:<agent_id>" (9 fields), and its
+ * Submit reads the agent's record as a reference input (identity/agent.ts:
+ * receiptAgentDid, identityOptions). A legacy escrow keeps the 8-field
+ * receipt and the legacy Submit.
+ *
  * Step 2's deadline is min(SERVICE_TIMEOUT_MS, deliver_by - now - SUBMIT_RESERVE_MS):
  * a job claimed late in its window gets a correspondingly smaller executor
  * budget, so it cannot burn the full configured timeout and then miss the
@@ -30,20 +36,25 @@
  *   prompt_hash   = sha256(utf8(payload))         — committed in the escrow datum
  *   response_hash = sha256(utf8(outputPayload))   — no canonicalisation, no wrapping
  *
- * Terminal payload stays `ChatJobResponsePayload` so the vendored poll-route
- * rendering works unchanged; its `content` field carries `outputPayload`.
+ * Terminal payload: the vendored job store holds one closed set of payload
+ * shapes, so the result is stored as its `ChatJobResponsePayload`: a Responses
+ * object whose single output_text part is `outputPayload`, plus the receipt
+ * and `submitted_ref` (the Submitted escrow output). GET /v1/job/:jobId
+ * (routes/custom.ts) renders it in the custom wire shape.
  */
 
 import type { OutputReference } from "@marketplace/shared/chain";
 import type { AdvertDatum, EscrowDatum } from "@marketplace/shared/cbor";
 import { buildSubmitTx } from "@marketplace/shared/tx";
 import { buildReceipt, signReceipt, receiptResultHash } from "@marketplace/shared/receipt";
+import { createResponse } from "@marketplace/shared/responses";
 import { createHash } from "crypto";
 
 import type { RunChatJobDeps } from "./jobRunner.js";
 import type { ChatJobResponsePayload } from "./jobs.js";
 import type { Executor } from "./executor/executor.js";
 import { ExecutorError } from "./executor/executor.js";
+import { identityOptions, receiptAgentDid } from "./identity/agent.js";
 
 export interface RunCustomJobParams {
   deps: RunChatJobDeps;            // reuse the vendored deps type unchanged
@@ -152,7 +163,6 @@ export async function runCustomJob(params: RunCustomJobParams): Promise<void> {
     }
 
     // ── 3. Build + sign receipt ────────────────────────────────────────
-    const assistantMessage = { role: "assistant" as const, content: inference.content };
     const responseHash = sha256Hex(inference.content);
 
     const receipt = buildReceipt({
@@ -164,6 +174,8 @@ export async function runCustomJob(params: RunCustomJobParams): Promise<void> {
       wallclock_ms: inference.wallclock_ms,
       supplier_pkh: deps.supplierKey.pubKeyHash,
       escrow_ref: escrowRef,
+      // A new escrow's receipt names its agent (9 fields); a legacy one has 8.
+      ...receiptAgentDid(escrowDatum),
     });
     const signed = signReceipt(receipt, deps.supplierKey.privateKeyHex);
     const resultHash = receiptResultHash(signed);
@@ -177,6 +189,8 @@ export async function runCustomJob(params: RunCustomJobParams): Promise<void> {
           supplierKey: deps.supplierKey,
           escrowRef: claimedRef,
           receiptHash: resultHash,
+          // A new escrow's Submit reads the agent's record (reference input).
+          ...identityOptions(escrowDatum, deps.identity),
         });
       } catch (err) {
         return { kind: "build_failed" as const, err };
@@ -186,7 +200,9 @@ export async function runCustomJob(params: RunCustomJobParams): Promise<void> {
       } catch (err) {
         return { kind: "await_failed" as const, err };
       }
-      return { kind: "ok" as const };
+      // Submit spends the Claimed escrow and writes the Submitted one as its
+      // first output: the output the buyer Accepts.
+      return { kind: "ok" as const, submittedRef: `${built.expectedTxHash}#0` };
     });
     if (submitOutcome.kind === "build_failed") {
       const message = submitOutcome.err instanceof Error ? submitOutcome.err.message : String(submitOutcome.err);
@@ -214,22 +230,28 @@ export async function runCustomJob(params: RunCustomJobParams): Promise<void> {
     }
 
     // ── 6. Mark complete ────────────────────────────────────────────────
-    const payload: ChatJobResponsePayload = {
-      kind: "chat",
-      choices: [
-        {
-          index: 0,
-          message: assistantMessage,
-          finish_reason: "stop",
-        },
-      ],
+    const response = createResponse({
+      id: `resp_${jobId}`,
+      model: advert.model,
+      output: [{
+        type: "message",
+        id: `msg_${jobId}`,
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: inference.content, annotations: [] }],
+      }],
       usage: {
-        prompt_tokens: inference.prompt_tokens,
-        completion_tokens: inference.completion_tokens,
+        input_tokens: inference.prompt_tokens,
+        output_tokens: inference.completion_tokens,
         total_tokens: inference.prompt_tokens + inference.completion_tokens,
       },
+    });
+    const payload: ChatJobResponsePayload = {
+      ...response,
+      kind: "chat",
       receipt: signed.receipt as unknown as Record<string, unknown>,
       receipt_signature: signed.signature,
+      submitted_ref: submitOutcome.submittedRef,
     };
     deps.jobs.complete(jobId, payload);
   } finally {

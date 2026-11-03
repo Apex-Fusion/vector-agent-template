@@ -7,8 +7,8 @@
  * Routes:
  *   GET  /capability                        — ARCHITECTURE.md §5.1
  *   GET  /status                            — ARCHITECTURE.md §5.1
- *   POST /v1/chat/completions               — async claim+enqueue (M1-F-async-chat)
- *   GET  /v1/chat/completions/:jobId        — poll job status
+ *   POST /v1/responses                      — async claim+enqueue
+ *   GET  /v1/responses/:jobId               — poll job status
  *
  * Async chat flow (M1-F-async-chat-green):
  *   POST validates → acquires lock → buildClaimTx → awaitTx Claim
@@ -29,26 +29,41 @@
  * references (`ollama.callOllama` via the imported namespace; `deps.chain`
  * via the closure) rather than top-level destructuring. That keeps
  * vi.stubGlobal("fetch") and vi.spyOn(chain, "submitTx") effective.
+ *
+ * Both escrow layouts (Part 2 §9.6): a new (16-field) escrow must name this
+ * supplier's agent (identity/agent.ts). Claim and Submit of a new escrow read
+ * the agent's record, and its receipt carries agent_did. GET /capability
+ * shows the agent (agent_id, agent_did) for receipt verifiers (§6.3).
  */
 
 import express, { type Application, type Request, type Response, type NextFunction } from "express";
 import { createHash } from "crypto";
+import { existsSync } from "node:fs";
 
 import type { ChainProvider, OutputReference } from "@marketplace/shared/chain";
-import { decodeAdvertDatum, decodeEscrowDatum, canonicalize } from "@marketplace/shared/cbor";
-import type { AdvertDatum, EscrowDatum } from "@marketplace/shared/cbor";
-import type { ChatMessage, WalletKey } from "@marketplace/shared/tx";
+import { canonicalize, type AdvertDatum, type EscrowDatum, type IdentityAdvertDatum } from "@marketplace/shared/cbor";
+import { vectorDid } from "@marketplace/shared/identity";
+import type { WalletKey } from "@marketplace/shared/tx";
 import {
   buildClaimTx,
   chatSessionPromptHash,
   mockSlotToWallclockMs,
   detectCborBackend,
-  normalizeChatMessage,
   ocrPromptHash,
   ALLOWED_OCR_MIMES,
   ALLOWED_OCR_OUTPUT_FORMATS,
   MAX_OCR_IMAGE_B64_CHARS,
 } from "@marketplace/shared/tx";
+import {
+  normalizeResponseRequest,
+  responseCompatibilityError,
+  responseInputToChatMessages,
+  responseInputTokenUpperBound,
+  responseRequestCommitment,
+  validateResponseToolOutputs,
+  type ResponseRequest,
+  type ResponseStreamEvent,
+} from "@marketplace/shared/responses";
 import type { OcrRequest } from "@marketplace/shared/tx";
 
 import type { SupplierState } from "./state.js";
@@ -59,9 +74,18 @@ import { probeRevision } from "./ocrVision.js";
 import { probeDatalabHealth } from "./datalabOcr.js";
 import { ChatSessionStore, type ChatSessionRecord } from "./chatSession.js";
 import { endChatSession, type EndChatSessionDeps } from "./chatSessionRunner.js";
-import { callOpenAiStream } from "./openai.js";
+import { callResponsesStream } from "./openai.js";
 import { healthzRouter } from "./routes/healthz.js";
 import { triggerOnFailureConsolidate } from "./walletHealth.js";
+import type { ResellerRuntime } from "./reseller/runtime.js";
+import { formatUsdNanos } from "./reseller/money.js";
+import { renderResellerDashboardPage } from "./reseller/dashboardPage.js";
+import type { Paper2AgentRuntime } from "./paper2agent/runtime.js";
+import { paper2AgentRoutes } from "./paper2agent/routes.js";
+import {
+  decodeAdvert, decodeEscrow, identityOptions, identityRefusal, newEscrowRefusal, ownAgentId, supplierIdentity,
+  type SupplierIdentity,
+} from "./identity/agent.js";
 import { makeHttpCalloutExecutor } from "./executor/httpCallout.js";
 import { makeCustomHandler, makeGetCustomJobHandler, type CustomRouteDeps } from "./routes/custom.js";
 
@@ -74,10 +98,28 @@ export interface SupplierDeps {
   jobs?: JobStore;
   /** Optional: defaults to a fresh ChatSessionStore (chat-session capability). */
   chatSessions?: ChatSessionStore;
+  /** Optional balance-aware resale runtime. Absent for every legacy supplier. */
+  reseller?: ResellerRuntime;
+  paper2agent?: Paper2AgentRuntime;
+  /** Optional: defaults to the chain record lookup and the env identity blueprint. */
+  identity?: SupplierIdentity;
 }
 
 const ESCROW_REF_RE = /^[0-9a-fA-F]{64}#(?:0|[1-9]\d*)$/;
 const UUID_V4_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
+const DRAIN_MARKER_PATH = "/dev/shm/marketplace-draining";
+const RESPONSE_REQUEST_FIELDS: Record<string, true> = {
+  input: true,
+  instructions: true,
+  max_output_tokens: true,
+  tools: true,
+  tool_choice: true,
+  parallel_tool_calls: true,
+  reasoning: true,
+  text: true,
+  temperature: true,
+  top_p: true,
+};
 
 function sha256Hex(s: string): string {
   return createHash("sha256").update(s, "utf8").digest("hex");
@@ -89,10 +131,17 @@ function parseEscrowRef(ref: string): OutputReference | null {
   return { txHash: ref.slice(0, idx), index: Number(ref.slice(idx + 1)) };
 }
 
-function jsonError(res: Response, status: number, reason: string, message: string): Response {
+function jsonError(
+  res: Response,
+  status: number,
+  reason: string,
+  message: string,
+  param?: string,
+): Response {
+  const error = { reason, message, ...(param === undefined ? {} : { param }) };
   return res
     .status(status)
-    .json({ reason, message, error: { reason, message } });
+    .json({ reason, message, ...(param === undefined ? {} : { param }), error });
 }
 
 // ─── /capability ───────────────────────────────────────────────────────────
@@ -104,21 +153,27 @@ interface ResolvedDeps {
   supplierKey: WalletKey;
   jobs: JobStore;
   chatSessions: ChatSessionStore;
+  reseller?: ResellerRuntime;
+  paper2agent?: Paper2AgentRuntime;
+  identity: SupplierIdentity;
 }
 
 function makeCapabilityHandler(deps: ResolvedDeps) {
   return async (_req: Request, res: Response, next: NextFunction) => {
     try {
       res.setHeader("Cache-Control", "no-store");
+      if (existsSync(DRAIN_MARKER_PATH)) {
+        return jsonError(res, 503, "supplier_draining", "supplier is draining");
+      }
 
       const utxo = await deps.chain.queryUtxo(deps.config.advertRef);
       if (utxo === null || !utxo.datumHex) {
         return jsonError(res, 503, "advert_unavailable", "advert UTxO not found on chain");
       }
 
-      let datum: AdvertDatum;
+      let datum: AdvertDatum | IdentityAdvertDatum;
       try {
-        datum = decodeAdvertDatum(utxo.datumHex);
+        datum = decodeAdvert(utxo.datumHex).datum;
       } catch (err) {
         return jsonError(res, 503, "advert_decode_failed",
           `unable to decode advert datum: ${(err as Error).message}`);
@@ -129,7 +184,17 @@ function makeCapabilityHandler(deps: ResolvedDeps) {
           `advert is retired (status=${datum.status})`);
       }
 
+      if (deps.paper2agent) datum = await deps.paper2agent.advert();
+      let agentId: string | null;
+      try {
+        agentId = ownAgentId(deps.config.agentId, datum);
+      } catch (err) {
+        return jsonError(res, 503, "agent_mismatch", (err as Error).message);
+      }
       const advertRefStr = `${deps.config.advertRef.txHash}#${deps.config.advertRef.index}`;
+      const llmCapability =
+        deps.config.capabilityKind === "chat" ||
+        deps.config.capabilityKind === "chat-session";
       return res.status(200).json({
         capability_id: datum.capability_id,
         model: datum.model,
@@ -138,8 +203,24 @@ function makeCapabilityHandler(deps: ResolvedDeps) {
         price_lovelace: datum.price_lovelace.toString(),
         advert_ref: advertRefStr,
         supplier_pkh: datum.supplier_pkh,
-        // SPEC FIX 2026-04-25: pub_key_hex required for buyer-side receipt verification
         pub_key_hex: deps.supplierKey.pubKeyHex,
+        agent_id: agentId,
+        agent_did: agentId === null ? null : vectorDid(agentId),
+        ...(deps.paper2agent ? { paper2agent: {
+          manifest: deps.paper2agent.manifest, manifest_hash: deps.paper2agent.manifestHash,
+        } } : {}),
+        ...(llmCapability
+          ? {
+              inference_api: "responses",
+              upstream_api: deps.config.llmBackend === "ollama"
+                ? "ollama"
+                : deps.config.openaiUpstreamApi,
+              reasoning_disabled: deps.config.openaiReasoningDisabled,
+            }
+          : {}),
+        ...(deps.reseller
+          ? { max_input_tokens: deps.reseller.maxInputTokens }
+          : {}),
       });
     } catch (err) {
       next(err);
@@ -153,8 +234,9 @@ function makeCapabilityHandler(deps: ResolvedDeps) {
 function makeStatusHandler(deps: ResolvedDeps) {
   return (_req: Request, res: Response) => {
     const snap = deps.state.snapshot();
+    const effectiveStatus = deps.reseller?.effectiveStatus() ?? snap.status;
     const payload: Record<string, unknown> = {
-      status: snap.status,
+      status: effectiveStatus,
       last_seen: snap.lastSeenIso,
       active_sessions: snap.activeSessions,
       max_sessions: snap.maxSessions,
@@ -162,41 +244,52 @@ function makeStatusHandler(deps: ResolvedDeps) {
     if (snap.status === "working" && snap.currentEscrowRef) {
       payload.current_escrow_ref = snap.currentEscrowRef;
     }
+    if (deps.reseller) {
+      const capacity = deps.reseller.capacitySnapshot();
+      payload.capacity = {
+        provider: capacity.provider,
+        reason: effectiveStatus === "working" ? "working" : capacity.reason,
+        sellable_usd: formatUsdNanos(capacity.sellableUsdNanos),
+        checked_at: capacity.checkedAtMs === null
+          ? null
+          : new Date(capacity.checkedAtMs).toISOString(),
+      };
+    }
     return res.status(200).json(payload);
   };
 }
 
-// ─── /v1/chat/completions ──────────────────────────────────────────────────
+// ─── /v1/responses ────────────────────────────────────────────────────────
 
-interface ChatBody {
+interface ResponsesBody extends Partial<ResponseRequest> {
   model?: unknown;
-  messages?: unknown;
-  max_tokens?: unknown;
   stream?: unknown;
-  tools?: unknown;
-  tool_choice?: unknown;
-  functions?: unknown;
 }
 
 type AdvertResult =
-  | { datum: AdvertDatum }
+  | { datum: AdvertDatum | IdentityAdvertDatum; agentId: string | null }
   | { error: { status: number; reason: string; message: string } };
 
+/** The configured advert (either layout) and the supplier's own agent. */
 async function fetchActiveAdvert(deps: ResolvedDeps): Promise<AdvertResult> {
   const utxo = await deps.chain.queryUtxo(deps.config.advertRef);
   if (utxo === null || !utxo.datumHex) {
     return { error: { status: 503, reason: "advert_unavailable", message: "advert UTxO missing on chain" } };
   }
-  let datum: AdvertDatum;
+  let datum: AdvertDatum | IdentityAdvertDatum;
   try {
-    datum = decodeAdvertDatum(utxo.datumHex);
+    datum = decodeAdvert(utxo.datumHex).datum;
   } catch (err) {
     return { error: { status: 503, reason: "advert_decode_failed", message: (err as Error).message } };
   }
   if (datum.status !== "Active") {
     return { error: { status: 503, reason: "advert_not_active", message: `advert status=${datum.status}` } };
   }
-  return { datum };
+  try {
+    return { datum, agentId: ownAgentId(deps.config.agentId, datum) };
+  } catch (err) {
+    return { error: { status: 503, reason: "agent_mismatch", message: (err as Error).message } };
+  }
 }
 
 function makeChatHandler(deps: ResolvedDeps) {
@@ -204,7 +297,12 @@ function makeChatHandler(deps: ResolvedDeps) {
     // Slot held by THIS request (null until acquired / after hand-off to the
     // job runner) — the catch-all must only release its own acquisition.
     let acquiredRef: string | null = null;
+    let evidenceRecorded = false;
+    let evidenceEscrowRef: string | null = null;
     try {
+      if (existsSync(DRAIN_MARKER_PATH)) {
+        return jsonError(res, 503, "supplier_draining", "supplier is draining");
+      }
       // ── 1. Header validation ──────────────────────────────────────────
       const headerVal = req.header("X-Escrow-Ref");
       if (!headerVal) {
@@ -216,32 +314,72 @@ function makeChatHandler(deps: ResolvedDeps) {
           'X-Escrow-Ref must match "<64-hex>#<int>"');
       }
       const escrowRefStr = `${escrowRef.txHash}#${escrowRef.index}`;
+      evidenceEscrowRef = escrowRefStr;
 
       // ── 2. Body shape validation ─────────────────────────────────────
-      const body = (req.body ?? {}) as ChatBody;
+      const body = (req.body ?? {}) as ResponsesBody;
       if (body.stream === true) {
         return jsonError(res, 400, "streaming_not_supported", "stream:true is not supported");
       }
-      if (body.tools !== undefined) {
-        return jsonError(res, 400, "tools_not_supported", "tools[] is not supported");
+      const rawRequest = { ...(body as Record<string, unknown>) };
+      delete rawRequest.model;
+      delete rawRequest.stream;
+      const unknownField = Object.keys(rawRequest).find(
+        (key) => RESPONSE_REQUEST_FIELDS[key] !== true,
+      );
+      if (unknownField !== undefined) {
+        return jsonError(
+          res,
+          400,
+          "unsupported_parameter",
+          `unsupported Responses parameter: ${unknownField}`,
+        );
       }
-      if (body.tool_choice !== undefined) {
-        return jsonError(res, 400, "tools_not_supported", "tool_choice is not supported");
+      let responseRequest: ResponseRequest;
+      try {
+        responseRequest = normalizeResponseRequest(rawRequest);
+        if (responseRequest.input.length === 0 && responseRequest.instructions === undefined) {
+          throw new Error("input must not be empty without instructions");
+        }
+        validateResponseToolOutputs(responseRequest.input);
+      } catch (error) {
+        return jsonError(
+          res,
+          400,
+          "invalid_request",
+          error instanceof Error ? error.message : String(error),
+        );
       }
-      if (body.functions !== undefined) {
-        return jsonError(res, 400, "tools_not_supported", "functions[] is not supported");
+      const compatibilityApi = deps.config.llmBackend === "ollama"
+        ? "ollama"
+        : deps.config.openaiUpstreamApi;
+      const compatibilityError = responseCompatibilityError(
+        responseRequest,
+        compatibilityApi,
+        deps.config.llmBackend === "openai" && deps.config.openaiReasoningDisabled,
+      );
+      if (compatibilityError) {
+        return jsonError(
+          res,
+          400,
+          compatibilityError.param === "reasoning.effort"
+            ? "reasoning_disabled"
+            : "upstream_api_incompatible",
+          compatibilityError.message,
+          compatibilityError.param,
+        );
       }
-      if (!Array.isArray(body.messages) || body.messages.length === 0) {
-        return jsonError(res, 400, "messages_required", "messages must be a non-empty array");
-      }
-      const messages = body.messages as Array<{ role: unknown; content: unknown }>;
-      for (const m of messages) {
-        if (!m || typeof m !== "object" || typeof m.role !== "string" || typeof m.content !== "string") {
-          return jsonError(res, 400, "messages_required",
-            "each message must have string role and string content");
+      if (deps.reseller) {
+        const inputUnits = responseInputTokenUpperBound(responseRequest);
+        if (inputUnits > deps.reseller.maxInputTokens) {
+          return jsonError(
+            res,
+            413,
+            "input_cap_exceeded",
+            `input bound ${inputUnits} exceeds supplier cap ${deps.reseller.maxInputTokens}`,
+          );
         }
       }
-      const validatedMessages = messages as Array<{ role: "system" | "user" | "assistant"; content: string }>;
 
       // ── 3. Resolve advert ────────────────────────────────────────────
       const advertResult = await fetchActiveAdvert(deps);
@@ -250,16 +388,30 @@ function makeChatHandler(deps: ResolvedDeps) {
         return jsonError(res, e.status, e.reason, e.message);
       }
       const advert = advertResult.datum;
+      if (body.model !== undefined && body.model !== advert.model) {
+        return jsonError(res, 400, "model_mismatch", "model does not match the advertised model");
+      }
+      if (responseRequest.max_output_tokens !== undefined) {
+        responseRequest = {
+          ...responseRequest,
+          max_output_tokens: Math.min(
+            responseRequest.max_output_tokens,
+            advert.max_output_tokens,
+          ),
+        };
+      }
 
-      const maxTokensRaw = body.max_tokens;
-      if (maxTokensRaw !== undefined) {
-        if (typeof maxTokensRaw !== "number" || !Number.isFinite(maxTokensRaw) || maxTokensRaw < 0) {
-          return jsonError(res, 400, "max_tokens_invalid",
-            "max_tokens must be a non-negative number");
-        }
-        if (maxTokensRaw > advert.max_output_tokens) {
-          return jsonError(res, 400, "output_cap_exceeded",
-            `max_tokens ${maxTokensRaw} exceeds advertised cap ${advert.max_output_tokens}`);
+      if (compatibilityApi !== "responses") {
+        try {
+          responseInputToChatMessages(responseRequest.input, responseRequest.instructions);
+        } catch (error) {
+          return jsonError(
+            res,
+            400,
+            "upstream_api_incompatible",
+            error instanceof Error ? error.message : String(error),
+            "input",
+          );
         }
       }
 
@@ -271,7 +423,7 @@ function makeChatHandler(deps: ResolvedDeps) {
       }
       let escrowDatum: EscrowDatum;
       try {
-        escrowDatum = decodeEscrowDatum(escrowUtxo.datumHex);
+        escrowDatum = decodeEscrow(escrowUtxo.datumHex).datum;
       } catch (err) {
         return jsonError(res, 404, "escrow_decode_failed", (err as Error).message);
       }
@@ -289,6 +441,8 @@ function makeChatHandler(deps: ResolvedDeps) {
         return jsonError(res, 409, "capability_mismatch",
           `escrow capability ${escrowDatum.capability_id} != advert ${advert.capability_id}`);
       }
+      const agentRefusal = newEscrowRefusal(escrowDatum, escrowUtxo.lovelace, advertResult.agentId, deps.identity);
+      if (agentRefusal) return jsonError(res, agentRefusal.status, agentRefusal.reason, agentRefusal.message);
 
       // ── 6. Hash checks ───────────────────────────────────────────────
       const expectedRequestSpecHash = sha256Hex(canonicalize({
@@ -300,10 +454,12 @@ function makeChatHandler(deps: ResolvedDeps) {
         return jsonError(res, 409, "request_spec_mismatch",
           "request_spec_hash in escrow does not match advert spec");
       }
-      const expectedPromptHash = sha256Hex(canonicalize(validatedMessages));
+      const expectedPromptHash = sha256Hex(
+        canonicalize(responseRequestCommitment(responseRequest)),
+      );
       if (escrowDatum.prompt_hash !== expectedPromptHash) {
         return jsonError(res, 409, "prompt_mismatch",
-          "prompt_hash in escrow does not match request body messages");
+          "prompt_hash in escrow does not match the Responses request");
       }
 
       // ── 7. Deadline ──────────────────────────────────────────────────
@@ -316,6 +472,28 @@ function makeChatHandler(deps: ResolvedDeps) {
         return jsonError(res, 408, "past_deliver_by",
           `now ${nowMs} >= deliver_by ${escrowDatum.deliver_by}`);
       }
+      if (deps.reseller) {
+        let capacity;
+        try {
+          capacity = await deps.reseller.refreshCapacity();
+        } catch {
+          return jsonError(
+            res,
+            503,
+            "capacity_unavailable",
+            "provider capacity or evidence database is unavailable",
+          );
+        }
+        if (!capacity.canServe) {
+          return jsonError(
+            res,
+            503,
+            "capacity_unavailable",
+            `provider capacity is unavailable (${capacity.reason})`,
+          );
+        }
+      }
+
 
       // ── 8. Acquire session slot ──────────────────────────────────────
       if (!deps.state.tryAcquire(escrowRefStr)) {
@@ -324,6 +502,26 @@ function makeChatHandler(deps: ResolvedDeps) {
       acquiredRef = escrowRefStr;
       // From here on, every error path MUST release the slot until the
       // runner takes ownership of it.
+      if (deps.reseller) {
+        try {
+          await deps.reseller.recordReceived(
+            escrowRefStr,
+            responseRequest,
+            req.header("X-Vector-Public-Preview") === "1",
+          );
+          evidenceRecorded = true;
+        } catch {
+          deps.state.release(escrowRefStr);
+          acquiredRef = null;
+          return jsonError(
+            res,
+            503,
+            "evidence_unavailable",
+            "reseller evidence database is unavailable",
+          );
+        }
+      }
+
 
       // ── 9+10. Claim tx: build + confirm as ONE wallet critical section ─
       // (splitting them would let another wallet spend coin-select mid-flight)
@@ -334,6 +532,7 @@ function makeChatHandler(deps: ResolvedDeps) {
             chain: deps.chain,
             supplierKey: deps.supplierKey,
             escrowRef,
+            ...identityOptions(escrowDatum, deps.identity),
           });
         } catch (err) {
           return { kind: "build_failed" as const, err };
@@ -345,9 +544,16 @@ function makeChatHandler(deps: ResolvedDeps) {
         }
         return { kind: "ok" as const, built };
       });
+      const failEvidence = async (reason: string): Promise<void> => {
+        if (!evidenceRecorded || !deps.reseller) return;
+        await deps.reseller.recordFailed(escrowRefStr, reason).catch(() => undefined);
+      };
       if (claimOutcome.kind === "build_failed") {
+        const refusal = identityRefusal(claimOutcome.err);
+        await failEvidence(refusal?.reason ?? "claim_submit_failed");
         deps.state.release(escrowRefStr);
         acquiredRef = null;
+        if (refusal) return jsonError(res, refusal.status, refusal.reason, refusal.message);
         // Backstop the periodic wallet-health ticker: most Claim build failures
         // we see in practice are wallet-shape problems (fragmentation, dust).
         // Fire-and-forget a debounced consolidate so the NEXT buyer retry
@@ -361,6 +567,7 @@ function makeChatHandler(deps: ResolvedDeps) {
           `Claim tx submit failed: ${(claimOutcome.err as Error).message}`);
       }
       if (claimOutcome.kind === "await_failed") {
+        await failEvidence("claim_confirmation_timeout");
         deps.state.release(escrowRefStr);
         acquiredRef = null;
         return jsonError(res, 504, "claim_timeout",
@@ -374,6 +581,32 @@ function makeChatHandler(deps: ResolvedDeps) {
         index: 0,
       };
       const jobId = deps.jobs.create(escrowRefStr);
+      if (deps.reseller) {
+        try {
+          await deps.reseller.recordClaimed(
+            escrowRefStr,
+            claimResult.expectedTxHash,
+            jobId,
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          deps.jobs.fail(jobId, {
+            httpStatus: 503,
+            reason: "evidence_unavailable",
+            message,
+          });
+          deps.state.release(escrowRefStr);
+          acquiredRef = null;
+          await failEvidence("claim_record_failed");
+          return jsonError(
+            res,
+            503,
+            "evidence_unavailable",
+            "Claim confirmed but evidence persistence failed",
+          );
+        }
+      }
+
 
       // Slot release now happens inside runChatJob's finally.
       acquiredRef = null;
@@ -384,13 +617,15 @@ function makeChatHandler(deps: ResolvedDeps) {
           config: deps.config,
           supplierKey: deps.supplierKey,
           jobs: deps.jobs,
+          reseller: deps.reseller,
+          identity: deps.identity,
         },
         jobId,
         escrowRef: escrowRefStr,
         claimedRef,
         advert,
         escrowDatum,
-        requestBody: { messages: validatedMessages },
+        requestBody: responseRequest,
       });
 
       // ── 12. 202 Accepted ─────────────────────────────────────────────
@@ -403,13 +638,18 @@ function makeChatHandler(deps: ResolvedDeps) {
       if (acquiredRef) {
         try { deps.state.release(acquiredRef); } catch { /* ignore */ }
       }
+      if (evidenceRecorded && deps.reseller && evidenceEscrowRef) {
+        await deps.reseller
+          .recordFailed(evidenceEscrowRef, err instanceof Error ? err.message : String(err))
+          .catch(() => undefined);
+      }
       next(err);
       return;
     }
   };
 }
 
-// ─── GET /v1/chat/completions/:jobId ───────────────────────────────────────
+// ─── GET /v1/responses/:jobId ─────────────────────────────────────────────
 
 function makeGetJobHandler(deps: ResolvedDeps) {
   return (req: Request, res: Response) => {
@@ -440,11 +680,10 @@ function makeGetJobHandler(deps: ResolvedDeps) {
         return jsonError(res, 500, "wrong_payload_kind",
           "non-chat payload returned to chat poll route");
       }
+      const { kind: _kind, ...responsePayload } = payload;
+      void _kind;
       return res.status(200).json({
-        choices: payload.choices,
-        usage: payload.usage,
-        receipt: payload.receipt,
-        receipt_signature: payload.receipt_signature,
+        ...responsePayload,
         escrow_ref: record.escrowRef,
       });
     }
@@ -530,7 +769,7 @@ function makeTtsHandler(deps: ResolvedDeps) {
       }
       let escrowDatum: EscrowDatum;
       try {
-        escrowDatum = decodeEscrowDatum(escrowUtxo.datumHex);
+        escrowDatum = decodeEscrow(escrowUtxo.datumHex).datum;
       } catch (err) {
         return jsonError(res, 404, "escrow_decode_failed", (err as Error).message);
       }
@@ -548,6 +787,8 @@ function makeTtsHandler(deps: ResolvedDeps) {
         return jsonError(res, 409, "capability_mismatch",
           `escrow capability ${escrowDatum.capability_id} != advert ${advert.capability_id}`);
       }
+      const agentRefusal = newEscrowRefusal(escrowDatum, escrowUtxo.lovelace, advertResult.agentId, deps.identity);
+      if (agentRefusal) return jsonError(res, agentRefusal.status, agentRefusal.reason, agentRefusal.message);
 
       // ── 6. Hash checks ──────────────────────────────────────────────
       const expectedRequestSpecHash = sha256Hex(canonicalize({
@@ -595,6 +836,7 @@ function makeTtsHandler(deps: ResolvedDeps) {
             chain: deps.chain,
             supplierKey: deps.supplierKey,
             escrowRef,
+            ...identityOptions(escrowDatum, deps.identity),
           });
         } catch (err) {
           return { kind: "build_failed" as const, err };
@@ -609,6 +851,8 @@ function makeTtsHandler(deps: ResolvedDeps) {
       if (claimOutcome.kind === "build_failed") {
         deps.state.release(escrowRefStr);
         acquiredRef = null;
+        const refusal = identityRefusal(claimOutcome.err);
+        if (refusal) return jsonError(res, refusal.status, refusal.reason, refusal.message);
         return jsonError(res, 503, "chain_submit_failed",
           `Claim tx submit failed: ${(claimOutcome.err as Error).message}`);
       }
@@ -635,6 +879,7 @@ function makeTtsHandler(deps: ResolvedDeps) {
           config: deps.config,
           supplierKey: deps.supplierKey,
           jobs: deps.jobs,
+          identity: deps.identity,
         },
         jobId,
         escrowRef: escrowRefStr,
@@ -692,6 +937,7 @@ function makeGetTtsJobHandler(deps: ResolvedDeps) {
         receipt: payload.receipt,
         receipt_signature: payload.receipt_signature,
         escrow_ref: record.escrowRef,
+        submitted_ref: payload.submitted_ref,
       });
     }
     // failed
@@ -781,7 +1027,7 @@ function makeOcrHandler(deps: ResolvedDeps) {
       }
       let escrowDatum: EscrowDatum;
       try {
-        escrowDatum = decodeEscrowDatum(escrowUtxo.datumHex);
+        escrowDatum = decodeEscrow(escrowUtxo.datumHex).datum;
       } catch (err) {
         return jsonError(res, 404, "escrow_decode_failed", (err as Error).message);
       }
@@ -799,6 +1045,8 @@ function makeOcrHandler(deps: ResolvedDeps) {
         return jsonError(res, 409, "capability_mismatch",
           `escrow capability ${escrowDatum.capability_id} != advert ${advert.capability_id}`);
       }
+      const agentRefusal = newEscrowRefusal(escrowDatum, escrowUtxo.lovelace, advertResult.agentId, deps.identity);
+      if (agentRefusal) return jsonError(res, agentRefusal.status, agentRefusal.reason, agentRefusal.message);
 
       // ── 6. Hash checks ──────────────────────────────────────────────
       const expectedRequestSpecHash = sha256Hex(canonicalize({
@@ -888,6 +1136,7 @@ function makeOcrHandler(deps: ResolvedDeps) {
             chain: deps.chain,
             supplierKey: deps.supplierKey,
             escrowRef,
+            ...identityOptions(escrowDatum, deps.identity),
           });
         } catch (err) {
           return { kind: "build_failed" as const, err };
@@ -902,6 +1151,8 @@ function makeOcrHandler(deps: ResolvedDeps) {
       if (claimOutcome.kind === "build_failed") {
         deps.state.release(escrowRefStr);
         acquiredRef = null;
+        const refusal = identityRefusal(claimOutcome.err);
+        if (refusal) return jsonError(res, refusal.status, refusal.reason, refusal.message);
         triggerOnFailureConsolidate({
           chain: deps.chain,
           state: deps.state,
@@ -933,6 +1184,7 @@ function makeOcrHandler(deps: ResolvedDeps) {
           config: deps.config,
           supplierKey: deps.supplierKey,
           jobs: deps.jobs,
+          identity: deps.identity,
         },
         jobId,
         escrowRef: escrowRefStr,
@@ -989,6 +1241,7 @@ function makeGetOcrJobHandler(deps: ResolvedDeps) {
         receipt: payload.receipt,
         receipt_signature: payload.receipt_signature,
         escrow_ref: record.escrowRef,
+        submitted_ref: payload.submitted_ref,
       });
     }
     // failed
@@ -1007,7 +1260,7 @@ function makeGetOcrJobHandler(deps: ResolvedDeps) {
 // Escrow bookends with off-chain turns:
 //   start   → validate (mirror makeChatHandler 1-7, but no messages) → Claim
 //             (Open→Claimed) → create session + arm idle/hard-cap watchdog → 200
-//   message → SSE stream a turn via callOpenAiStream; zero chain interaction
+//   message → canonical Responses SSE via callResponsesStream; zero chain interaction
 //   end     → endChatSession (Submit transcript receipt; Claimed→Submitted) → 200
 //
 // The buyer then Accepts off this route (server-side, in the buyer-app),
@@ -1027,6 +1280,7 @@ function makeChatSessionHandlers(deps: ResolvedDeps) {
     supplierKey: deps.supplierKey,
     jobs: deps.jobs,
     sessions: deps.chatSessions,
+    identity: deps.identity,
   };
 
   function armIdleTimer(record: ChatSessionRecord): void {
@@ -1053,6 +1307,9 @@ function makeChatSessionHandlers(deps: ResolvedDeps) {
     // record takes ownership) — the catch-all only releases its own.
     let acquiredRef: string | null = null;
     try {
+      if (existsSync(DRAIN_MARKER_PATH)) {
+        return jsonError(res, 503, "supplier_draining", "supplier is draining");
+      }
       // ── 1. Header ───────────────────────────────────────────────────
       const headerVal = req.header("X-Escrow-Ref");
       if (!headerVal) {
@@ -1095,7 +1352,7 @@ function makeChatSessionHandlers(deps: ResolvedDeps) {
       }
       let escrowDatum: EscrowDatum;
       try {
-        escrowDatum = decodeEscrowDatum(escrowUtxo.datumHex);
+        escrowDatum = decodeEscrow(escrowUtxo.datumHex).datum;
       } catch (err) {
         return jsonError(res, 404, "escrow_decode_failed", (err as Error).message);
       }
@@ -1111,6 +1368,8 @@ function makeChatSessionHandlers(deps: ResolvedDeps) {
         return jsonError(res, 409, "capability_mismatch",
           `escrow capability ${escrowDatum.capability_id} != advert ${advert.capability_id}`);
       }
+      const agentRefusal = newEscrowRefusal(escrowDatum, escrowUtxo.lovelace, advertResult.agentId, deps.identity);
+      if (agentRefusal) return jsonError(res, agentRefusal.status, agentRefusal.reason, agentRefusal.message);
 
       // ── 6. Hash checks (request spec + session-init prompt) ──────────
       const expectedRequestSpecHash = sha256Hex(canonicalize({
@@ -1163,7 +1422,9 @@ function makeChatSessionHandlers(deps: ResolvedDeps) {
       const claimOutcome = await deps.state.walletMutex.run(async () => {
         let built;
         try {
-          built = await buildClaimTx({ chain: deps.chain, supplierKey: deps.supplierKey, escrowRef });
+          built = await buildClaimTx({
+            chain: deps.chain, supplierKey: deps.supplierKey, escrowRef, ...identityOptions(escrowDatum, deps.identity),
+          });
         } catch (err) {
           return { kind: "build_failed" as const, err };
         }
@@ -1177,6 +1438,8 @@ function makeChatSessionHandlers(deps: ResolvedDeps) {
       if (claimOutcome.kind === "build_failed") {
         deps.state.release(escrowRefStr);
         acquiredRef = null;
+        const refusal = identityRefusal(claimOutcome.err);
+        if (refusal) return jsonError(res, refusal.status, refusal.reason, refusal.message);
         triggerOnFailureConsolidate({ chain: deps.chain, state: deps.state, supplierKey: deps.supplierKey });
         return jsonError(res, 503, "chain_submit_failed", `Claim tx submit failed: ${(claimOutcome.err as Error).message}`);
       }
@@ -1219,47 +1482,79 @@ function makeChatSessionHandlers(deps: ResolvedDeps) {
         return jsonError(res, 404, "chat_session_not_found",
           `no active chat session for ${escrowRefStr}`);
       }
-      // Two body shapes: legacy {content} (single user turn) and
-      // {messages, tools?, tool_choice?} (multi-message delta — e.g. tool
-      // results — appended to the transcript as one turn).
-      const body = (req.body ?? {}) as {
-        content?: unknown;
-        messages?: unknown;
-        tools?: unknown;
-        tool_choice?: unknown;
-      };
-      let delta: ChatMessage[];
-      if (Array.isArray(body.messages)) {
-        const normalized: ChatMessage[] = [];
-        for (const raw of body.messages) {
-          const msg = normalizeChatMessage(raw);
-          if (!msg) {
-            return jsonError(res, 400, "invalid_messages",
-              "body.messages must be OpenAI-shaped {role, content, tool_calls?, tool_call_id?} objects");
-          }
-          normalized.push(msg);
-        }
-        const last = normalized[normalized.length - 1];
-        if (!last || (last.role !== "user" && last.role !== "tool")) {
-          return jsonError(res, 400, "invalid_messages",
-            "body.messages must end with a user or tool message");
-        }
-        delta = normalized;
-      } else {
-        const content = typeof body.content === "string" ? body.content : "";
-        if (content.length === 0) {
-          return jsonError(res, 400, "content_required", "body.content must be a non-empty string");
-        }
-        delta = [{ role: "user", content }];
+      if (record.turnInFlight) {
+        return jsonError(res, 409, "chat_turn_in_progress", "another turn is already in progress");
       }
-      const tools = Array.isArray(body.tools) && body.tools.length > 0 ? body.tools : undefined;
-      const toolChoice = tools !== undefined ? body.tool_choice : undefined;
+      const rawTurnRequest = req.body ?? {};
+      const unknownField = Object.keys(rawTurnRequest).find(
+        (key) => RESPONSE_REQUEST_FIELDS[key] !== true,
+      );
+      if (unknownField !== undefined) {
+        return jsonError(
+          res,
+          400,
+          "unsupported_parameter",
+          `unsupported Responses parameter: ${unknownField}`,
+        );
+      }
 
-      // Pause the idle timer while a turn is in flight; re-arm when it ends so
-      // a long generation never trips the auto-end mid-stream.
-      if (record.idleTimer) { clearTimeout(record.idleTimer); record.idleTimer = undefined; }
-      const transcriptLenBefore = record.transcript.length;
-      deps.chatSessions.appendMessages(escrowRefStr, delta);
+      let turnRequest: ResponseRequest;
+      let prospectiveTranscript: ResponseRequest["input"];
+      try {
+        turnRequest = normalizeResponseRequest(rawTurnRequest);
+        if (turnRequest.max_output_tokens !== undefined) {
+          turnRequest = {
+            ...turnRequest,
+            max_output_tokens: Math.min(
+              turnRequest.max_output_tokens,
+              record.advert.max_output_tokens,
+            ),
+          };
+        }
+        prospectiveTranscript = [...record.transcript, ...turnRequest.input];
+        validateResponseToolOutputs(prospectiveTranscript);
+      } catch (error) {
+        return jsonError(
+          res,
+          400,
+          "invalid_request",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+
+      const compatibilityError = responseCompatibilityError(
+        { ...turnRequest, input: prospectiveTranscript },
+        deps.config.openaiUpstreamApi,
+        deps.config.openaiReasoningDisabled,
+      );
+      if (compatibilityError) {
+        return jsonError(
+          res,
+          400,
+          compatibilityError.param === "reasoning.effort"
+            ? "reasoning_disabled"
+            : "upstream_api_incompatible",
+          compatibilityError.message,
+          compatibilityError.param,
+        );
+      }
+
+      if (deps.config.openaiUpstreamApi !== "responses") {
+        try {
+          responseInputToChatMessages(
+            prospectiveTranscript,
+            turnRequest.instructions,
+          );
+        } catch (error) {
+          return jsonError(
+            res,
+            400,
+            "upstream_api_incompatible",
+            error instanceof Error ? error.message : String(error),
+            "input",
+          );
+        }
+      }
 
       res.status(200);
       res.setHeader("Content-Type", "text/event-stream");
@@ -1269,57 +1564,46 @@ function makeChatSessionHandlers(deps: ResolvedDeps) {
       if (typeof (res as Response & { flushHeaders?: () => void }).flushHeaders === "function") {
         (res as Response & { flushHeaders: () => void }).flushHeaders();
       }
-      const sse = (frame: Record<string, unknown>): void => {
-        res.write(`data: ${JSON.stringify(frame)}\n\n`);
+      const sendEvent = (event: ResponseStreamEvent): void => {
+        res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
       };
+      record.turnInFlight = true;
+      if (record.idleTimer) {
+        clearTimeout(record.idleTimer);
+        record.idleTimer = undefined;
+      }
+      const transcriptLenBefore = record.transcript.length;
+      deps.chatSessions.appendInput(escrowRefStr, turnRequest.input);
 
       try {
-        // Stateful upstreams (OpenClaw) key a persistent agent session off the
-        // OpenAI `user` field and carry the history themselves — send only this
-        // turn's delta or the transcript duplicates into the upstream context
-        // every turn. Stateless upstreams get the full transcript as before.
         const stateful = deps.config.openaiSessionPassthrough;
-        const result = await callOpenAiStream(
+        const result = await callResponsesStream(
           {
             baseUrl: deps.config.openaiBaseUrl,
+            responsesUrl: deps.config.openaiResponsesUrl || undefined,
+            responsesStreamOnly: deps.config.openaiResponsesStreamOnly,
+            upstreamApi: deps.config.openaiUpstreamApi,
             model: deps.config.openaiModelOverride || record.advert.model,
-            messages: stateful ? delta : record.transcript,
+            ...turnRequest,
+            input: stateful ? turnRequest.input : prospectiveTranscript,
             timeoutMs: deps.config.openaiTimeoutMs,
             apiKey: deps.config.openaiApiKey,
             maxTokens: deps.config.openaiMaxTokens,
             disableReasoning: deps.config.openaiReasoningDisabled,
-            tools,
-            toolChoice,
             user: stateful ? escrowRefStr : undefined,
           },
-          (tok) => sse({ type: "token", value: tok }),
+          sendEvent,
         );
-        // Build the assistant message once and send it VERBATIM in the done
-        // frame: the gateway mirrors this object so both transcripts stay
-        // hash-identical for the receipt (field presence matters).
-        const assistantMsg: ChatMessage = { role: "assistant", content: result.content };
-        if (result.tool_calls && result.tool_calls.length > 0) assistantMsg.tool_calls = result.tool_calls;
-        deps.chatSessions.appendAssistant(escrowRefStr, assistantMsg, {
-          prompt_tokens: result.prompt_tokens,
-          completion_tokens: result.completion_tokens,
-        });
-        const finishReason =
-          result.finish_reason === "tool_calls" || (result.tool_calls?.length ?? 0) > 0
-            ? "tool_calls"
-            : "stop";
-        sse({
-          type: "done",
-          message: assistantMsg,
-          finish_reason: finishReason,
-          usage: { prompt_tokens: result.prompt_tokens, completion_tokens: result.completion_tokens },
-        });
+        deps.chatSessions.appendResponse(escrowRefStr, result.response);
       } catch (err) {
-        // Failed turn: the gateway mirror never saw this delta, so drop it here
-        // too — otherwise a retry re-sends it and the transcripts diverge.
         deps.chatSessions.truncateTranscript(escrowRefStr, transcriptLenBefore);
-        const errMsg = err instanceof Error ? err.message : String(err);
-        sse({ type: "error", message: errMsg });
+        const message = err instanceof Error ? err.message : String(err);
+        sendEvent({
+          type: "error",
+          error: { type: "supplier_error", message },
+        });
       } finally {
+        record.turnInFlight = false;
         if (record.status === "active") armIdleTimer(record);
         res.end();
       }
@@ -1341,8 +1625,12 @@ function makeChatSessionHandlers(deps: ResolvedDeps) {
         return jsonError(res, 400, "escrow_ref_malformed", 'X-Escrow-Ref must match "<64-hex>#<int>"');
       }
       const escrowRefStr = `${escrowRef.txHash}#${escrowRef.index}`;
-      if (!deps.chatSessions.get(escrowRefStr)) {
+      const existing = deps.chatSessions.get(escrowRefStr);
+      if (!existing) {
         return jsonError(res, 404, "chat_session_not_found", `no chat session for ${escrowRefStr}`);
+      }
+      if (existing.turnInFlight) {
+        return jsonError(res, 409, "chat_turn_in_progress", "cannot end a session during a turn");
       }
       const record = await endChatSession({ deps: endDeps, escrowRef: escrowRefStr, trigger: "end" });
       if (!record) {
@@ -1385,7 +1673,13 @@ export function createApp(deps: SupplierDeps): Application {
     supplierKey: deps.supplierKey,
     jobs: deps.jobs ?? new JobStore(),
     chatSessions: deps.chatSessions ?? new ChatSessionStore(),
+    reseller: deps.reseller,
+    paper2agent: deps.paper2agent,
+    identity: deps.identity ?? supplierIdentity(deps.chain, deps.config.networkId),
   };
+  if (resolved.config.capabilityKind === "paper2agent" && !resolved.paper2agent) {
+    throw new Error("Paper2Agent runtime must be initialized before serving requests");
+  }
 
   const app = express();
   app.disable("x-powered-by");
@@ -1393,11 +1687,46 @@ export function createApp(deps: SupplierDeps): Application {
   // below; every other route keeps the 1mb ceiling.
   const jsonBody = express.json({ limit: "1mb" });
   app.use((req, res, next) =>
-    req.path.startsWith("/v1/ocr/") ? next() : jsonBody(req, res, next));
+    req.path.startsWith("/v1/ocr/") || req.path.startsWith("/v1/paper2agent/") ? next() : jsonBody(req, res, next));
 
   // /healthz is mounted FIRST and uses no deps — it must succeed regardless
   // of chain/state/config (independent of /status free/working/offline).
   app.use(healthzRouter());
+  if (resolved.reseller) {
+    app.get("/reseller", (_req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      res.type("html").send(renderResellerDashboardPage());
+    });
+    app.get("/reseller/api/status", async (_req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      try {
+        res.status(200).json(await resolved.reseller!.publicState());
+      } catch {
+        jsonError(
+          res,
+          503,
+          "evidence_unavailable",
+          "reseller evidence database is unavailable",
+        );
+      }
+    });
+    app.get("/reseller/api/jobs", async (req: Request, res: Response) => {
+      res.setHeader("Cache-Control", "no-store");
+      const parsed = Number(req.query.limit ?? 50);
+      const limit = Number.isSafeInteger(parsed) ? parsed : 50;
+      try {
+        res.status(200).json({ jobs: await resolved.reseller!.publicJobs(limit) });
+      } catch {
+        jsonError(
+          res,
+          503,
+          "evidence_unavailable",
+          "reseller evidence database is unavailable",
+        );
+      }
+    });
+  }
+
 
   app.get("/capability", makeCapabilityHandler(resolved));
   app.get("/status", makeStatusHandler(resolved));
@@ -1408,7 +1737,9 @@ export function createApp(deps: SupplierDeps): Application {
   // hang on a request that's guaranteed to fail capability validation; we'd
   // rather it 404 immediately. (The on-chain capability_id check still runs
   // on every request, so this is belt-and-braces.)
-  if (resolved.config.capabilityKind === "tts") {
+  if (resolved.config.capabilityKind === "paper2agent") {
+    app.use(paper2AgentRoutes(resolved.paper2agent!));
+  } else if (resolved.config.capabilityKind === "tts") {
     app.post("/v1/audio/synthesize", makeTtsHandler(resolved));
     app.get("/v1/audio/synthesize/:jobId", makeGetTtsJobHandler(resolved));
   } else if (resolved.config.capabilityKind === "ocr") {
@@ -1424,8 +1755,9 @@ export function createApp(deps: SupplierDeps): Application {
     //   SUBMIT_RESERVE  the runner's reserve for building, submitting and
     //                   confirming Submit (30 s, mirrored in customJobRunner)
     // The window is the advert's max_processing_ms plus the 30 s network
-    // buffer the escrow builder adds: deliver_by = posted_at +
-    // max_processing_ms + 30 s (packages/shared/src/tx/escrow/postEscrow.ts).
+    // buffer the escrow builders add: deliver_by = posted_at +
+    // max_processing_ms + 30 s, in both escrow layouts
+    // (packages/shared/src/tx/escrow/postEscrow.ts, postFromAdvert.ts).
     // Refuse to boot when they do not fit, rather than claim jobs this node
     // cannot submit in time and forfeit the bond on each one.
     //
@@ -1463,8 +1795,8 @@ export function createApp(deps: SupplierDeps): Application {
     app.post("/v1/chat/message", chat.message);
     app.post("/v1/chat/end", chat.end);
   } else {
-    app.post("/v1/chat/completions", makeChatHandler(resolved));
-    app.get("/v1/chat/completions/:jobId", makeGetJobHandler(resolved));
+    app.post("/v1/responses", makeChatHandler(resolved));
+    app.get("/v1/responses/:jobId", makeGetJobHandler(resolved));
   }
 
   // Centralised error handler (4 args required by Express).

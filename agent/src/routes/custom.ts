@@ -14,7 +14,19 @@
  *   - the runner is `runCustomJob`, handed the mounted Executor;
  *   - one extra pre-Claim check the chat route has no equivalent for: the live
  *     advert's max_processing_ms against the SLA this node was configured with
- *     (step 3b), because the boot guard could only check the configured value.
+ *     (step 3b), because the boot guard could only check the configured value;
+ *   - GET renders the stored Responses payload in the custom wire shape
+ *     (`choices[0].message.content` = the output bytes) and adds
+ *     `submitted_ref`, the Submitted escrow output the buyer Accepts.
+ *
+ * Both escrow layouts, exactly as makeChatHandler handles them (Part 2 §6.1,
+ * §6.3, §9.6, through the vendored identity/agent.ts): the advert and the
+ * escrow decode in either layout; a new (16-field) escrow must name this
+ * supplier's own agent (AGENT_ID, else the agent of the configured new
+ * advert) and stay inside the value cap before anything is claimed; Claim and
+ * Submit of a new escrow read the agent's record as a reference input, and a
+ * builder refusal of that record answers 503 agent_not_eligible instead of a
+ * wallet error; the receipt of a new escrow carries agent_did.
  *
  * The private helpers `makeChatHandler` leans on (jsonError, parseEscrowRef,
  * sha256Hex, fetchActiveAdvert, the two regexes) are module-private in
@@ -26,8 +38,9 @@ import type { Request, Response, NextFunction } from "express";
 import { createHash } from "crypto";
 
 import type { ChainProvider, OutputReference } from "@marketplace/shared/chain";
-import { decodeAdvertDatum, decodeEscrowDatum, canonicalize } from "@marketplace/shared/cbor";
-import type { AdvertDatum, EscrowDatum } from "@marketplace/shared/cbor";
+import { canonicalize } from "@marketplace/shared/cbor";
+import type { AdvertDatum, EscrowDatum, IdentityAdvertDatum } from "@marketplace/shared/cbor";
+import { responseOutputText } from "@marketplace/shared/responses";
 import type { WalletKey } from "@marketplace/shared/tx";
 import {
   buildClaimTx,
@@ -41,6 +54,15 @@ import type { JobStore } from "../jobs.js";
 import type { Executor } from "../executor/executor.js";
 import { runCustomJob } from "../customJobRunner.js";
 import { triggerOnFailureConsolidate } from "../walletHealth.js";
+import {
+  decodeAdvert,
+  decodeEscrow,
+  identityOptions,
+  identityRefusal,
+  newEscrowRefusal,
+  ownAgentId,
+  type SupplierIdentity,
+} from "../identity/agent.js";
 
 /**
  * The subset of server.ts's (module-private) ResolvedDeps these handlers use,
@@ -53,6 +75,8 @@ export interface CustomRouteDeps {
   config: SupplierConfig;
   supplierKey: WalletKey;
   jobs: JobStore;
+  /** Record lookup and identity blueprint for new escrows (createApp's default: the chain lookup, env IDENTITY_POLICY_ID). */
+  identity: SupplierIdentity;
   /** Attached by createApp for capabilityKind="custom". */
   executor?: Executor;
 }
@@ -82,24 +106,29 @@ interface CustomBody {
 }
 
 type AdvertResult =
-  | { datum: AdvertDatum }
+  | { datum: AdvertDatum | IdentityAdvertDatum; agentId: string | null }
   | { error: { status: number; reason: string; message: string } };
 
+/** The configured advert (either layout) and the supplier's own agent. */
 async function fetchActiveAdvert(deps: CustomRouteDeps): Promise<AdvertResult> {
   const utxo = await deps.chain.queryUtxo(deps.config.advertRef);
   if (utxo === null || !utxo.datumHex) {
     return { error: { status: 503, reason: "advert_unavailable", message: "advert UTxO missing on chain" } };
   }
-  let datum: AdvertDatum;
+  let datum: AdvertDatum | IdentityAdvertDatum;
   try {
-    datum = decodeAdvertDatum(utxo.datumHex);
+    datum = decodeAdvert(utxo.datumHex).datum;
   } catch (err) {
     return { error: { status: 503, reason: "advert_decode_failed", message: (err as Error).message } };
   }
   if (datum.status !== "Active") {
     return { error: { status: 503, reason: "advert_not_active", message: `advert status=${datum.status}` } };
   }
-  return { datum };
+  try {
+    return { datum, agentId: ownAgentId(deps.config.agentId, datum) };
+  } catch (err) {
+    return { error: { status: 503, reason: "agent_mismatch", message: (err as Error).message } };
+  }
 }
 
 // ─── POST /v1/job ──────────────────────────────────────────────────────────
@@ -170,7 +199,7 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
       }
       let escrowDatum: EscrowDatum;
       try {
-        escrowDatum = decodeEscrowDatum(escrowUtxo.datumHex);
+        escrowDatum = decodeEscrow(escrowUtxo.datumHex).datum;
       } catch (err) {
         return jsonError(res, 404, "escrow_decode_failed", (err as Error).message);
       }
@@ -188,6 +217,10 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
         return jsonError(res, 409, "capability_mismatch",
           `escrow capability ${escrowDatum.capability_id} != advert ${advert.capability_id}`);
       }
+      // A new escrow must name this supplier's own agent and stay inside the
+      // value cap; a legacy escrow passes. Refused before any slot or Claim.
+      const agentRefusal = newEscrowRefusal(escrowDatum, escrowUtxo.lovelace, advertResult.agentId, deps.identity);
+      if (agentRefusal) return jsonError(res, agentRefusal.status, agentRefusal.reason, agentRefusal.message);
 
       // ── 6. Hash checks ───────────────────────────────────────────────
       const expectedRequestSpecHash = sha256Hex(canonicalize({
@@ -235,6 +268,8 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
             chain: deps.chain,
             supplierKey: deps.supplierKey,
             escrowRef,
+            // A new escrow's Claim reads the agent's record (reference input).
+            ...identityOptions(escrowDatum, deps.identity),
           });
         } catch (err) {
           return { kind: "build_failed" as const, err };
@@ -249,6 +284,10 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
       if (claimOutcome.kind === "build_failed") {
         deps.state.release(escrowRefStr);
         acquiredRef = null;
+        // The record of the agent fails a check of the escrow contract, or the
+        // new escrow cannot be claimed: no wallet problem, so no consolidate.
+        const refusal = identityRefusal(claimOutcome.err);
+        if (refusal) return jsonError(res, refusal.status, refusal.reason, refusal.message);
         // Backstop the periodic wallet-health ticker: most Claim build failures
         // we see in practice are wallet-shape problems (fragmentation, dust).
         // Fire-and-forget a debounced consolidate so the NEXT buyer retry
@@ -285,6 +324,7 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
           config: deps.config,
           supplierKey: deps.supplierKey,
           jobs: deps.jobs,
+          identity: deps.identity,
         },
         executor,
         jobId,
@@ -336,18 +376,30 @@ export function makeGetCustomJobHandler(deps: CustomRouteDeps) {
     if (record.status === "done") {
       const payload = record.responsePayload!;
       // Defensive narrowing: this poll route only knows how to render the
-      // chat shape. A future shared JobStore could mix capabilities; we'd
-      // want each kind's poll to be sure it's reading its own.
-      if (payload.kind === "ocr" || "audio_b64" in payload) {
+      // shape runCustomJob stores. A future shared JobStore could mix
+      // capabilities; we'd want each kind's poll to be sure it's reading its own.
+      if (payload.kind === "ocr" || payload.kind === "tts") {
         return jsonError(res, 500, "wrong_payload_kind",
           "non-chat payload returned to chat poll route");
       }
+      // The custom wire shape: the output bytes as choices[0].message.content
+      // (what the buyer hashes against response_hash), zero usage counts, the
+      // signed receipt, and the Submitted escrow output to Accept.
       return res.status(200).json({
-        choices: payload.choices,
-        usage: payload.usage,
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content: responseOutputText(payload.output) },
+          finish_reason: "stop",
+        }],
+        usage: {
+          prompt_tokens: payload.usage?.input_tokens ?? 0,
+          completion_tokens: payload.usage?.output_tokens ?? 0,
+          total_tokens: payload.usage?.total_tokens ?? 0,
+        },
         receipt: payload.receipt,
         receipt_signature: payload.receipt_signature,
         escrow_ref: record.escrowRef,
+        submitted_ref: payload.submitted_ref,
       });
     }
     // failed

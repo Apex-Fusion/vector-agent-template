@@ -16,10 +16,16 @@
  * escrowLockFloor() returns the lovelace to lock: the economic total
  * (payment + both bonds), raised to the Submitted-state min-ada plus a
  * safety margin when the total alone is too small.
+ *
+ * Both escrow layouts: a datum with `agent_id` is the new 16-field datum
+ * (Part 2 §6.1). Its `agent_id` (32 bytes) and `refund` address raise the
+ * floor by about 0.5 AP3X.
  */
 
 import type { EscrowDatum } from "../../cbor/types.js";
 import { encodeEscrowDatum } from "../../cbor/EscrowDatum.js";
+import { encodeIdentityEscrowDatum, type IdentityEscrowDatum } from "../../cbor/IdentityEscrowDatum.js";
+import { isIdentityEscrowDatum } from "./layout.js";
 
 /** Conway/Babbage utxoCostPerByte on Vector mainnet (protocol params). */
 const UTXO_COST_PER_BYTE = 4310n;
@@ -43,18 +49,18 @@ function estimateOutputBytes(datumBytes: number, lovelace: bigint): bigint {
   return addr + coin + datumField + mapOverhead;
 }
 
-/** Min-ada for the escrow output when it carries `datum`. */
-export function minAdaForEscrowDatum(datum: EscrowDatum, lovelace: bigint): bigint {
-  const datumBytes = encodeEscrowDatum(datum).length / 2;
-  const size = estimateOutputBytes(datumBytes, lovelace);
+/** Min-ada for the escrow output when it carries `datum` (either layout). */
+export function minAdaForEscrowDatum(datum: EscrowDatum | IdentityEscrowDatum, lovelace: bigint): bigint {
+  const encoded = isIdentityEscrowDatum(datum) ? encodeIdentityEscrowDatum(datum) : encodeEscrowDatum(datum);
+  const size = estimateOutputBytes(encoded.length / 2, lovelace);
   return (OUTPUT_OVERHEAD_BYTES + size) * UTXO_COST_PER_BYTE;
 }
 
 /** The lovelace a POST must lock so the escrow output satisfies min-ada in
  * every reachable state, including Submitted. `economicTotal` is
  * payment + buyer_bond + supplier_bond. */
-export function escrowLockFloor(openDatum: EscrowDatum, economicTotal: bigint): bigint {
-  const submittedShape: EscrowDatum = {
+export function escrowLockFloor(openDatum: EscrowDatum | IdentityEscrowDatum, economicTotal: bigint): bigint {
+  const submittedShape: EscrowDatum | IdentityEscrowDatum = {
     ...openDatum,
     // Representative worst-case Submit fields: a 13-digit POSIX ms stamp
     // and a 32-byte receipt hash — sizes, not values, matter here.

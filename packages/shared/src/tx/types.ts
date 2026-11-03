@@ -22,12 +22,10 @@ export interface ToolCall {
 }
 
 /**
- * ChatMessage — OpenAI-compatible chat message.
- * `content` is always a string ("" for tool-call-only assistant messages —
- * OpenAI's `content: null` is normalized on ingest). `tool_calls` /
- * `tool_call_id` MUST be omitted (not set to undefined) when absent: the
- * receipt hash canonicalizes the transcript objects, so field presence is
- * part of the identity shared between supplier transcript and gateway mirror.
+ * Chat Completions wire data for explicit upstream compatibility adapters
+ * and generic escrow-builder inputs. Content is a string, including "" for
+ * a tool-only assistant message. Marketplace LLM requests and session
+ * transcripts use Responses Items instead.
  */
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -83,8 +81,8 @@ export interface PostEscrowBuildResult extends BuildResult {
 export class TxConstructionError extends Error {
   public readonly reason: string;
 
-  constructor(reason: string, message?: string) {
-    super(message ?? reason);
+  constructor(reason: string, message?: string, options?: ErrorOptions) {
+    super(message ?? reason, options);
     this.name = "TxConstructionError";
     this.reason = reason;
   }

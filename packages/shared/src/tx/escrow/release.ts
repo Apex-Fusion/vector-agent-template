@@ -9,21 +9,28 @@
  *   2. datum.state === "Submitted"
  *   3. datum.submitted_at is non-null
  *   4. validity lower-bound ≥ datum.submitted_at + ACCEPT_WINDOW
+ *
+ * Both layouts (Part 2 §9.6): the escrow datum decides; a 16-field escrow
+ * goes to identityEscrow.ts releaseIdentity (same rules, the new script).
  */
 
 import type { ChainProvider, OutputReference } from "../../chain/ChainProvider.js";
-import { decodeEscrowDatum } from "../../cbor/EscrowDatum.js";
+import type { IdentityBlueprint } from "../blueprint.js";
 import type { WalletKey, BuildResult } from "../types.js";
 import { TxConstructionError } from "../types.js";
 import { encodeTxBody, sha256Hex } from "../internal/testTxBody.js";
-import { ACCEPT_WINDOW_MS, mockSlotToWallclockMs } from "../internal/constants.js";
+import { ACCEPT_WINDOW_MS, LOWER_BOUND_BACKPAD_MS, mockSlotToWallclockMs } from "../internal/constants.js";
 import { detectCborBackend } from "../internal/cborBackend.js";
+import { readEscrow } from "../internal/layout.js";
+import { releaseIdentity } from "./identityEscrow.js";
 import type { LiveOgmiosProvider } from "../../chain/LiveOgmiosProvider.js";
 
 export interface ReleaseParams {
   chain: ChainProvider;
   supplierKey: WalletKey;
   escrowRef: OutputReference;
+  /** Identity layout only. Default: loadIdentityBlueprint() (env IDENTITY_POLICY_ID). */
+  identityBlueprint?: IdentityBlueprint;
 }
 
 export async function buildReleaseTx(
@@ -31,21 +38,16 @@ export async function buildReleaseTx(
 ): Promise<BuildResult> {
   const { chain, supplierKey, escrowRef } = params;
 
-  const utxo = await chain.queryUtxo(escrowRef);
-  if (utxo === null) {
-    throw new TxConstructionError(
-      "escrow ref not on chain",
-      `no UTxO at ${escrowRef.txHash}#${escrowRef.index}`,
-    );
+  const escrow = await readEscrow(chain, escrowRef);
+  if (escrow.layout === "identity") {
+    return releaseIdentity({
+      chain,
+      escrow,
+      supplierKey,
+      identityBlueprint: params.identityBlueprint,
+    });
   }
-  if (!utxo.datumHex) {
-    throw new TxConstructionError(
-      "escrow datum missing",
-      `UTxO ${escrowRef.txHash}#${escrowRef.index} has no inline datum`,
-    );
-  }
-
-  const datum = decodeEscrowDatum(utxo.datumHex);
+  const { utxo, datum } = escrow;
 
   // 1. Signer must match supplier identity.
   if (supplierKey.pubKeyHash !== datum.supplier_pkh) {
@@ -111,7 +113,8 @@ export async function buildReleaseTx(
       },
     ],
     requiredSigners: [supplierKey.pubKeyHash],
-    validityRange: { lowerBoundMs: threshold, upperBoundMs: tipMs + 60_000 },
+    // Same range as the live builder: no time before the threshold, hi − lo ≤ MAX_RANGE_MS (Part 2 §6.5).
+    validityRange: { lowerBoundMs: Math.max(threshold, tipMs - LOWER_BOUND_BACKPAD_MS), upperBoundMs: tipMs + 60_000 },
     redeemer: "Release",
   };
 

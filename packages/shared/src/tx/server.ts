@@ -10,12 +10,22 @@
  */
 
 export { loadEscrowScript, loadAdvertScript } from "./internal/liveCbor.js";
+export type { RefUtxoEnvKey } from "./internal/liveCbor.js";
+export { loadIdentityEscrowScript, loadIdentityAdvertScript } from "./internal/liveIdentityCbor.js";
 export { pkhToEnterpriseAddress } from "./internal/pkhAddress.js";
 export type {
-  LivePublishRefScriptsParams,
-  PublishRefScriptsBuildResult,
+  PublishedReference,
+  PublishReferenceScriptsArgs,
+  PublishReferenceScriptsTx,
+  ReferenceScript,
 } from "./internal/publishReferenceScripts.js";
-export { buildLiveTxForPublishReferenceScripts } from "./internal/publishReferenceScripts.js";
+export {
+  buildPublishReferenceScripts,
+  REFERENCE_SCRIPT_KEY_HASH,
+  referenceScriptAddress,
+} from "./internal/publishReferenceScripts.js";
+export type { SignedTransactionInfo, SignedTransactionFinancials } from "./internal/signedTransaction.js";
+export { inspectSignedTransaction, inspectSignedTransactionFinancials } from "./internal/signedTransaction.js";
 
 // ── Wallet consolidate (one-shot operational tx; live-only) ─────────────
 export type {
@@ -45,3 +55,16 @@ export type {
   WithdrawWalletBuildResult,
 } from "./wallet/withdrawWallet.js";
 export { buildWithdrawTx } from "./wallet/withdrawWallet.js";
+
+// ── Surplus Merkle-batch anchor (live-only) ────────────────────────────
+export type {
+  AnchorMetadataParams,
+  SurplusSaleProofAnchorMetadata,
+} from "./wallet/anchorMetadata.js";
+export {
+  MAX_TRANSACTION_METADATA_TEXT_BYTES,
+  SURPLUS_SALE_PROOF_METADATA_LABEL,
+  SURPLUS_SALE_PROOF_PROTOCOL,
+  buildAnchorMetadataTx,
+  validateSurplusSaleProofAnchorMetadata,
+} from "./wallet/anchorMetadata.js";

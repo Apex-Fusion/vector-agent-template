@@ -22,7 +22,7 @@ import { blake2b } from "@noble/hashes/blake2b";
 import { buildReceipt, signReceipt, receiptResultHash } from "@marketplace/shared/receipt";
 import type { SignedReceipt } from "@marketplace/shared/receipt";
 
-import { verifyReceipt, verifyChainBindings } from "./verify-receipt.js";
+import { verifyReceipt, verifyChainBindings, type ChainBindings } from "./verify-receipt.js";
 
 // @noble/ed25519 v2 sync mode needs a sha512 hook. The vendored sign.ts
 // installs one on import; we install ours too so key generation in this file
@@ -214,6 +214,7 @@ describe("verifyChainBindings", () => {
       escrowRefPosted: ESCROW_REF,
       advertSupplierPkh: supplier.pkh,
       supplierPubKeyHex: supplier.pubHex,
+      escrowAgentId: null,
     })).toEqual({ ok: true });
   });
 
@@ -227,6 +228,7 @@ describe("verifyChainBindings", () => {
       escrowRefPosted: ESCROW_REF,
       advertSupplierPkh: supplier.pkh,
       supplierPubKeyHex: supplier.pubHex,
+      escrowAgentId: null,
     })).toEqual({ ok: false, reason: "result_receipt_hash_mismatch" });
   });
 
@@ -237,6 +239,7 @@ describe("verifyChainBindings", () => {
       escrowRefPosted: ESCROW_REF,
       advertSupplierPkh: supplier.pkh,
       supplierPubKeyHex: supplier.pubHex,
+      escrowAgentId: null,
     })).toEqual({ ok: false, reason: "no_result_receipt_hash_on_chain" });
   });
 
@@ -247,6 +250,7 @@ describe("verifyChainBindings", () => {
       escrowRefPosted: `${"cd".repeat(32)}#0`,
       advertSupplierPkh: supplier.pkh,
       supplierPubKeyHex: supplier.pubHex,
+      escrowAgentId: null,
     })).toEqual({ ok: false, reason: "wrong_escrow_ref" });
   });
 
@@ -257,6 +261,7 @@ describe("verifyChainBindings", () => {
       escrowRefPosted: ESCROW_REF,
       advertSupplierPkh: "9f".repeat(28),
       supplierPubKeyHex: supplier.pubHex,
+      escrowAgentId: null,
     })).toEqual({ ok: false, reason: "wrong_supplier" });
   });
 
@@ -277,6 +282,58 @@ describe("verifyChainBindings", () => {
       escrowRefPosted: ESCROW_REF,
       advertSupplierPkh: supplier.pkh,
       supplierPubKeyHex: impostor.pubHex,
+      escrowAgentId: null,
     })).toEqual({ ok: false, reason: "pub_key_not_supplier" });
+  });
+});
+
+/**
+ * An escrow with an agent_id (upstream docs/IDENTITY_REGISTRY.md §6.3): its
+ * receipt has exactly the 9 fields, agent_did naming the escrow's agent; a
+ * legacy escrow's receipt has exactly the 8 fields.
+ */
+describe("verifyChainBindings — the agent of the escrow", () => {
+  const supplier = makeSupplierKey("try-it-agent-supplier");
+  const AGENT_ID = "a1".repeat(32);
+
+  function agentReceipt(agentDid: string): SignedReceipt {
+    const legacy = makeSignedReceipt({ payload: PAYLOAD, output: OUTPUT, privHex: supplier.privHex, pkh: supplier.pkh });
+    return signReceipt({ ...legacy.receipt, agent_did: agentDid }, supplier.privHex);
+  }
+
+  function bindings(signed: SignedReceipt, escrowAgentId: string | null): ChainBindings {
+    return {
+      resultReceiptHashOnChain: receiptResultHash(signed),
+      escrowRefPosted: ESCROW_REF,
+      advertSupplierPkh: supplier.pkh,
+      supplierPubKeyHex: supplier.pubHex,
+      escrowAgentId,
+    };
+  }
+
+  it("accepts a 9-field receipt that names the escrow's agent", () => {
+    const signed = agentReceipt(`did:vector:${AGENT_ID}`);
+    expect(verifyChainBindings(signed, bindings(signed, AGENT_ID))).toEqual({ ok: true });
+  });
+
+  it("rejects a receipt that names another agent, or none, for an escrow with an agent_id", () => {
+    const other = agentReceipt(`did:vector:${"b2".repeat(32)}`);
+    expect(verifyChainBindings(other, bindings(other, AGENT_ID))).toEqual({ ok: false, reason: "agent_did_mismatch" });
+    const legacy = makeSignedReceipt({ payload: PAYLOAD, output: OUTPUT, privHex: supplier.privHex, pkh: supplier.pkh });
+    expect(verifyChainBindings(legacy, bindings(legacy, AGENT_ID))).toEqual({ ok: false, reason: "agent_did_mismatch" });
+  });
+
+  it("rejects agent_did on a legacy escrow's receipt", () => {
+    const signed = agentReceipt(`did:vector:${AGENT_ID}`);
+    expect(verifyChainBindings(signed, bindings(signed, null))).toEqual({ ok: false, reason: "agent_did_mismatch" });
+  });
+
+  it("rejects a receipt with a field outside the 9", () => {
+    const legacy = makeSignedReceipt({ payload: PAYLOAD, output: OUTPUT, privHex: supplier.privHex, pkh: supplier.pkh });
+    const signed = signReceipt(
+      { ...legacy.receipt, agent_did: `did:vector:${AGENT_ID}`, extra: "x" } as SignedReceipt["receipt"],
+      supplier.privHex,
+    );
+    expect(verifyChainBindings(signed, bindings(signed, AGENT_ID))).toEqual({ ok: false, reason: "malformed_receipt" });
   });
 });

@@ -7,12 +7,20 @@ UPSTREAM="${1:?usage: sync-core.sh <upstream-clone-path> [<ref>]}"
 REF="${2:-origin/main}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# The compiled validator blueprints vendored next to the code. Each one is
+# dirty-checked, wiped and re-extracted below exactly like agent/ and
+# packages/shared/:
+#   contracts/marketplace/plutus.json           the legacy escrow and advert
+#   contracts/identity-marketplace/plutus.json  the escrow and advert that
+#                                               carry an agent_id
+BLUEPRINTS=(contracts/marketplace/plutus.json contracts/identity-marketplace/plutus.json)
+
 # The vendored dirs are wiped and rebuilt below, and deleted template-owned
 # files are restored FROM THE INDEX - so any uncommitted edit under them would
 # be destroyed silently. Refuse to run until the tree is clean there.
-DIRTY=$(git -C "$ROOT" status --porcelain -- agent packages/shared)
+DIRTY=$(git -C "$ROOT" status --porcelain -- agent packages/shared "${BLUEPRINTS[@]}")
 if [ -n "$DIRTY" ]; then
-  echo "sync-core: refusing to run - uncommitted changes under agent/ or packages/shared/:" >&2
+  echo "sync-core: refusing to run - uncommitted changes under agent/, packages/shared/ or a vendored blueprint:" >&2
   echo "$DIRTY" >&2
   echo "commit or stash them first (this script rebuilds those trees from upstream)" >&2
   exit 1
@@ -24,6 +32,17 @@ fi
 # touched. Fetch it yourself first if you are pinning to something else.
 git -C "$UPSTREAM" fetch origin main --quiet
 PIN=$(git -C "$UPSTREAM" rev-parse "$REF")
+
+# Every vendored path must exist at the ref BEFORE anything is wiped. A ref
+# that lacks one (for example a commit from before the identity blueprint
+# existed) would otherwise fail half-way through the extract below, with
+# agent/ and packages/shared/ already deleted.
+for vendored in packages/shared supplier "${BLUEPRINTS[@]}"; do
+  if ! git -C "$UPSTREAM" cat-file -e "$PIN:$vendored" 2>/dev/null; then
+    echo "sync-core: $vendored does not exist at $REF (${PIN:0:12}) - nothing touched" >&2
+    exit 1
+  fi
+done
 
 # The pin this tree currently sits on, read out of VENDORED-FROM.md before that
 # file is rewritten at the end of this run. It is what makes "template-owned
@@ -50,7 +69,8 @@ fi
 # "$ROOT/supplier" is not a typo: a run that dies between the archive extract
 # and the mv below leaves the upstream directory name behind, and the next run
 # would then extract on top of it and mv a merged tree into place.
-rm -rf "$ROOT/packages/shared" "$ROOT/agent" "$ROOT/supplier" "$ROOT/contracts/marketplace/plutus.json"
+rm -rf "$ROOT/packages/shared" "$ROOT/agent" "$ROOT/supplier"
+for blueprint in "${BLUEPRINTS[@]}"; do rm -f "$ROOT/$blueprint"; done
 mkdir -p "$ROOT/packages"
 git -C "$UPSTREAM" archive "$REF" packages/shared | tar -x -C "$ROOT"
 # supplier/ -> agent/ is the single path rename this template owns.
@@ -58,13 +78,20 @@ git -C "$UPSTREAM" archive "$REF" packages/shared | tar -x -C "$ROOT"
 # .env.*.example) move too - a glob without dotglob silently drops them.
 git -C "$UPSTREAM" archive "$REF" supplier | tar -x -C "$ROOT"
 mv "$ROOT/supplier" "$ROOT/agent"
-# The compiled validator blueprint. Both live tx builders resolve it from
-# <repo>/contracts/marketplace/plutus.json - loadBlueprint() for the script
-# ADDRESS (postEscrow/postAdvert) and loadEscrowScript() for the compiled
-# code (Claim/Submit/Accept/Reclaim) - so without it the template cannot build
-# an escrow tx at all. It must stay pinned to the same upstream commit as the
-# code: a stale blueprint derives a DIFFERENT script address.
-git -C "$UPSTREAM" archive "$REF" contracts/marketplace/plutus.json | tar -x -C "$ROOT"
+# The compiled validator blueprints. The live tx builders resolve them from
+# <repo>/contracts/<project>/plutus.json:
+#   contracts/marketplace/plutus.json - loadBlueprint() for the legacy script
+#     ADDRESSES (postEscrow/postAdvert) and loadEscrowScript() for the legacy
+#     compiled code (Claim/Submit/Accept/Reclaim);
+#   contracts/identity-marketplace/plutus.json - loadIdentityBlueprint() for
+#     the address and compiled code of the escrow and advert that carry an
+#     agent_id (it applies IDENTITY_POLICY_ID to the escrow code).
+# Without them the template cannot build an escrow tx at all. They must stay
+# pinned to the same upstream commit as the code: a stale blueprint derives a
+# DIFFERENT script address.
+for blueprint in "${BLUEPRINTS[@]}"; do
+  git -C "$UPSTREAM" archive "$REF" "$blueprint" | tar -x -C "$ROOT"
+done
 
 # The wipe above removes agent/ wholesale, which also takes the template's OWN
 # files living under it - the custom-kind runtime (executor/, routes/custom.ts,
@@ -82,13 +109,19 @@ git -C "$UPSTREAM" archive "$REF" contracts/marketplace/plutus.json | tar -x -C 
 # tree whose whole promise is that it matches its pin. Report those instead.
 # The one path rename this template owns (supplier/ -> agent/) is applied to
 # the upstream listing before comparing.
-git -C "$ROOT" diff --name-only --diff-filter=D -- agent packages/shared | while read -r deleted; do
+#
+# The list is read in full BEFORE the first checkout: `git diff` can still hold
+# the index lock while it refreshes the index, so piping it straight into the
+# loop races `git checkout` for that lock and stops the run half-way.
+DELETED=$(git -C "$ROOT" diff --name-only --diff-filter=D -- agent packages/shared)
+while read -r deleted; do
+  [ -n "$deleted" ] || continue
   if printf '%s\n' "$PREV_PATHS" | grep -qxF -- "$deleted"; then
     echo "sync-core: $deleted was upstream at ${PREV_PIN:0:12} and is gone at ${PIN:0:12} - left deleted (upstream removed it)" >&2
   else
     git -C "$ROOT" checkout -- "$deleted"
   fi
-done
+done <<< "$DELETED"
 
 # Re-apply template-owned patches to vendored files. Conflict = hard stop.
 if ls "$ROOT"/scripts/patches/*.patch >/dev/null 2>&1; then
@@ -100,16 +133,19 @@ fi
 cat > "$ROOT/VENDORED-FROM.md" <<EOF
 # Vendored core
 
-\`packages/shared/\`, \`agent/\` (upstream \`supplier/\`) and
-\`contracts/marketplace/plutus.json\` (the compiled validator blueprint the tx
-builders read) are vendored from
+\`packages/shared/\`, \`agent/\` (upstream \`supplier/\`) and the compiled
+validator blueprints the tx builders read (\`contracts/marketplace/plutus.json\`
+for the legacy escrow and advert, \`contracts/identity-marketplace/plutus.json\`
+for the escrow and advert that carry an \`agent_id\`) are vendored from
 https://github.com/Apex-Fusion/agents-marketplace at commit \`$PIN\`
 ($(date -u +%Y-%m-%d)). Do not edit vendored files directly - change
-\`scripts/patches/*.patch\` and re-run \`scripts/sync-core.sh\`. The blueprint is
-pinned to this same commit on purpose: a blueprint from a different build
+\`scripts/patches/*.patch\` and re-run \`scripts/sync-core.sh\`. The blueprints
+are pinned to this same commit on purpose: a blueprint from a different build
 derives a different script address.
 EOF
 echo "vendored at $PIN"
 # The wipe took packages/shared/node_modules and agent/node_modules with it, so
-# workspace deps are unresolvable until the store is re-linked.
-echo "next: corepack pnpm install"
+# workspace deps are unresolvable until the store is re-linked. A new pin can
+# also change the dependencies of the vendored package.json files; the install
+# then rewrites pnpm-lock.yaml, which CI installs with --frozen-lockfile.
+echo "next: corepack pnpm install (commit pnpm-lock.yaml if it changes)"

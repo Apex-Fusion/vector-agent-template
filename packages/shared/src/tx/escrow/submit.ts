@@ -10,15 +10,24 @@
  *   2. datum.state === "Claimed"
  *   3. receiptHash is a 32-byte hex string
  *   4. validity upper-bound ≤ datum.deliver_by
+ *
+ * Both layouts (Part 2 §9.6): the escrow datum decides. A 16-field escrow
+ * (identity layout) also needs `lookupRecord`: the agent record becomes a
+ * reference input, and the builder refuses when a Submit check of §6.1 fails
+ * (identityEscrow.ts submitIdentity).
  */
 
 import type { ChainProvider, OutputReference } from "../../chain/ChainProvider.js";
-import { decodeEscrowDatum, encodeEscrowDatum } from "../../cbor/EscrowDatum.js";
+import { encodeEscrowDatum } from "../../cbor/EscrowDatum.js";
+import type { IdentityBlueprint } from "../blueprint.js";
+import type { RecordLookup } from "../identityRecord.js";
 import type { WalletKey, BuildResult } from "../types.js";
 import { TxConstructionError } from "../types.js";
 import { encodeTxBody, sha256Hex } from "../internal/testTxBody.js";
 import { mockSlotToWallclockMs } from "../internal/constants.js";
 import { detectCborBackend } from "../internal/cborBackend.js";
+import { readEscrow } from "../internal/layout.js";
+import { submitIdentity } from "./identityEscrow.js";
 import type { LiveOgmiosProvider } from "../../chain/LiveOgmiosProvider.js";
 
 export interface SubmitParams {
@@ -26,6 +35,12 @@ export interface SubmitParams {
   supplierKey: WalletKey;
   escrowRef: OutputReference;
   receiptHash: string;
+  /** Durable journal hook invoked with signed CBOR before broadcast. */
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
+  /** Identity layout only: finds the agent record (required for a 16-field escrow). */
+  lookupRecord?: RecordLookup;
+  /** Identity layout only. Default: loadIdentityBlueprint() (env IDENTITY_POLICY_ID). */
+  identityBlueprint?: IdentityBlueprint;
 }
 
 function isHex32(s: string): boolean {
@@ -46,21 +61,19 @@ export async function buildSubmitTx(
     );
   }
 
-  const utxo = await chain.queryUtxo(escrowRef);
-  if (utxo === null) {
-    throw new TxConstructionError(
-      "escrow ref not on chain",
-      `no UTxO at ${escrowRef.txHash}#${escrowRef.index}`,
-    );
+  const escrow = await readEscrow(chain, escrowRef);
+  if (escrow.layout === "identity") {
+    return submitIdentity({
+      chain,
+      escrow,
+      supplierKey,
+      receiptHash,
+      lookupRecord: params.lookupRecord,
+      identityBlueprint: params.identityBlueprint,
+      beforeSubmit: params.beforeSubmit,
+    });
   }
-  if (!utxo.datumHex) {
-    throw new TxConstructionError(
-      "escrow datum missing",
-      `UTxO ${escrowRef.txHash}#${escrowRef.index} has no inline datum`,
-    );
-  }
-
-  const datum = decodeEscrowDatum(utxo.datumHex);
+  const { utxo, datum } = escrow;
 
   // 1. Signer must match supplier identity.
   if (supplierKey.pubKeyHash !== datum.supplier_pkh) {
@@ -101,7 +114,7 @@ export async function buildSubmitTx(
   };
 
   // Live path: real Cardano CBOR via lucid-evolution.
-  if (detectCborBackend(chain) === "live") {
+  if (isLive) {
     const liveCborPath = "../internal/liveCbor.js";
     const { buildLiveTxForSubmit } = await import(/* @vite-ignore */ liveCborPath);
     return buildLiveTxForSubmit({
@@ -113,6 +126,7 @@ export async function buildSubmitTx(
       deliverBy: datum.deliver_by,
       tipMs,
       receiptHash: receiptHash.toLowerCase(),
+      beforeSubmit: params.beforeSubmit,
     });
   }
 
@@ -138,6 +152,7 @@ export async function buildSubmitTx(
   const txCborHex = encodeTxBody(body);
   const expectedTxHash = sha256Hex(txCborHex);
 
+  await params.beforeSubmit?.({ txCborHex, expectedTxHash });
   await chain.submitTx(txCborHex);
 
   return { txCborHex, expectedTxHash };

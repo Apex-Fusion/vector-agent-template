@@ -7,7 +7,7 @@
  */
 
 import type { ChainProvider, OutputReference } from "@marketplace/shared/chain";
-import { buildRetireAdvertTx, type WalletKey } from "@marketplace/shared/tx";
+import { buildRetireAdvertTx, type BuildResult, type WalletKey } from "@marketplace/shared/tx";
 
 export interface RetireAdvertFlowParams {
   chain: ChainProvider;
@@ -16,6 +16,8 @@ export interface RetireAdvertFlowParams {
   /** Milliseconds to wait for on-chain confirmation. Default: 120_000. */
   awaitTimeoutMs?: number;
   log?: (line: string) => void;
+  /** Durable journal hook invoked with the signed transaction before broadcast. */
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
 }
 
 export interface RetireAdvertFlowResult {
@@ -39,7 +41,7 @@ export async function runRetireAdvert(
 
   writeLog(`retiring advert ${advertRef.txHash}#${advertRef.index}`);
 
-  const built = await buildRetireAdvertTx({ chain, walletKey, advertRef });
+  const built = await buildRetireAdvertTx({ chain, walletKey, advertRef, beforeSubmit: params.beforeSubmit });
 
   writeLog(`submitted tx ${built.expectedTxHash}`);
   writeLog("awaiting confirmation");
