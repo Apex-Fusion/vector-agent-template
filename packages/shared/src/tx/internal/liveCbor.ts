@@ -172,6 +172,8 @@ export interface LiveRetireAdvertParams {
   advertRef: OutputReference;
   advertUtxo: Utxo;
   datum: AdvertDatum;
+  /** Runs after signing and before any broadcast. Rejection prevents submit. */
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
@@ -1141,6 +1143,7 @@ export async function buildLiveTxForRetireAdvert(
 
   const txCborHex = signed.toCBOR();
   const expectedTxHash = signed.toHash();
+  await params.beforeSubmit?.({ txCborHex, expectedTxHash });
   await chain.submitTx(txCborHex);
 
   return { txCborHex, expectedTxHash };

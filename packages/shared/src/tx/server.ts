@@ -14,10 +14,16 @@ export type { RefUtxoEnvKey } from "./internal/liveCbor.js";
 export { loadIdentityEscrowScript, loadIdentityAdvertScript } from "./internal/liveIdentityCbor.js";
 export { pkhToEnterpriseAddress } from "./internal/pkhAddress.js";
 export type {
-  LivePublishRefScriptsParams,
-  PublishRefScriptsBuildResult,
+  PublishedReference,
+  PublishReferenceScriptsArgs,
+  PublishReferenceScriptsTx,
+  ReferenceScript,
 } from "./internal/publishReferenceScripts.js";
-export { buildLiveTxForPublishReferenceScripts } from "./internal/publishReferenceScripts.js";
+export {
+  buildPublishReferenceScripts,
+  REFERENCE_SCRIPT_KEY_HASH,
+  referenceScriptAddress,
+} from "./internal/publishReferenceScripts.js";
 export type { SignedTransactionInfo, SignedTransactionFinancials } from "./internal/signedTransaction.js";
 export { inspectSignedTransaction, inspectSignedTransactionFinancials } from "./internal/signedTransaction.js";
 

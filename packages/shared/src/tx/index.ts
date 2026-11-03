@@ -33,11 +33,12 @@ export {
   agentWorkProblem,
   assertAgentCanWork,
 } from "./identityRecord.js";
-// Note: live-CBOR helpers (loadEscrowScript, loadAdvertScript,
-// buildLiveTxForPublishReferenceScripts, pkhToEnterpriseAddress) live in
-// "./server.js" — kept OUT of this index so the buyer's vite bundle
-// doesn't trace into lucid-evolution / CML WASM (sibling builders use
-// /* @vite-ignore */ dynamic imports for the same reason).
+// Note: the live-CBOR helpers (loadEscrowScript, loadAdvertScript,
+// pkhToEnterpriseAddress) and the reference-script publisher
+// (buildPublishReferenceScripts) live in "./server.js". They are kept OUT
+// of this index so the buyer's vite bundle doesn't trace into
+// lucid-evolution / CML WASM (sibling builders use /* @vite-ignore */
+// dynamic imports for the same reason).
 
 // Advert builders
 export type { PostAdvertParams } from "./advert/postAdvert.js";

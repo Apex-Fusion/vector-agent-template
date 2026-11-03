@@ -27,6 +27,8 @@ export interface RetireAdvertParams {
   advertRef: OutputReference;
   /** New advert only. Default: loadIdentityBlueprint() (env IDENTITY_POLICY_ID). */
   identityBlueprint?: IdentityBlueprint;
+  /** Durable journal hook invoked with the signed transaction before broadcast. Rejection prevents submit. */
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
 }
 
 export async function buildRetireAdvertTx(
@@ -36,7 +38,8 @@ export async function buildRetireAdvertTx(
 
   const advert = await readAdvert(chain, advertRef);
   if (advert.layout === "identity") {
-    return retireIdentityAdvert({ chain, walletKey, advert, identityBlueprint: params.identityBlueprint });
+    return retireIdentityAdvert({ chain, walletKey, advert, identityBlueprint: params.identityBlueprint,
+      beforeSubmit: params.beforeSubmit });
   }
   const { utxo, datum } = advert;
 
@@ -59,6 +62,7 @@ export async function buildRetireAdvertTx(
       advertRef,
       advertUtxo: utxo,
       datum,
+      beforeSubmit: params.beforeSubmit,
     });
   }
 
@@ -81,6 +85,7 @@ export async function buildRetireAdvertTx(
 
   const txCborHex = encodeTxBody(body);
   const expectedTxHash = sha256Hex(txCborHex);
+  await params.beforeSubmit?.({ txCborHex, expectedTxHash });
 
   await chain.submitTx(txCborHex);
 

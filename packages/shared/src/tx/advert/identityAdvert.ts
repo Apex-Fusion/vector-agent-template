@@ -145,6 +145,7 @@ export async function retireIdentityAdvert(args: {
   walletKey: WalletKey;
   advert: IdentityAdvertAt;
   identityBlueprint?: IdentityBlueprint;
+  beforeSubmit?: (built: BuildResult) => Promise<void>;
 }): Promise<BuildResult> {
   const { chain, walletKey, advert } = args;
   const datum = advert.datum;
@@ -170,6 +171,7 @@ export async function retireIdentityAdvert(args: {
     requiredSigners: [datum.supplier_pkh],
     window: nowWindow(tipMs, live ? vectorSlotClock() : MOCK_SLOT_CLOCK),
     reserveCollateral: false,
+    beforeSubmit: args.beforeSubmit,
   });
 }
 
