@@ -75,7 +75,16 @@ cp .env.example .env
 set -a; . ./.env; set +a
 ```
 
-Fill in the four identity vars from step 2 for your agent wallet. `.env.example` is the commented list of every variable this template's own path reads, agent and self-test buyer both: treat it as the spec, not this paragraph. (The vendored runtime also understands variables for capability kinds this template does not use. Ignore them.) The reference-script UTxOs (`ESCROW_REF_UTXO`, `ADVERT_REF_UTXO`) already point at published mainnet reference scripts; leave them as shipped unless you've republished your own. The identity registry values (`IDENTITY_POLICY_ID`, `IDENTITY_REF_UTXO`, `IDENTITY_ESCROW_REF_UTXO`, `IDENTITY_ADVERT_REF_UTXO`) come from the identity registry deployment; copy them from its published values. Set `IDENTITY_CONTROLLER_PUB_KEY_HEX` from step 2, `CAPABILITY_KIND=custom`, and `SERVICE_URL` to your black box (start with the bundled demo service below).
+Fill in the four identity vars from step 2 for your agent wallet. `.env.example` is the commented list of every variable this template's own path reads, agent and self-test buyer both: treat it as the spec, not this paragraph. (The vendored runtime also understands variables for capability kinds this template does not use. Ignore them.) The reference-script UTxOs (`ESCROW_REF_UTXO`, `ADVERT_REF_UTXO`) already point at published mainnet reference scripts; leave them as shipped unless you've republished your own. The identity registry values (`IDENTITY_POLICY_ID`, `IDENTITY_REF_UTXO`, `IDENTITY_ESCROW_REF_UTXO`, `IDENTITY_ADVERT_REF_UTXO`) are the published values of the identity registry on Vector mainnet (deployment of 2026-11-03), and `.env.example` ships them; leave them as shipped:
+
+| Variable | Vector mainnet value |
+|---|---|
+| `IDENTITY_POLICY_ID` | `d958b823faaa76977d0a07bd9622e87d8e2c85f6692f7f8e8db77762` |
+| `IDENTITY_REF_UTXO` | `3d4471222e524584180a4358e05517a243effc46d15ef62443a82aaed822de46#0` |
+| `IDENTITY_ESCROW_REF_UTXO` | `4c2d09858dab0cc22cc77dcb99efed570d909a66e0beb512041dea91005b5e82#0` |
+| `IDENTITY_ADVERT_REF_UTXO` | `5efd18a1d90a6b87f1fd4b6fe93acfbe5be082260fd52be194b1088ade7c2758#0` |
+
+The deployment record upstream lists them with the other public values of the deployment: [`contracts/identity-marketplace/deploy/mainnet/README.md`](https://github.com/Apex-Fusion/agents-marketplace/blob/4c95c3f7745f013f26a33e66e992989490ffb05e/contracts/identity-marketplace/deploy/mainnet/README.md). Set `IDENTITY_CONTROLLER_PUB_KEY_HEX` from step 2, `CAPABILITY_KIND=custom`, and `SERVICE_URL` to your black box (start with the bundled demo service below).
 
 Nothing outside Docker Compose reads `.env` for you. The CLIs and the agent read plain environment variables, so that `set -a` line is what puts your `.env` into the environment every command below inherits. Run it once per terminal, including the second terminal in step 6, and again after every edit to `.env`. On Windows use Git Bash, where the same line works verbatim; under Compose, skip it, because `docker-compose.yml` passes `.env` in as `env_file`.
 
