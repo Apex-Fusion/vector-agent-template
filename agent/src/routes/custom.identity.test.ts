@@ -193,6 +193,8 @@ interface SetupOptions {
   recordCapabilities?: string[] | null;
   /** The lovelace that the escrow output holds. Default: the payment and both bonds of its datum. */
   held?: bigint;
+  /** More settings for loadConfig, for example SERVICE_PRECHECK_URL. */
+  env?: Record<string, string>;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -268,6 +270,7 @@ function setup(options: SetupOptions = {}) {
     SERVICE_TIMEOUT_MS: "60000",
     ADVERT_MAX_PROCESSING_MS: "300000",
     ...(agentId === undefined ? {} : { AGENT_ID: agentId }),
+    ...options.env,
   });
   const jobs = new JobStore();
   const state = new SupplierState(1);
@@ -279,10 +282,10 @@ function setup(options: SetupOptions = {}) {
     jobs,
     identity: supplierIdentity(chain, 0, { blueprint: IDENTITY }),
   });
-  return { app, chain, jobs, state, submitted };
+  return { app, chain, jobs, state, submitted, escrow };
 }
 
-const service = vi.fn(async (url: string | URL | Request) => {
+const service = vi.fn(async (url: string | URL | Request, _init?: RequestInit) => {
   if (String(url) !== SERVICE_URL) throw new Error(`unexpected fetch ${String(url)}`);
   return new Response(OUTPUT, { status: 200 });
 });
@@ -295,8 +298,13 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-async function postJob(app: Application) {
-  return request(app).post("/v1/job").send({ escrow_ref: ESCROW_REF_STR, payload: PAYLOAD });
+async function postJob(app: Application, headers: Record<string, string> = {}) {
+  return request(app).post("/v1/job").set(headers).send({ escrow_ref: ESCROW_REF_STR, payload: PAYLOAD });
+}
+
+/** The headers of the n-th call that the runtime made to the service, with lower-case names. */
+function sentHeaders(call = 0): Record<string, string> {
+  return Object.fromEntries(new Headers(service.mock.calls[call]![1]!.headers).entries());
 }
 
 describe("custom capability: a new escrow of this supplier's own agent", () => {
@@ -455,6 +463,59 @@ describe("custom capability: the escrow against the advert", () => {
     expect(posted.status).toBe(202);
     await vi.waitFor(() => expect(jobs.get(posted.body.job_id)?.status).toBe("done"));
     expect(submitted.map((tx) => tx.body.type)).toEqual(["claim", "submit"]);
+  });
+});
+
+describe("custom capability: the job context for the service", () => {
+  const CONTEXT_NAMES = [
+    "x-vector-advert-model",
+    "x-vector-advert-ref",
+    "x-vector-buyer-pkh",
+    "x-vector-deliver-by-ms",
+    "x-vector-escrow-ref",
+    "x-vector-payment-lovelace",
+  ];
+
+  it("sends the escrow, the advert, the buyer, the payment and the deadline to the service as headers", async () => {
+    const { app, jobs, escrow } = setup();
+
+    const posted = await postJob(app);
+    expect(posted.status).toBe(202);
+    await vi.waitFor(() => expect(jobs.get(posted.body.job_id)?.status).toBe("done"));
+
+    const headers = sentHeaders();
+    expect(headers["x-vector-escrow-ref"]).toBe(ESCROW_REF_STR);
+    expect(headers["x-vector-advert-ref"]).toBe(`${ADVERT_REF.txHash}#${ADVERT_REF.index}`);
+    expect(headers["x-vector-advert-model"]).toBe(MODEL);
+    expect(headers["x-vector-buyer-pkh"]).toBe(BUYER_PKH);
+    expect(headers["x-vector-payment-lovelace"]).toBe("2000000");
+    expect(headers["x-vector-deliver-by-ms"]).toBe(String(escrow.deliver_by));
+  });
+
+  it("never passes a header of the buyer to the service, not even one with a name of the context", async () => {
+    const { app, jobs } = setup();
+
+    const posted = await postJob(app, {
+      "x-vector-escrow-ref": `${"0".repeat(64)}#9`,
+      "x-vector-advert-ref": `${"0".repeat(64)}#9`,
+      "x-vector-advert-model": "forged-model",
+      "x-vector-buyer-pkh": "0".repeat(56),
+      "x-vector-payment-lovelace": "999999999999",
+      "x-vector-deliver-by-ms": "1",
+      "x-vector-extra": "forged",
+      authorization: "Bearer forged",
+      cookie: "session=forged",
+    });
+    expect(posted.status).toBe(202);
+    await vi.waitFor(() => expect(jobs.get(posted.body.job_id)?.status).toBe("done"));
+
+    const headers = sentHeaders();
+    // The values are the ones of the chain, and the names are exactly the six and the content type.
+    expect(headers["x-vector-escrow-ref"]).toBe(ESCROW_REF_STR);
+    expect(headers["x-vector-buyer-pkh"]).toBe(BUYER_PKH);
+    expect(headers["x-vector-advert-model"]).toBe(MODEL);
+    expect(Object.keys(headers).sort()).toEqual(["content-type", ...CONTEXT_NAMES]);
+    expect(Object.values(headers).join(" ")).not.toContain("forged");
   });
 });
 

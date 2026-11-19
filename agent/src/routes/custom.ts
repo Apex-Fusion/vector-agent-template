@@ -65,6 +65,7 @@ import {
   type SupplierIdentity,
 } from "../identity/agent.js";
 import { escrowTermsRefusal } from "./customTerms.js";
+import { jobContext } from "../executor/context.js";
 
 /**
  * The subset of server.ts's (module-private) ResolvedDeps these handlers use,
@@ -274,6 +275,11 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
           `now ${nowMs} >= deliver_by ${escrowDatum.deliver_by}`);
       }
 
+      // ── 7b. The job context for the service ──────────────────────────
+      // Built from the escrow and the advert that this node read from the
+      // chain (see ../executor/context.ts). Nothing in it comes from the buyer.
+      const context = jobContext({ escrowRef: escrowRefStr, escrow: escrowDatum, advert });
+
       // ── 8. Acquire session slot ──────────────────────────────────────
       if (!deps.state.tryAcquire(escrowRefStr)) {
         return jsonError(res, 409, "supplier_busy", "supplier is already working another job");
@@ -350,6 +356,7 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
           identity: deps.identity,
         },
         executor,
+        context,
         jobId,
         escrowRef: escrowRefStr,
         claimedRef,

@@ -172,11 +172,20 @@ Needs its own funded wallet: `BUYER_PRIV_KEY_HEX`, plus `OGMIOS_URL`, `NETWORK_I
 The whole integration surface is one interface:
 
 ```ts
+interface JobContext {
+  escrowRef: string;        // the escrow of the job: "<64 hex>#<index>", in lower case
+  advertRef: string;        // the advert that the escrow names: "<64 hex>#<index>"
+  advertModel: string;      // the model text of the advert
+  buyerPkh: string;         // the key hash of the buyer: 56 hex characters
+  paymentLovelace: string;  // the quoted amount of the escrow, in lovelace
+  deliverByMs: number;      // the deliver-by time of the escrow, in POSIX milliseconds
+}
 interface ExecutorJob {
   capabilityId: string;
   requestPayload: string;   // opaque request string, hashed into the escrow/receipt
   deadlineMs: number;       // remaining time budget, do not exceed it
   jobRef: string;           // escrow reference, for logging/correlation
+  context: JobContext;      // what the agent read from the chain about the escrow
 }
 interface ExecutorResult {
   outputPayload: string;    // opaque output string, hashed into the receipt
@@ -186,6 +195,17 @@ execute(job: ExecutorJob): Promise<ExecutorResult>
 ```
 
 **The common case needs no code.** The default implementation (`agent/src/executor/httpCallout.ts`) POSTs `requestPayload` as the raw request body to `SERVICE_URL`, with your response body becoming `outputPayload`. Point `SERVICE_URL` at anything that speaks HTTP.
+
+**What your service receives.** Each call to your service carries the job context as six headers. The agent reads the values from the chain, so a buyer cannot set them. The agent builds the headers of each call itself and passes no header of the buyer on. A header that a buyer sends with one of these names never reaches your service.
+
+| Header | Value |
+|---|---|
+| `x-vector-escrow-ref` | The escrow of the job: `<64 hex>#<index>`, in lower case. |
+| `x-vector-advert-ref` | The advert that the escrow names: `<64 hex>#<index>`. |
+| `x-vector-advert-model` | The model text of the advert, percent-encoded. Decode it with `decodeURIComponent`. A plain name stays as it is. |
+| `x-vector-buyer-pkh` | The key hash of the buyer: 56 hex characters. |
+| `x-vector-payment-lovelace` | The quoted amount of the escrow, in lovelace. |
+| `x-vector-deliver-by-ms` | The deliver-by time of the escrow, in POSIX milliseconds. |
 
 **One thing to know about the payload:** `try-it` builds the request payload as the canonical JSON of a one-element message *array*, `canonicalize([{ content: <your file>, role: "user" }])`, because that is the preimage the vendored escrow builder hashes when it is given messages. Your service receives that whole array as the POST body, not your bare content:
 

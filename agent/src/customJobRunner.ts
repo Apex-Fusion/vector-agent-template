@@ -52,13 +52,15 @@ import { createHash } from "crypto";
 
 import type { RunChatJobDeps } from "./jobRunner.js";
 import type { ChatJobResponsePayload } from "./jobs.js";
-import type { Executor } from "./executor/executor.js";
+import type { Executor, JobContext } from "./executor/executor.js";
 import { ExecutorError } from "./executor/executor.js";
 import { identityOptions, receiptAgentDid } from "./identity/agent.js";
 
 export interface RunCustomJobParams {
   deps: RunChatJobDeps;            // reuse the vendored deps type unchanged
   executor: Executor;
+  /** The context of the job. The route builds it from the chain, and sends it on the call before the Claim too. */
+  context: JobContext;
   jobId: string;
   escrowRef: string;
   claimedRef: OutputReference;
@@ -133,6 +135,7 @@ export async function runCustomJob(params: RunCustomJobParams): Promise<void> {
         requestPayload: requestBody.payload,
         deadlineMs,
         jobRef: escrowRef,
+        context: params.context,
       });
       inference = {
         content: result.outputPayload,

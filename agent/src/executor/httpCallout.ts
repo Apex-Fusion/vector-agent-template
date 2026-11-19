@@ -1,4 +1,5 @@
 import { type Executor, type ExecutorJob, type ExecutorResult, ExecutorError } from "./executor.js";
+import { contextHeaders } from "./context.js";
 
 export interface HttpCalloutOpts {
   serviceUrl: string;
@@ -7,13 +8,18 @@ export interface HttpCalloutOpts {
   contentType?: string;
 }
 
-/** Default Executor: POST the payload to the operator's service, return the body. */
+/**
+ * Default Executor: POST the payload to the operator's service, return the body.
+ * The call carries the job context as six x-vector headers (./context.ts). The
+ * runtime builds the header set here. It passes no header of the buyer on.
+ */
 export function makeHttpCalloutExecutor(opts: HttpCalloutOpts): Executor {
   return {
     async execute(job: ExecutorJob): Promise<ExecutorResult> {
       const budget = Math.max(1, Math.min(opts.timeoutMs, job.deadlineMs));
       const headers: Record<string, string> = {
         "content-type": opts.contentType ?? "application/json",
+        ...contextHeaders(job.context),
       };
       if (opts.authHeader) headers.authorization = opts.authHeader;
       let res: Response;
