@@ -88,6 +88,7 @@ import {
 } from "./identity/agent.js";
 import { makeHttpCalloutExecutor } from "./executor/httpCallout.js";
 import { makeCustomHandler, makeGetCustomJobHandler, type CustomRouteDeps } from "./routes/custom.js";
+import { mountAgentCard } from "./routes/customCard.js";
 
 export interface SupplierDeps {
   chain: ChainProvider;
@@ -1805,6 +1806,7 @@ export function createApp(deps: SupplierDeps): Application {
       contentType: resolved.config.serviceContentType,
       precheckUrl: resolved.config.servicePrecheckUrl || undefined,
     });
+    mountAgentCard(app, resolved);
     app.post("/v1/job", express.json({ limit: "1mb" }), makeCustomHandler(resolved));
     app.get("/v1/job/:jobId", makeGetCustomJobHandler(resolved));
   } else if (resolved.config.capabilityKind === "chat-session") {

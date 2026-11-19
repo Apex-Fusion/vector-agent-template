@@ -99,3 +99,45 @@ describe("SERVICE_PRECHECK_URL", () => {
     expect(c.servicePrecheckUrl).toBe("");
   });
 });
+
+describe("PUBLIC_ORIGIN", () => {
+  it("is empty when unset or empty, so that the agent serves no card", () => {
+    expect(loadConfig({ ...CUSTOM_BASE }).publicOrigin).toBe("");
+    expect(loadConfig({ ...CUSTOM_BASE, PUBLIC_ORIGIN: "" }).publicOrigin).toBe("");
+  });
+  it("keeps the origin of an https URL", () => {
+    expect(loadConfig({ ...CUSTOM_BASE, PUBLIC_ORIGIN: "https://Agent.Example.com:443/" }).publicOrigin)
+      .toBe("https://agent.example.com");
+  });
+  it("rejects an http URL, a path and a text that is not a URL", () => {
+    for (const bad of ["http://agent.example.com", "https://agent.example.com/agent", "agent.example.com"]) {
+      expect(() => loadConfig({ ...CUSTOM_BASE, PUBLIC_ORIGIN: bad })).toThrow(/PUBLIC_ORIGIN/);
+    }
+  });
+  it("is not read for another capability kind", () => {
+    const c = loadConfig({ ...BASE, CAPABILITY_KIND: "chat", OLLAMA_URL: "http://127.0.0.1:11434", PUBLIC_ORIGIN: "nope" });
+    expect(c.publicOrigin).toBe("");
+  });
+});
+
+describe("RELEASE_WATCHER", () => {
+  const LIVE = { ...CUSTOM_BASE, LIVE_CHAIN: "1" };
+  it("is off when unset, empty or 0", () => {
+    expect(loadConfig({ ...CUSTOM_BASE }).releaseWatcher).toBe(false);
+    expect(loadConfig({ ...CUSTOM_BASE, RELEASE_WATCHER: "" }).releaseWatcher).toBe(false);
+    expect(loadConfig({ ...CUSTOM_BASE, RELEASE_WATCHER: "0" }).releaseWatcher).toBe(false);
+  });
+  it("is on for 1 with LIVE_CHAIN=1", () => {
+    expect(loadConfig({ ...LIVE, RELEASE_WATCHER: "1" }).releaseWatcher).toBe(true);
+  });
+  it("rejects any other value, so that a typo does not leave it off without a word", () => {
+    expect(() => loadConfig({ ...LIVE, RELEASE_WATCHER: "true" })).toThrow(/RELEASE_WATCHER/);
+  });
+  it("rejects 1 without LIVE_CHAIN=1, because a Release is a transaction", () => {
+    expect(() => loadConfig({ ...CUSTOM_BASE, RELEASE_WATCHER: "1" })).toThrow(/RELEASE_WATCHER.*LIVE_CHAIN/);
+  });
+  it("is not read for another capability kind", () => {
+    const c = loadConfig({ ...BASE, CAPABILITY_KIND: "chat", OLLAMA_URL: "http://127.0.0.1:11434", RELEASE_WATCHER: "yes" });
+    expect(c.releaseWatcher).toBe(false);
+  });
+});

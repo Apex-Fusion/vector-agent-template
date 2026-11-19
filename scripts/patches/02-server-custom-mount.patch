@@ -1,17 +1,18 @@
 diff --git i/agent/src/server.ts w/agent/src/server.ts
-index 48a898d..83d74d2 100644
+index 48a898d..7ef4820 100644
 --- i/agent/src/server.ts
 +++ w/agent/src/server.ts
-@@ -86,6 +86,8 @@ import {
+@@ -86,6 +86,9 @@ import {
    decodeAdvert, decodeEscrow, identityOptions, identityRefusal, newEscrowRefusal, ownAgentId, supplierIdentity,
    type SupplierIdentity,
  } from "./identity/agent.js";
 +import { makeHttpCalloutExecutor } from "./executor/httpCallout.js";
 +import { makeCustomHandler, makeGetCustomJobHandler, type CustomRouteDeps } from "./routes/custom.js";
++import { mountAgentCard } from "./routes/customCard.js";
  
  export interface SupplierDeps {
    chain: ChainProvider;
-@@ -1761,6 +1763,50 @@ export function createApp(deps: SupplierDeps): Application {
+@@ -1761,6 +1764,51 @@ export function createApp(deps: SupplierDeps): Application {
      // fits comfortably under 16mb.
      app.post("/v1/ocr/extract", express.json({ limit: "16mb" }), makeOcrHandler(resolved));
      app.get("/v1/ocr/extract/:jobId", makeGetOcrJobHandler(resolved));
@@ -57,6 +58,7 @@ index 48a898d..83d74d2 100644
 +      contentType: resolved.config.serviceContentType,
 +      precheckUrl: resolved.config.servicePrecheckUrl || undefined,
 +    });
++    mountAgentCard(app, resolved);
 +    app.post("/v1/job", express.json({ limit: "1mb" }), makeCustomHandler(resolved));
 +    app.get("/v1/job/:jobId", makeGetCustomJobHandler(resolved));
    } else if (resolved.config.capabilityKind === "chat-session") {

@@ -232,6 +232,20 @@ The agent has four codes of its own for the check: `precheck_timeout` and `prech
 
 A refusal costs no Claim fee. The buyer can send the same job again, or Reclaim the escrow after deliver-by. If you replace `makeHttpCalloutExecutor` with an executor of your own, add the optional method `precheck(job)` to it. It takes the request and the context, and it returns `{ ok: true }` or `{ ok: false, status, code, message }`.
 
+**Serve an agent card.** Set `PUBLIC_ORIGIN` to the https origin at which buyers reach this agent, for example `https://agent.example.com`. It must be the origin of the `endpoint` in your agent record. The agent then serves `GET /.well-known/agent-card.json` and answers `GET /` with a 200. The card is an A2A card with one interface: `<PUBLIC_ORIGIN>/v1/job`, with the binding `vector-job-v1` and the version `1`. The identity gateway lists your agent in its catalogs when it finds this card at the endpoint of your record. The card needs no data from the chain, so it is live before you register the record. It names the capability and the model of your advert when the agent can read the advert, and it has no skill when the agent cannot. Without `PUBLIC_ORIGIN` the agent serves neither route: both answer 404, as before. The origin comes from the setting only, never from a header of the request.
+
+**Release a Submitted escrow that the buyer did not accept.** Set `RELEASE_WATCHER=1`. It needs `LIVE_CHAIN=1`. Each minute the agent reads the escrow addresses, and it releases each Submitted escrow of its own whose 600-second accept window has ended. An escrow is its own when its supplier key is the key of this agent. An escrow that names an agent must name the agent of this node. The agent releases one escrow at a time, inside the wallet lock of the Claim and the Submit, with the Release transaction of the vendored core. It never releases before the window ends. After a failed release it waits five minutes before it tries that escrow again. It reads the chain, so it also releases the escrows that were Submitted before a restart. A release costs a chain fee, like each script transaction. Unset, empty or `0` is off, and `1` is on. Any other value stops the boot.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `SERVICE_PRECHECK_URL` | unset | The check before the Claim. Unset: no check. |
+| `PUBLIC_ORIGIN` | unset | The agent card, and a 200 on `GET /`. Unset: neither. |
+| `RELEASE_WATCHER` | unset (off) | The release watcher. Needs `LIVE_CHAIN=1`. |
+
+With the three settings unset, the agent answers each request as it did before. The context headers and the checks of the escrow against your advert have no setting: they apply to every job. To give an agent that runs today a card and nothing else, set `PUBLIC_ORIGIN` only.
+
+**Three runtimes in front of one service.** Each runtime needs its own key, advert and port, and the runtimes share one service URL. The check before the Claim keeps the one job slot of the service. See `docs/THREE-RUNTIMES.md`.
+
 **One thing to know about the payload:** `try-it` builds the request payload as the canonical JSON of a one-element message *array*, `canonicalize([{ content: <your file>, role: "user" }])`, because that is the preimage the vendored escrow builder hashes when it is given messages. Your service receives that whole array as the POST body, not your bare content:
 
 ```

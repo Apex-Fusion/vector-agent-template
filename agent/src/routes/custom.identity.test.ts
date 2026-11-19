@@ -282,7 +282,7 @@ function setup(options: SetupOptions = {}) {
     jobs,
     identity: supplierIdentity(chain, 0, { blueprint: IDENTITY }),
   });
-  return { app, chain, jobs, state, submitted, escrow };
+  return { app, chain, jobs, state, submitted, escrow, config };
 }
 
 const PRECHECK_URL = "http://service.test/precheck";
@@ -604,6 +604,63 @@ describe("custom capability: the check of the service before the Claim", () => {
     expect(posted.status).toBe(503);
     expect(posted.body).toMatchObject({ error: "precheck_unreachable", reason: "precheck_unreachable" });
     expect(submitted).toHaveLength(0);
+  });
+});
+
+describe("custom capability: the agent card", () => {
+  const env = { PUBLIC_ORIGIN: "https://agent.example" };
+
+  it("serves the card with the capability and the model of the advert, and a 200 on GET /", async () => {
+    const { app } = setup({ env });
+
+    const card = await request(app).get("/.well-known/agent-card.json");
+
+    expect(card.status).toBe(200);
+    expect(card.body).toMatchObject({
+      name: MODEL,
+      capabilities: {},
+      defaultInputModes: ["application/json"],
+      defaultOutputModes: ["application/json"],
+      skills: [{ id: CAPABILITY, name: CAPABILITY }],
+      supportedInterfaces: [{ url: "https://agent.example/v1/job", protocolBinding: "vector-job-v1", protocolVersion: "1" }],
+    });
+    expect((await request(app).get("/")).status).toBe(200);
+  });
+});
+
+describe("custom capability: every new setting unset", () => {
+  // The agent of today: no check, no card, no watcher. Its answers do not change.
+  it("serves neither the card nor a page on GET /, as before", async () => {
+    const { app } = setup();
+
+    expect((await request(app).get("/")).status).toBe(404);
+    expect((await request(app).get("/.well-known/agent-card.json")).status).toBe(404);
+  });
+
+  it("has empty settings", () => {
+    const { config } = setup();
+    expect(config).toMatchObject({ servicePrecheckUrl: "", publicOrigin: "", releaseWatcher: false });
+  });
+
+  it("makes one call to the service for a job, to SERVICE_URL, with the body and the headers of the job call only", async () => {
+    const { app, jobs } = setup();
+
+    const posted = await postJob(app);
+    expect(posted.status).toBe(202);
+    await vi.waitFor(() => expect(jobs.get(posted.body.job_id)?.status).toBe("done"));
+
+    expect(service).toHaveBeenCalledTimes(1);
+    expect(String(service.mock.calls[0]![0])).toBe(SERVICE_URL);
+    expect(service.mock.calls[0]![1]).toMatchObject({ method: "POST", body: PAYLOAD });
+    expect(Object.keys(sentHeaders()).sort()).toEqual([
+      "content-type",
+      "x-vector-advert-model",
+      "x-vector-advert-ref",
+      "x-vector-buyer-pkh",
+      "x-vector-deliver-by-ms",
+      "x-vector-escrow-ref",
+      "x-vector-payment-lovelace",
+    ]);
   });
 });
 
