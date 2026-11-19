@@ -12,12 +12,13 @@ A public, MIT-licensed GitHub template. Clone it, plug in your service, and you 
 
 ```
 README.md            # you are here
-docs/                 # LIFECYCLE.md, WALLET.md, GOTCHAS.md: the operator detail
+docs/                 # LIFECYCLE.md, WALLET.md, GOTCHAS.md, TRUST-LAYER.md, THREE-RUNTIMES.md: the operator detail
 agent/                 # supplier runtime + your integration seam (executor/)
 packages/shared/       # vendored chain core, byte-identical to the upstream pin
 try-it/                 # self-test buyer: commission one job from your own agent, verify offline
 examples/                # echo-service.mjs, a fake black box, and payload.txt for step 7
 deploy/                 # docker-compose.yml
+.env.example            # every setting, with SERVICE_PRECHECK_URL, PUBLIC_ORIGIN and RELEASE_WATCHER
 scripts/sync-core.sh    # re-vendor the chain core from a pinned upstream commit
 ```
 
@@ -222,13 +223,15 @@ The call is a `POST` to that URL. The body is the request of the buyer: the same
 | Your service answers | The agent does |
 |---|---|
 | A 2xx status | It claims the escrow, and then it calls your service for the job. |
-| A status from 400 to 599 | It builds no Claim. The escrow stays Open. The buyer gets that status. |
+| A status from 400 to 599 | It builds no Claim. The escrow stays Open. The buyer gets that status and your code. |
+| 409 with the code `busy` | It builds no Claim. The buyer gets the answer of an agent that is busy: 409 with the code `supplier_busy`. Buyer clients retry that code. |
 | A 3xx status | It builds no Claim. The buyer gets 502. The agent does not follow a redirect. |
 | No answer in 10 seconds, or no connection | It builds no Claim. The buyer gets 503. |
+| 401 | It builds no Claim. The buyer gets 503 with the code `precheck_failed`. A 401 means that your service refused the token of the agent (`SERVICE_AUTH_HEADER`). That is a fault of the operator, not of the buyer. The log of the agent names the cause. |
 
 The buyer gets a JSON body with the keys `error`, `reason` and `message`. `error` and `reason` hold the same code. The code comes from the key `error` of the JSON body of your refusal: letters, digits, `_`, `.` and `-`, at most 64 characters. When your answer has no such code, the code is `precheck_refused`. The words come from the key `message`: the agent makes them one line and cuts them to 500 characters. An answer as short as `{"error":"busy"}` is enough.
 
-The agent has four codes of its own for the check: `precheck_timeout` and `precheck_unreachable` (both 503), `precheck_failed` (503, when an executor of your own throws) and `precheck_bad_status` (502).
+The agent has four codes of its own for the check: `precheck_timeout` and `precheck_unreachable` (both 503), `precheck_failed` (503, when an executor of your own throws, or when your service answers 401) and `precheck_bad_status` (502).
 
 A refusal costs no Claim fee. The buyer can send the same job again, or Reclaim the escrow after deliver-by. If you replace `makeHttpCalloutExecutor` with an executor of your own, add the optional method `precheck(job)` to it. It takes the request and the context, and it returns `{ ok: true }` or `{ ok: false, status, code, message }`.
 

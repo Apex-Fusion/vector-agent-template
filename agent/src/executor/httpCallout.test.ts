@@ -201,6 +201,36 @@ describe("httpCallout executor: the check before the Claim", () => {
     const ex = makeHttpCalloutExecutor({ serviceUrl: `${base}/ok`, timeoutMs: 2_000, precheckUrl: "http://127.0.0.1:9/precheck" });
     expect(await ex.precheck!(job)).toMatchObject({ ok: false, status: 503, code: "precheck_unreachable" });
   });
+
+  it("maps a 401 of the service to a refusal 503 of the runtime, and names the cause in the log without the token", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const verdict = await precheckAt("/status/401").precheck!(job);
+
+      expect(verdict).toEqual({
+        ok: false,
+        status: 503,
+        code: "precheck_failed",
+        message: "The runtime could not ask the service for the check before the Claim.",
+      });
+      expect(warn).toHaveBeenCalledTimes(1);
+      const line = String(warn.mock.calls[0]![0]);
+      expect(line).toContain("401");
+      expect(line).toContain("SERVICE_AUTH_HEADER");
+      expect(line).not.toContain("Bearer t0");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("keeps a 403 of the service as it is, the twin of the 401", async () => {
+    expect(await precheckAt("/status/403").precheck!(job)).toEqual({
+      ok: false,
+      status: 403,
+      code: "approval_digest_mismatch",
+      message: "The digest does not match.",
+    });
+  });
 });
 
 describe("httpCallout executor: no answer to the check before the Claim", () => {

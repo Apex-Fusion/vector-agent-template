@@ -162,6 +162,13 @@ export function makeHttpCalloutExecutor(opts: HttpCalloutOpts): Executor {
         return refuse(502, "precheck_bad_status",
           `The service answered the check before the Claim with HTTP ${res.status}. That is neither a go nor a refusal.`);
       }
+      if (res.status === 401) {
+        // The service refused the token of the runtime (SERVICE_AUTH_HEADER). That is a fault of the
+        // operator, not of the buyer, and a buyer client reads 401 as "my credentials". The buyer gets 503.
+        void res.body?.cancel().catch(() => undefined);
+        console.warn("[precheck] the service answered 401: it refused the token of SERVICE_AUTH_HEADER, so the runtime cannot ask it");
+        return refuse(503, "precheck_failed", "The runtime could not ask the service for the check before the Claim.");
+      }
       return refusalOf(res.status, await readBounded(res, PRECHECK_BODY_LIMIT));
     } finally {
       clearTimeout(timer);
