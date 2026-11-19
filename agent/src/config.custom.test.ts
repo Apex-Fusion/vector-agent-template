@@ -65,3 +65,37 @@ describe("CAPABILITY_KIND=custom", () => {
     expect(c.advertMaxProcessingMs).toBe(0);
   });
 });
+
+describe("SERVICE_PRECHECK_URL", () => {
+  it("is empty when unset, so that no check runs before the Claim", () => {
+    expect(loadConfig({ ...CUSTOM_BASE }).servicePrecheckUrl).toBe("");
+  });
+  it("is empty when set to an empty text", () => {
+    expect(loadConfig({ ...CUSTOM_BASE, SERVICE_PRECHECK_URL: "" }).servicePrecheckUrl).toBe("");
+  });
+  it("keeps an http URL and an https URL as they are", () => {
+    expect(loadConfig({ ...CUSTOM_BASE, SERVICE_PRECHECK_URL: "http://service:9091/precheck" }).servicePrecheckUrl)
+      .toBe("http://service:9091/precheck");
+    expect(loadConfig({ ...CUSTOM_BASE, SERVICE_PRECHECK_URL: "https://service.example/precheck?v=1" }).servicePrecheckUrl)
+      .toBe("https://service.example/precheck?v=1");
+  });
+  it("rejects a text that is not a URL", () => {
+    expect(() => loadConfig({ ...CUSTOM_BASE, SERVICE_PRECHECK_URL: "service/precheck" })).toThrow(/SERVICE_PRECHECK_URL/);
+  });
+  it("rejects a URL with another scheme", () => {
+    expect(() => loadConfig({ ...CUSTOM_BASE, SERVICE_PRECHECK_URL: "ftp://service/precheck" })).toThrow(/SERVICE_PRECHECK_URL/);
+  });
+  it("rejects a URL with a user name or a password", () => {
+    expect(() => loadConfig({ ...CUSTOM_BASE, SERVICE_PRECHECK_URL: "http://user:secret@service/precheck" }))
+      .toThrow(/SERVICE_PRECHECK_URL/);
+  });
+  it("is not read for another capability kind, so that a bad value in a shared .env does not stop the boot", () => {
+    const c = loadConfig({
+      ...BASE,
+      CAPABILITY_KIND: "chat",
+      OLLAMA_URL: "http://127.0.0.1:11434",
+      SERVICE_PRECHECK_URL: "not a url",
+    });
+    expect(c.servicePrecheckUrl).toBe("");
+  });
+});

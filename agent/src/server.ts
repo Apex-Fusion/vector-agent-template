@@ -1803,6 +1803,7 @@ export function createApp(deps: SupplierDeps): Application {
       timeoutMs: resolved.config.serviceTimeoutMs,
       authHeader: resolved.config.serviceAuthHeader || undefined,
       contentType: resolved.config.serviceContentType,
+      precheckUrl: resolved.config.servicePrecheckUrl || undefined,
     });
     app.post("/v1/job", express.json({ limit: "1mb" }), makeCustomHandler(resolved));
     app.get("/v1/job/:jobId", makeGetCustomJobHandler(resolved));

@@ -87,6 +87,7 @@
 
 import { isIP } from "node:net";
 import { parseAgentId } from "./identity/agent.js";
+import { loadRuntimeSettings, type RuntimeSettings } from "./runtimeSettings.js";
 
 const HEX64_RE = /^[0-9a-fA-F]{64}$/;
 const TX_HASH_RE = /^[0-9a-fA-F]{64}$/;
@@ -195,7 +196,7 @@ export interface Paper2AgentConfig {
   freeCalls?: boolean;
 }
 
-export interface SupplierConfig {
+export interface SupplierConfig extends RuntimeSettings {
   supplierPrivKeyHex: string;
   ogmiosUrl: string;
   /** Empty string when capabilityKind="tts" or llmBackend="openai". */
@@ -730,6 +731,9 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
     walletHealthIntervalMs = Number(whIntervalStr);
   }
 
+  // Settings that the template adds for the custom kind (SERVICE_PRECHECK_URL and others).
+  const runtimeSettings = loadRuntimeSettings(env, capabilityKind === "custom");
+
   const resellerFields = [
     "RESELLER_DATABASE_URL",
     "RESELLER_RESERVE_USD",
@@ -888,6 +892,7 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
     serviceAuthHeader,
     serviceContentType,
     advertMaxProcessingMs,
+    ...runtimeSettings,
     liveChain,
     walletHealthIntervalMs,
     reseller,

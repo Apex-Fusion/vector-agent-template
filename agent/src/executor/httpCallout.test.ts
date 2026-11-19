@@ -1,7 +1,11 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { createServer, type Server } from "node:http";
-import { makeHttpCalloutExecutor } from "./httpCallout.js";
-import { ExecutorError, type JobContext } from "./executor.js";
+import { once } from "node:events";
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
+import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
+import { makeHttpCalloutExecutor, PRECHECK_TIMEOUT_MS } from "./httpCallout.js";
+import { ExecutorError, type JobContext, type PrecheckJob } from "./executor.js";
+
+/** Every request that the test server got, with its body. */
+const seen: Array<{ method?: string; url?: string; headers: IncomingHttpHeaders; body: string }> = [];
 
 let server: Server;
 let base: string;
@@ -10,12 +14,23 @@ beforeAll(async () => {
     let body = "";
     req.on("data", (c) => (body += c));
     req.on("end", () => {
+      seen.push({ method: req.method, url: req.url, headers: req.headers, body });
       if (req.url === "/ok") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ echoed: body, auth: req.headers.authorization ?? null }));
       } else if (req.url === "/echo") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ method: req.method, headers: req.headers, body }));
+      } else if (req.url?.startsWith("/status/")) {
+        res.writeHead(Number(req.url.slice("/status/".length)), { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "approval_digest_mismatch", message: "The digest does not match." }));
+      } else if (req.url === "/plain") {
+        res.writeHead(403, { "content-type": "text/plain" }).end("forbidden");
+      } else if (req.url === "/odd") {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "not a code!", message: `line one\nline two\u0007 ${"x".repeat(1_000)}` }));
+      } else if (req.url === "/redirect") {
+        res.writeHead(302, { location: `${base}/echo` }).end();
       } else if (req.url === "/slow") {
         setTimeout(() => res.writeHead(200).end("late"), 5_000);
       } else {
@@ -111,5 +126,113 @@ describe("httpCallout executor: the job context", () => {
     const { headers } = await sent({ advertModel: model });
     expect(headers["x-vector-advert-model"]).toBe(encodeURIComponent(model));
     expect(decodeURIComponent(headers["x-vector-advert-model"]!)).toBe(model);
+  });
+});
+
+describe("httpCallout executor: the check before the Claim", () => {
+  const job: PrecheckJob = { capabilityId: "x.y.z.v1", requestPayload: '{"a":1}', jobRef: "ref#0", context: CONTEXT };
+  const precheckAt = (path: string) =>
+    makeHttpCalloutExecutor({ serviceUrl: `${base}/ok`, timeoutMs: 2_000, precheckUrl: `${base}${path}`, authHeader: "Bearer t0" });
+
+  afterEach(() => {
+    seen.length = 0;
+  });
+
+  it("has no check when no URL is set", () => {
+    expect(makeHttpCalloutExecutor({ serviceUrl: `${base}/ok`, timeoutMs: 2_000 }).precheck).toBeUndefined();
+  });
+
+  it("POSTs the payload with the context and the authorization header to the URL of the check", async () => {
+    expect(await precheckAt("/echo").precheck!(job)).toEqual({ ok: true });
+
+    expect(seen).toHaveLength(1);
+    const [call] = seen;
+    expect(call!.method).toBe("POST");
+    expect(call!.url).toBe("/echo");
+    expect(call!.body).toBe('{"a":1}');
+    expect(call!.headers["content-type"]).toBe("application/json");
+    expect(call!.headers.authorization).toBe("Bearer t0");
+    expect(call!.headers["x-vector-escrow-ref"]).toBe(CONTEXT.escrowRef);
+    expect(call!.headers["x-vector-advert-ref"]).toBe(CONTEXT.advertRef);
+    expect(call!.headers["x-vector-advert-model"]).toBe("my-product-v1");
+    expect(call!.headers["x-vector-buyer-pkh"]).toBe(CONTEXT.buyerPkh);
+    expect(call!.headers["x-vector-payment-lovelace"]).toBe("2000000");
+    expect(call!.headers["x-vector-deliver-by-ms"]).toBe("1900000000000");
+  });
+
+  it.each([200, 204])("takes the status %i as go", async (status) => {
+    expect(await precheckAt(`/status/${status}`).precheck!(job)).toEqual({ ok: true });
+  });
+
+  it.each([400, 403, 409, 422, 500, 503])("refuses with the status %i and the code and the text of the service", async (status) => {
+    expect(await precheckAt(`/status/${status}`).precheck!(job)).toEqual({
+      ok: false,
+      status,
+      code: "approval_digest_mismatch",
+      message: "The digest does not match.",
+    });
+  });
+
+  it("gives a refusal without a JSON body the status, a default code and a default text", async () => {
+    expect(await precheckAt("/plain").precheck!(job)).toEqual({
+      ok: false,
+      status: 403,
+      code: "precheck_refused",
+      message: "The service refused the job before the Claim (HTTP 403).",
+    });
+  });
+
+  it("replaces a code that is not a plain code, and flattens and cuts a long text", async () => {
+    const verdict = await precheckAt("/odd").precheck!(job);
+    if (verdict.ok) throw new Error("the check must refuse");
+    expect(verdict).toMatchObject({ status: 403, code: "precheck_refused" });
+    expect(verdict.message.startsWith("line one line two ")).toBe(true);
+    expect(verdict.message).toHaveLength(500);
+    expect(verdict.message).not.toMatch(/[\u0000-\u001f]/);
+  });
+
+  it("does not follow a redirect: the answer is a refusal 502, and the target gets no call", async () => {
+    const verdict = await precheckAt("/redirect").precheck!(job);
+    expect(verdict).toMatchObject({ ok: false, status: 502, code: "precheck_bad_status" });
+    expect(seen.map((call) => call.url)).toEqual(["/redirect"]);
+  });
+
+  it("refuses with 503 when the service cannot be reached", async () => {
+    const ex = makeHttpCalloutExecutor({ serviceUrl: `${base}/ok`, timeoutMs: 2_000, precheckUrl: "http://127.0.0.1:9/precheck" });
+    expect(await ex.precheck!(job)).toMatchObject({ ok: false, status: 503, code: "precheck_unreachable" });
+  });
+});
+
+describe("httpCallout executor: no answer to the check before the Claim", () => {
+  const job: PrecheckJob = { capabilityId: "x.y.z.v1", requestPayload: '{"a":1}', jobRef: "ref#0", context: CONTEXT };
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("waits 10 seconds for the answer", () => {
+    expect(PRECHECK_TIMEOUT_MS).toBe(10_000);
+  });
+
+  it("refuses with 503 when there is no answer in 10 seconds, and not before", async () => {
+    vi.useFakeTimers();
+    // A service that never answers: the call ends only when the runtime aborts it.
+    const hang = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      await once(init!.signal!, "abort");
+      throw new DOMException("aborted", "AbortError");
+    });
+    vi.stubGlobal("fetch", hang);
+    const ex = makeHttpCalloutExecutor({ serviceUrl: "http://service.test/job", timeoutMs: 120_000, precheckUrl: "http://service.test/precheck" });
+
+    let verdict: unknown;
+    const pending = ex.precheck!(job).then((v) => { verdict = v; });
+    await vi.advanceTimersByTimeAsync(PRECHECK_TIMEOUT_MS - 1);
+    expect(verdict).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    await pending;
+
+    expect(verdict).toMatchObject({ ok: false, status: 503, code: "precheck_timeout" });
+    expect(hang).toHaveBeenCalledTimes(1);
   });
 });

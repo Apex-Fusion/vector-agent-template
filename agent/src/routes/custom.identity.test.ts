@@ -285,13 +285,20 @@ function setup(options: SetupOptions = {}) {
   return { app, chain, jobs, state, submitted, escrow };
 }
 
+const PRECHECK_URL = "http://service.test/precheck";
+
+/** What the service answers at PRECHECK_URL. A test replaces it. */
+let precheckAnswer: () => Response = () => new Response(null, { status: 200 });
+
 const service = vi.fn(async (url: string | URL | Request, _init?: RequestInit) => {
+  if (String(url) === PRECHECK_URL) return precheckAnswer();
   if (String(url) !== SERVICE_URL) throw new Error(`unexpected fetch ${String(url)}`);
   return new Response(OUTPUT, { status: 200 });
 });
 
 beforeEach(() => {
   service.mockClear();
+  precheckAnswer = () => new Response(null, { status: 200 });
   vi.stubGlobal("fetch", service);
 });
 afterEach(() => {
@@ -516,6 +523,87 @@ describe("custom capability: the job context for the service", () => {
     expect(headers["x-vector-advert-model"]).toBe(MODEL);
     expect(Object.keys(headers).sort()).toEqual(["content-type", ...CONTEXT_NAMES]);
     expect(Object.values(headers).join(" ")).not.toContain("forged");
+  });
+});
+
+describe("custom capability: the check of the service before the Claim", () => {
+  const env = { SERVICE_PRECHECK_URL: PRECHECK_URL };
+
+  it("asks the service before the Claim, with the payload and the same headers as the job call", async () => {
+    const { app, chain, jobs } = setup({ env });
+    const submit = vi.spyOn(chain, "submitTx");
+
+    const posted = await postJob(app);
+    expect(posted.status).toBe(202);
+    await vi.waitFor(() => expect(jobs.get(posted.body.job_id)?.status).toBe("done"));
+
+    expect(service.mock.calls.map(([url]) => String(url))).toEqual([PRECHECK_URL, SERVICE_URL]);
+    expect(service.mock.calls.map(([, init]) => init?.body)).toEqual([PAYLOAD, PAYLOAD]);
+    expect(sentHeaders(0)).toEqual(sentHeaders(1));
+    // Order: the question, then the Claim, then the job.
+    const [question, job] = service.mock.invocationCallOrder;
+    const [claim] = submit.mock.invocationCallOrder;
+    expect(question).toBeLessThan(claim!);
+    expect(claim).toBeLessThan(job!);
+  });
+
+  it("refuses with the status of the service, leaves the escrow Open and calls no job", async () => {
+    precheckAnswer = () => Response.json(
+      { error: "approval_digest_mismatch", message: "The digest does not match." },
+      { status: 403 },
+    );
+    const { app, chain, jobs, state, submitted } = setup({ env });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(403);
+    expect(posted.body).toEqual({
+      error: "approval_digest_mismatch",
+      message: "The digest does not match.",
+      reason: "approval_digest_mismatch",
+    });
+    expect(submitted).toHaveLength(0);
+    expect(service).toHaveBeenCalledTimes(1);
+    expect(jobs.count()).toBe(0);
+    expect(state.snapshot().activeSessions).toBe(0);
+    const escrow = await chain.queryUtxo(ESCROW_REF);
+    expect(decodeIdentityEscrowDatum(escrow!.datumHex!).state).toBe("Open");
+  });
+
+  it("claims the same escrow on a second try after a refusal, because the escrow stayed Open", async () => {
+    const refusal = () => Response.json({ error: "busy" }, { status: 409 });
+    precheckAnswer = refusal;
+    const { app, jobs } = setup({ env });
+
+    expect((await postJob(app)).status).toBe(409);
+    precheckAnswer = () => new Response(null, { status: 204 });
+    const second = await postJob(app);
+
+    expect(second.status).toBe(202);
+    await vi.waitFor(() => expect(jobs.get(second.body.job_id)?.status).toBe("done"));
+  });
+
+  it("passes the code busy of a busy service on, with the status 409", async () => {
+    precheckAnswer = () => Response.json({ error: "busy" }, { status: 409 });
+    const { app } = setup({ env });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(409);
+    expect(posted.body).toMatchObject({ error: "busy", reason: "busy" });
+  });
+
+  it("refuses with 503 when the service cannot be reached, and builds no Claim", async () => {
+    precheckAnswer = () => {
+      throw new TypeError("fetch failed");
+    };
+    const { app, submitted } = setup({ env });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(503);
+    expect(posted.body).toMatchObject({ error: "precheck_unreachable", reason: "precheck_unreachable" });
+    expect(submitted).toHaveLength(0);
   });
 });
 

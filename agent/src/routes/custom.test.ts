@@ -53,6 +53,7 @@ import { SupplierState } from "../state.js";
 import { JobStore } from "../jobs.js";
 import type { SupplierIdentity } from "../identity/agent.js";
 import { makeCustomHandler, type CustomRouteDeps } from "./custom.js";
+import type { PrecheckJob, PrecheckResult } from "../executor/executor.js";
 
 /**
  * Every escrow in this file has the legacy layout, which needs no agent
@@ -428,5 +429,175 @@ describe("makeCustomHandler — the escrow against the advert of this node", () 
       "wrong_advert",
       `${other.txHash}#0`,
     );
+  });
+});
+
+describe("makeCustomHandler — the check of the service before the Claim", () => {
+  const PAYLOAD = "matching payload";
+  // The default escrow and advert match in every term. Only the hash of the payload is set.
+  const MATCHING: Partial<EscrowDatum> = { prompt_hash: sha256Hex(PAYLOAD) };
+  const REFUSAL: PrecheckResult = {
+    ok: false,
+    status: 403,
+    code: "approval_digest_mismatch",
+    message: "The digest does not match.",
+  };
+
+  beforeEach(() => {
+    vi.mocked(buildClaimTx).mockReset().mockResolvedValue({ txCborHex: "00", expectedTxHash: "d".repeat(64) });
+    vi.mocked(buildSubmitTx).mockReset().mockResolvedValue({ txCborHex: "00", expectedTxHash: "e".repeat(64) });
+  });
+
+  function setup(precheck?: (job: PrecheckJob) => Promise<PrecheckResult>, escrow: Partial<EscrowDatum> = {}) {
+    const state = new SupplierState(1);
+    const jobs = new JobStore();
+    const execute = vi.fn(async () => ({ outputPayload: "{}" }));
+    const deps: CustomRouteDeps = {
+      chain: makeChain({}, { ...MATCHING, ...escrow }),
+      state,
+      config,
+      supplierKey,
+      jobs,
+      identity: legacyOnlyIdentity,
+      executor: precheck === undefined ? { execute } : { execute, precheck },
+    };
+    return { deps, state, jobs, execute };
+  }
+
+  async function post(deps: CustomRouteDeps) {
+    const next = vi.fn();
+    const { req, res, captured } = makeReqRes({ escrow_ref: ESCROW_REF_STR, payload: PAYLOAD });
+    await makeCustomHandler(deps)(req, res, next as unknown as NextFunction);
+    expect(next).not.toHaveBeenCalled();
+    return captured;
+  }
+
+  it("asks the service once, with the payload and the context of the escrow, before it builds the Claim", async () => {
+    const order: string[] = [];
+    const precheck = vi.fn(async (_job: PrecheckJob): Promise<PrecheckResult> => {
+      order.push("precheck");
+      return { ok: true };
+    });
+    vi.mocked(buildClaimTx).mockImplementation(async () => {
+      order.push("claim");
+      return { txCborHex: "00", expectedTxHash: "d".repeat(64) };
+    });
+    const { deps, state } = setup(precheck);
+
+    const captured = await post(deps);
+    await vi.waitFor(() => expect(state.snapshot().activeSessions).toBe(0));
+
+    expect(captured.statusCode).toBe(202);
+    expect(order).toEqual(["precheck", "claim"]);
+    expect(precheck).toHaveBeenCalledTimes(1);
+    expect(precheck).toHaveBeenCalledWith({
+      capabilityId: advert.capability_id,
+      requestPayload: PAYLOAD,
+      jobRef: ESCROW_REF_STR,
+      context: {
+        escrowRef: ESCROW_REF_STR,
+        advertRef: `${ADVERT_REF.txHash}#0`,
+        advertModel: advert.model,
+        buyerPkh: "4f".repeat(28),
+        paymentLovelace: "1000000",
+        deliverByMs: escrowDatum.deliver_by,
+      },
+    });
+  });
+
+  it("claims and runs the job when the service says go", async () => {
+    const { deps, state, execute } = setup(async () => ({ ok: true }));
+
+    const captured = await post(deps);
+    await vi.waitFor(() => expect(state.snapshot().activeSessions).toBe(0));
+
+    expect(captured.statusCode).toBe(202);
+    expect(buildClaimTx).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses with the status, the code and the text of the service, and builds no Claim", async () => {
+    const { deps, state, jobs, execute } = setup(async () => REFUSAL);
+
+    const captured = await post(deps);
+
+    expect(captured.statusCode).toBe(403);
+    expect(captured.body).toEqual({
+      error: "approval_digest_mismatch",
+      message: "The digest does not match.",
+      reason: "approval_digest_mismatch",
+    });
+    expect(buildClaimTx).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    // The escrow stays Open and no job exists: the refusal is not a failed job.
+    expect(jobs.count()).toBe(0);
+    expect(state.snapshot().activeSessions).toBe(0);
+  });
+
+  it("serves the next request after a refusal, because the refusal frees the slot", async () => {
+    const precheck = vi.fn(async (): Promise<PrecheckResult> => REFUSAL);
+    precheck.mockResolvedValueOnce(REFUSAL).mockResolvedValueOnce({ ok: true });
+    const { deps, state } = setup(precheck);
+
+    expect((await post(deps)).statusCode).toBe(403);
+    expect((await post(deps)).statusCode).toBe(202);
+    await vi.waitFor(() => expect(state.snapshot().activeSessions).toBe(0));
+    expect(buildClaimTx).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses with 503 when the check of an executor throws", async () => {
+    const { deps, state } = setup(async () => {
+      throw new Error("the check broke");
+    });
+
+    const captured = await post(deps);
+
+    expect(captured.statusCode).toBe(503);
+    expect(captured.body).toMatchObject({ error: "precheck_failed", reason: "precheck_failed" });
+    expect(JSON.stringify(captured.body)).not.toContain("the check broke");
+    expect(buildClaimTx).not.toHaveBeenCalled();
+    expect(state.snapshot().activeSessions).toBe(0);
+  });
+
+  it.each([200, 302, 99, 600, 40.5])("refuses with 503 when an executor refuses with the status %s, which is not an error status", async (status) => {
+    const { deps } = setup(async () => ({ ok: false, status, code: "x", message: "y" }));
+
+    const captured = await post(deps);
+
+    expect(captured.statusCode).toBe(503);
+    expect(captured.body).toMatchObject({ error: "x", reason: "x", message: "y" });
+    expect(buildClaimTx).not.toHaveBeenCalled();
+  });
+
+  it("answers supplier_busy and does not ask the service when this node already works another job", async () => {
+    const precheck = vi.fn(async (): Promise<PrecheckResult> => ({ ok: true }));
+    const { deps, state } = setup(precheck);
+    expect(state.tryAcquire(`${"9".repeat(64)}#0`)).toBe(true);
+
+    const captured = await post(deps);
+
+    expect(captured.statusCode).toBe(409);
+    expect(captured.body).toMatchObject({ reason: "supplier_busy" });
+    expect(precheck).not.toHaveBeenCalled();
+  });
+
+  it("does not ask the service about a job that fails an earlier check", async () => {
+    const precheck = vi.fn(async (): Promise<PrecheckResult> => ({ ok: true }));
+    const { deps } = setup(precheck, { advert_ref: { txHash: "f".repeat(64), index: 0 } });
+
+    const captured = await post(deps);
+
+    expect(captured.body).toMatchObject({ reason: "wrong_advert" });
+    expect(precheck).not.toHaveBeenCalled();
+  });
+
+  it("claims without a question when the executor has no check", async () => {
+    const { deps, state } = setup(undefined);
+
+    const captured = await post(deps);
+    await vi.waitFor(() => expect(state.snapshot().activeSessions).toBe(0));
+
+    expect(captured.statusCode).toBe(202);
+    expect(buildClaimTx).toHaveBeenCalledTimes(1);
   });
 });

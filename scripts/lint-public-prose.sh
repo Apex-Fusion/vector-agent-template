@@ -15,8 +15,9 @@
 #
 # Two exceptions to those exclusions, both scanned:
 #   the template-owned files that live inside agent/ (executor/,
-#     customJobRunner*, routes/custom*, config.custom.test.ts). This repo
-#     authored those, so this repo answers for their prose.
+#     customJobRunner*, routes/custom*, runtimeSettings*, releaseWatcher*,
+#     config.custom.test.ts). This repo authored those, so this repo answers
+#     for their prose.
 #   the ADDED lines of scripts/patches/*.patch. A patch's context lines are
 #     verbatim upstream text; its added lines are ours and land in the
 #     vendored tree, which is the one way template prose reaches those files.
@@ -27,7 +28,7 @@ cd "$ROOT"
 # Name spellings include their diacritic forms: the plain-ASCII variant alone
 # misses the way these names are normally written.
 BANNED='earn AP3X|governance|Blagojevi(c|ć)|Cejtlin|Nedeljkovi(c|ć)|Mu(z|ž)evi(c|ć)|Fragiskatos|datalab|chandra| TPS|throughput|accuracy of [0-9]|% accuracy'
-OWNED_INSIDE_VENDORED='^agent/src/(executor/|customJobRunner|routes/custom|config\.custom\.test\.ts)'
+OWNED_INSIDE_VENDORED='^agent/src/(executor/|customJobRunner|routes/custom|runtimeSettings|releaseWatcher|config\.custom\.test\.ts)'
 
 fail=0
 

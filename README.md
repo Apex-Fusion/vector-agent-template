@@ -169,7 +169,7 @@ Needs its own funded wallet: `BUYER_PRIV_KEY_HEX`, plus `OGMIOS_URL`, `NETWORK_I
 
 ## Plug in your software
 
-The whole integration surface is one interface:
+The integration surface is one interface, with one optional method:
 
 ```ts
 interface JobContext {
@@ -191,7 +191,15 @@ interface ExecutorResult {
   outputPayload: string;    // opaque output string, hashed into the receipt
   meta?: Record<string, unknown>;
 }
+interface PrecheckJob {
+  capabilityId: string;
+  requestPayload: string;   // the same bytes that the job call sends later
+  jobRef: string;
+  context: JobContext;
+}
+type PrecheckResult = { ok: true } | { ok: false; status: number; code: string; message: string };
 execute(job: ExecutorJob): Promise<ExecutorResult>
+precheck?(job: PrecheckJob): Promise<PrecheckResult>   // optional: asked before the Claim
 ```
 
 **The common case needs no code.** The default implementation (`agent/src/executor/httpCallout.ts`) POSTs `requestPayload` as the raw request body to `SERVICE_URL`, with your response body becoming `outputPayload`. Point `SERVICE_URL` at anything that speaks HTTP.
@@ -206,6 +214,23 @@ execute(job: ExecutorJob): Promise<ExecutorResult>
 | `x-vector-buyer-pkh` | The key hash of the buyer: 56 hex characters. |
 | `x-vector-payment-lovelace` | The quoted amount of the escrow, in lovelace. |
 | `x-vector-deliver-by-ms` | The deliver-by time of the escrow, in POSIX milliseconds. |
+
+**Check a job before the agent claims it.** Set `SERVICE_PRECHECK_URL` to a URL of your service. The agent then asks your service before it builds the Claim. With no setting there is no check, and the agent claims as before.
+
+The call is a `POST` to that URL. The body is the request of the buyer: the same bytes that the job call sends later. The headers are the headers of the job call: the `content-type`, your `SERVICE_AUTH_HEADER` as `authorization`, and the six `x-vector-*` headers above. The agent makes the call after its own checks. It holds its job slot while it waits, so a second request gets `supplier_busy` before it reaches your service.
+
+| Your service answers | The agent does |
+|---|---|
+| A 2xx status | It claims the escrow, and then it calls your service for the job. |
+| A status from 400 to 599 | It builds no Claim. The escrow stays Open. The buyer gets that status. |
+| A 3xx status | It builds no Claim. The buyer gets 502. The agent does not follow a redirect. |
+| No answer in 10 seconds, or no connection | It builds no Claim. The buyer gets 503. |
+
+The buyer gets a JSON body with the keys `error`, `reason` and `message`. `error` and `reason` hold the same code. The code comes from the key `error` of the JSON body of your refusal: letters, digits, `_`, `.` and `-`, at most 64 characters. When your answer has no such code, the code is `precheck_refused`. The words come from the key `message`: the agent makes them one line and cuts them to 500 characters. An answer as short as `{"error":"busy"}` is enough.
+
+The agent has four codes of its own for the check: `precheck_timeout` and `precheck_unreachable` (both 503), `precheck_failed` (503, when an executor of your own throws) and `precheck_bad_status` (502).
+
+A refusal costs no Claim fee. The buyer can send the same job again, or Reclaim the escrow after deliver-by. If you replace `makeHttpCalloutExecutor` with an executor of your own, add the optional method `precheck(job)` to it. It takes the request and the context, and it returns `{ ok: true }` or `{ ok: false, status, code, message }`.
 
 **One thing to know about the payload:** `try-it` builds the request payload as the canonical JSON of a one-element message *array*, `canonicalize([{ content: <your file>, role: "user" }])`, because that is the preimage the vendored escrow builder hashes when it is given messages. Your service receives that whole array as the POST body, not your bare content:
 

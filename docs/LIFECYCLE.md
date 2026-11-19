@@ -66,6 +66,8 @@ Some checks compare the escrow with your own advert (`ADVERT_REF`). The answer t
 
 An amount above the advert is not refused. The supplier gets more, not less. An escrow that comes from a vault can have a buyer bond above the advert bond, because the builder adds the minimum ada of the output to that bond.
 
+When you set `SERVICE_PRECHECK_URL`, the agent asks your service after these checks and before it builds the Claim. A 2xx answer is a go. Any other answer is a refusal. The agent builds no Claim, and the escrow stays Open. The buyer gets the status of your service, with the code and the words of your answer in the same JSON body. No answer in 10 seconds is a refusal 503. The README gives the call and the codes.
+
 ## Timing
 
 - **Deliver-by** = the time the escrow was posted + your advert's SLA (`max_processing_ms`) + a 30-second grace. Before deliver-by passes, a buyer cannot Reclaim an Open or Claimed escrow: the supplier still has time to work it. After deliver-by passes, the buyer can walk away with a full refund whether or not you've started.

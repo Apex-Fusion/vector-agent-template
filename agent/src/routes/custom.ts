@@ -52,7 +52,7 @@ import {
 import type { SupplierState } from "../state.js";
 import type { SupplierConfig } from "../config.js";
 import type { JobStore } from "../jobs.js";
-import type { Executor } from "../executor/executor.js";
+import type { Executor, PrecheckJob, PrecheckResult } from "../executor/executor.js";
 import { runCustomJob } from "../customJobRunner.js";
 import { triggerOnFailureConsolidate } from "../walletHealth.js";
 import {
@@ -111,6 +111,24 @@ function jsonError(res: Response, status: number, reason: string, message: strin
  */
 function refusal(res: Response, status: number, code: string, message: string): Response {
   return res.status(status).json({ error: code, message, reason: code });
+}
+
+/**
+ * The check of the executor before the Claim, or a go when it has none. A check
+ * that throws is a refusal 503. A refusal with a status that is not an HTTP
+ * error status gets 503 too, so that the buyer always gets a status of 400 to 599.
+ */
+async function askService(executor: Executor, job: PrecheckJob): Promise<PrecheckResult> {
+  if (executor.precheck === undefined) return { ok: true };
+  let verdict: PrecheckResult;
+  try {
+    verdict = await executor.precheck(job);
+  } catch {
+    return { ok: false, status: 503, code: "precheck_failed", message: "The check before the Claim failed." };
+  }
+  if (verdict.ok) return verdict;
+  const status = Number.isInteger(verdict.status) && verdict.status >= 400 && verdict.status <= 599 ? verdict.status : 503;
+  return { ...verdict, status };
 }
 
 interface CustomBody {
@@ -287,6 +305,23 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
       acquiredRef = escrowRefStr;
       // From here on, every error path MUST release the slot until the
       // runner takes ownership of it.
+
+      // ── 8b. The check of the service before the Claim ────────────────
+      // The executor has this check only when SERVICE_PRECHECK_URL is set. A
+      // refusal leaves the escrow Open: no Claim and no job. The buyer gets
+      // the status, the code and the words of the service.
+      const verdict = await askService(executor, {
+        capabilityId: advert.capability_id,
+        requestPayload: payload,
+        jobRef: escrowRefStr,
+        context,
+      });
+      if (!verdict.ok) {
+        deps.state.release(escrowRefStr);
+        acquiredRef = null;
+        console.warn(`[precheck_refused] escrow=${escrowRefStr} status=${verdict.status} code=${JSON.stringify(verdict.code)}`);
+        return refusal(res, verdict.status, verdict.code, verdict.message);
+      }
 
       // ── 9+10. Claim tx: build + confirm as ONE wallet critical section ─
       // (splitting them would let another wallet spend coin-select mid-flight)

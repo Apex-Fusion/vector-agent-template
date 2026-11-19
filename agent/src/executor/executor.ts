@@ -41,8 +41,33 @@ export interface ExecutorResult {
   meta?: Record<string, unknown>;
 }
 
+/** What the runtime asks of the service before it claims: the request and the context of the job. */
+export interface PrecheckJob {
+  capabilityId: string;
+  /** The request string, the same bytes that the job call sends later. */
+  requestPayload: string;
+  /** Escrow reference, for logging/correlation only. */
+  jobRef: string;
+  context: JobContext;
+}
+
+/**
+ * The answer of the service to the check before the Claim. A refusal has an
+ * HTTP error status (400 to 599), a code and a text. The runtime gives all
+ * three to the buyer.
+ */
+export type PrecheckResult =
+  | { ok: true }
+  | { ok: false; status: number; code: string; message: string };
+
 export interface Executor {
   execute(job: ExecutorJob): Promise<ExecutorResult>;
+  /**
+   * Optional. The runtime calls it before the Claim. A refusal leaves the
+   * escrow Open: the runtime builds no Claim. Without this method there is no
+   * check, and the runtime claims as before.
+   */
+  precheck?(job: PrecheckJob): Promise<PrecheckResult>;
 }
 
 export class ExecutorError extends Error {
