@@ -1774,8 +1774,9 @@ export function createApp(deps: SupplierDeps): Application {
     // buffer the escrow builders add: deliver_by = posted_at +
     // max_processing_ms + 30 s, in both escrow layouts
     // (packages/shared/src/tx/escrow/postEscrow.ts, postFromAdvert.ts).
-    // Refuse to boot when they do not fit, rather than claim jobs this node
-    // cannot submit in time and forfeit the bond on each one.
+    // Refuse to boot when they do not fit, rather than claim jobs that this
+    // node cannot submit in time. The buyer reclaims each such escrow, and the
+    // node gets no settlement for it.
     //
     // The advert datum itself is only readable asynchronously (chain query)
     // and this factory is synchronous, so the SLA arrives via config —

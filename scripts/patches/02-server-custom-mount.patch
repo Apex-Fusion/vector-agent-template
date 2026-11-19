@@ -1,5 +1,5 @@
 diff --git i/agent/src/server.ts w/agent/src/server.ts
-index e404e53..bc127f6 100644
+index 48a898d..92664d4 100644
 --- i/agent/src/server.ts
 +++ w/agent/src/server.ts
 @@ -86,6 +86,8 @@ import {
@@ -11,7 +11,7 @@ index e404e53..bc127f6 100644
  
  export interface SupplierDeps {
    chain: ChainProvider;
-@@ -1745,6 +1747,48 @@ export function createApp(deps: SupplierDeps): Application {
+@@ -1761,6 +1763,49 @@ export function createApp(deps: SupplierDeps): Application {
      // fits comfortably under 16mb.
      app.post("/v1/ocr/extract", express.json({ limit: "16mb" }), makeOcrHandler(resolved));
      app.get("/v1/ocr/extract/:jobId", makeGetOcrJobHandler(resolved));
@@ -26,8 +26,9 @@ index e404e53..bc127f6 100644
 +    // buffer the escrow builders add: deliver_by = posted_at +
 +    // max_processing_ms + 30 s, in both escrow layouts
 +    // (packages/shared/src/tx/escrow/postEscrow.ts, postFromAdvert.ts).
-+    // Refuse to boot when they do not fit, rather than claim jobs this node
-+    // cannot submit in time and forfeit the bond on each one.
++    // Refuse to boot when they do not fit, rather than claim jobs that this
++    // node cannot submit in time. The buyer reclaims each such escrow, and the
++    // node gets no settlement for it.
 +    //
 +    // The advert datum itself is only readable asynchronously (chain query)
 +    // and this factory is synchronous, so the SLA arrives via config —

@@ -76,9 +76,9 @@ function sha256Hex(s: string): string {
  * transaction, submit it, and wait for it to land, all before the escrow's
  * on-chain deliver_by. Submit is a script spend, so this is a chain round trip,
  * not a function call. A job that lets the executor run right up to deliver_by
- * produces a result it can never submit, and forfeits the supplier bond on
- * work it actually did. Mirrors the 30 s the boot guard reserves in
- * server.ts's SLA arithmetic.
+ * produces a result that the node cannot submit. The buyer then reclaims the
+ * escrow, and the node gets no settlement for work that it did. Mirrors the
+ * 30 s the boot guard reserves in server.ts's SLA arithmetic.
  */
 const SUBMIT_RESERVE_MS = 30_000;
 
