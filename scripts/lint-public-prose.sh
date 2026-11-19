@@ -66,8 +66,20 @@ if ! printf 'agents earn while selling\n' | grep -qiE "$PROSE_BANNED"; then
   echo "FAIL: tier-2 pattern self-test did not match its probe - lint broken" >&2
   exit 1
 fi
+# One protocol name has the banned word between hyphens: the header x-vector-payment-lovelace.
+# It is a name, not commerce framing. Blank it before the match, so that a line with the name
+# and a banned word still fails. (Self-tests: the name alone passes, the name plus "pays" fails.)
+ALLOWED_NAME='x-vector-payment-lovelace'
+if printf 'the header %s\n' "$ALLOWED_NAME" | sed "s/$ALLOWED_NAME//g" | grep -qiE "$PROSE_BANNED"; then
+  echo "FAIL: tier-2 allowance self-test: the protocol header name alone must pass - lint broken" >&2
+  exit 1
+fi
+if ! printf '%s pays\n' "$ALLOWED_NAME" | sed "s/$ALLOWED_NAME//g" | grep -qiE "$PROSE_BANNED"; then
+  echo "FAIL: tier-2 allowance self-test: a banned word next to the name must fail - lint broken" >&2
+  exit 1
+fi
 PROSE_RAW=$(grep -rniE "$PROSE_BANNED" README.md docs/*.md || true)
-PROSE_HITS=$(printf '%s\n' "$PROSE_RAW" | grep -v 'buy-once' || true)
+PROSE_HITS=$(printf '%s\n' "$PROSE_RAW" | sed "s/$ALLOWED_NAME//g" | grep -iE "$PROSE_BANNED" | grep -v 'buy-once' || true)
 if [ -n "$PROSE_HITS" ]; then
   printf '%s\n' "$PROSE_HITS"
   echo "FAIL: commerce/payment framing in prose (stake, bond, commission, settle - never sell/buy/pay)" >&2
