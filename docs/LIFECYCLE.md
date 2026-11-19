@@ -52,15 +52,39 @@ An advert posted with your `AGENT_ID` (README step 5) gives escrows that carry t
 
 Escrows posted against a legacy advert keep the legacy rules and the 8-field receipt until the last of them closes.
 
+## What the agent checks before the Claim
+
+A buyer sends the job to `POST /v1/job` with the escrow reference and the request. The agent reads the escrow and your advert from the chain. It claims the escrow only when every check passes. A refused job costs no Claim, and the escrow stays Open. The buyer can Reclaim it after deliver-by.
+
+Some checks compare the escrow with your own advert (`ADVERT_REF`). The answer to the buyer is a JSON body with the keys `error` and `reason` (both hold the code) and `message`:
+
+| Code | Status | The escrow breaks this rule |
+|---|---|---|
+| `wrong_advert` | 409 | The escrow names another advert than `ADVERT_REF`. |
+| `underpaid` | 409 | The quoted amount (`payment_lovelace`) of the escrow is below the advert price. Or the escrow output holds less than the quoted amount and both bonds of its datum. |
+| `bond_mismatch` | 409 | A bond of the escrow is below the bond of the advert. |
+
+An amount above the advert is not refused. The supplier gets more, not less. An escrow that comes from a vault can have a buyer bond above the advert bond, because the builder adds the minimum ada of the output to that bond.
+
+When you set `SERVICE_PRECHECK_URL`, the agent asks your service after these checks and before it builds the Claim. A 2xx answer is a go. Any other answer is a refusal. The agent builds no Claim, and the escrow stays Open. The buyer gets the status of your service, with the code and the words of your answer in the same JSON body. No answer in 10 seconds is a refusal 503. The README gives the call and the codes.
+
 ## Timing
 
-- **Deliver-by** = the time the escrow was posted + your advert's SLA (`max_processing_ms`) + a 30-second grace. Before deliver-by passes, a buyer cannot Reclaim an Open or Claimed escrow: the supplier still has time to work it. After deliver-by passes, the buyer can walk away with a full refund whether or not you've started.
+- **Deliver-by** = the time the escrow was posted + your advert's SLA (`max_processing_ms`) + a 30-second grace. Before deliver-by passes, a buyer cannot Reclaim an Open or Claimed escrow: the supplier still has time to work it. After deliver-by passes, the buyer can walk away with a full refund whether or not you've started. The 30 seconds are what the builder in this repo writes (`NETWORK_BUFFER_MS` in the core, used by `try-it`), and what the boot guard of the agent assumes. The agent does not compute `deliver_by`. It reads it from the escrow and refuses a job at or after that time. A buyer that uses another builder can write another grace, and the agent then works with the `deliver_by` that the escrow holds.
 - **The accept window is 600 seconds from Submit.** Once you submit a result, the buyer has ten minutes to Accept it. There is no buyer recovery from the Submitted state inside that window: an aborted or crashed buyer client still leaves the escrow sitting there, payable.
-- **Boot guard:** the agent will not start serving the `custom` capability unless three costs fit inside that window: up to 60 seconds waiting out the Claim confirmation, then `SERVICE_TIMEOUT_MS` for your own service, then 30 seconds held back to build and land the Submit. In practice that means `SERVICE_TIMEOUT_MS` no higher than `ADVERT_MAX_PROCESSING_MS - 60000`. This is deliberate: a supplier whose own service budget can exceed what it advertised would claim jobs it can never submit in time, forfeiting its bond for nothing. Fix your `.env`, don't fight the guard.
+- **Boot guard:** the agent will not start serving the `custom` capability unless three costs fit inside that window: up to 60 seconds waiting out the Claim confirmation, then `SERVICE_TIMEOUT_MS` for your own service, then 30 seconds held back to build and land the Submit. In practice that means `SERVICE_TIMEOUT_MS` no higher than `ADVERT_MAX_PROCESSING_MS - 60000`. This is deliberate: a supplier whose own service budget can exceed what it advertised would claim jobs it can never submit in time. The buyer then reclaims each such escrow after deliver-by. The supplier posts no bond of its own, so it loses the Claim fee and the settlement that it would have got. Fix your `.env`, don't fight the guard.
 - **The same arithmetic runs per job, not just at boot.** The agent gives your service whatever is left before deliver-by, minus that 30-second Submit reserve, capped at `SERVICE_TIMEOUT_MS`. A job claimed so late that nothing is left fails immediately as `deliver_by_too_close`, without your service being called: work that cannot be submitted in time settles for nobody. The advert's real SLA is also re-read from chain before every Claim, so an advert tighter than your configured value is refused rather than claimed.
 
-## Release path: status as of ship date
+## Release path
 
-The chain supports Release: after the 600-second accept window closes on a Submitted job, the supplier can settle it unilaterally, taking the quoted amount plus both bonds, with no further action from the buyer. The transaction builder for it ships in the vendored core (`packages/shared/src/tx/escrow/release.ts`).
+The chain supports Release. After the 600-second accept window closes on a Submitted job, the supplier can settle the job alone. The quoted amount and both bonds settle to the supplier. The buyer does nothing.
 
-**This template does not ship a command for it.** There's no `tx:release` CLI, no automated watcher that fires one when a window closes. If a buyer misses the accept window today, your only path to that settlement is writing your own script against the vendored builder. Until that gap closes, the operating assumption is: buyers accept promptly, and suppliers should not count on Release as a safety net.
+The template ships the command `tx:release-escrows` for this move. The command reads the escrow addresses on the chain and finds the Submitted escrows of your supplier key. It skips each escrow that is still inside its accept window. It releases the other escrows one at a time. Add `--dry-run` to list what it would release, and release nothing:
+
+```bash
+corepack pnpm --filter @marketplace/supplier exec tsx src/cli/release-escrows.ts --dry-run
+```
+
+The command reads `SUPPLIER_PRIV_KEY_HEX`, `NETWORK_ID` and `OGMIOS_URL` from the environment. On mainnet it also needs `ESCROW_REF_UTXO` and `VECTOR_ZERO_TIME_MS`. It needs `IDENTITY_POLICY_ID` and `IDENTITY_ESCROW_REF_UTXO` to find and release the escrows that name an agent. The command runs in its own process and does not share the wallet lock of the agent. Run it when `/status` says `free`.
+
+The template also ships a release watcher. It is off by default. Set `RELEASE_WATCHER=1` (it needs `LIVE_CHAIN=1`), and the agent releases for you. Each minute it reads the escrow addresses and releases each Submitted escrow of its own whose accept window has ended. It uses the wallet lock of the agent, so a Release never runs beside a Claim or a Submit. After a failure it waits five minutes before it tries that escrow again. It never releases an escrow before the window ends, and never an escrow that is not its own: the supplier key must be the key of the agent, and an escrow that names an agent must name the agent of this node. It reads the chain, so it also releases the escrows that were Submitted before a restart. A Release costs a chain fee, like each script transaction. With the setting off, a Submitted escrow that the buyer does not accept stays in the escrow contract until you run the command.

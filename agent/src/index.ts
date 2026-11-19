@@ -23,6 +23,7 @@ import { createApp, type SupplierDeps } from "./server.js";
 import { buildChainProvider } from "./chain.js";
 import { startWalletHealthTicker } from "./walletHealth.js";
 import { decodeAdvert, ownAgentId, supplierIdentity } from "./identity/agent.js";
+import { maybeStartReleaseWatcher } from "./releaseWatcher.js";
 import { BOUNDED_INPUT_DETAIL_MARKER } from "@marketplace/shared/tx";
 import { OpenRouterCapacityProvider } from "./reseller/openRouterCapacity.js";
 import { CapacityGate } from "./reseller/capacityGate.js";
@@ -172,6 +173,10 @@ async function main(startHealth: typeof startDecoderHealth = startDecoderHealth)
   );
   evictInterval.unref();
 
+  // Release watcher: with RELEASE_WATCHER=1 it releases the Submitted escrows that the buyer
+  // did not accept, after the accept window. Off by default: with the setting off, nothing runs.
+  const releaseWatcher = maybeStartReleaseWatcher(cfg, { chain, state, supplierKey, identity });
+
   // Wallet self-consolidation: only meaningful when chain writes are enabled.
   // 0 disables. planConsolidate short-circuits to already-healthy in the
   // common case so this is a no-op on a clean wallet.
@@ -192,6 +197,7 @@ async function main(startHealth: typeof startDecoderHealth = startDecoderHealth)
     console.log(`received ${signal}, shutting down`);
     clearInterval(evictInterval);
     walletHealthTicker?.stop();
+    releaseWatcher?.stop();
     state.markOffline();
     const runtimeCleanup = Promise.all([reseller?.close(), paper2agent?.close()])
       .then(() => 0, () => 1);

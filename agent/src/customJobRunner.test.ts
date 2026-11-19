@@ -37,7 +37,7 @@ import type * as TxModule from "@marketplace/shared/tx";
 import type { SupplierConfig } from "./config.js";
 import type { JobStore, JobFailure, JobResponsePayload, ChatJobResponsePayload } from "./jobs.js";
 import { SupplierState } from "./state.js";
-import { ExecutorError, type Executor, type ExecutorJob } from "./executor/executor.js";
+import { ExecutorError, type Executor, type ExecutorJob, type JobContext } from "./executor/executor.js";
 import type { SupplierIdentity } from "./identity/agent.js";
 
 // buildSubmitTx is the one tx-package value this test replaces: it would build
@@ -104,6 +104,16 @@ const supplierKey: WalletKey = {
 // The supplier's agent (64 lowercase hex) for the escrow layout with agent_id.
 const AGENT_ID = "a1".repeat(32);
 
+// What the route builds from the escrow and the advert, and hands to the runner.
+const CONTEXT: JobContext = {
+  escrowRef: ESCROW_REF,
+  advertRef: `${"a".repeat(64)}#0`,
+  advertModel: "echo-service-v1",
+  buyerPkh: "4f".repeat(28),
+  paymentLovelace: "1000000",
+  deliverByMs: 1_900_000_000_000,
+};
+
 let jobs: FakeJobStore;
 let state: SupplierState;
 
@@ -125,6 +135,7 @@ function makeParams(
       identity,
     },
     executor,
+    context: CONTEXT,
     jobId: JOB_ID,
     escrowRef: ESCROW_REF,
     claimedRef: CLAIMED_REF,
@@ -206,6 +217,19 @@ describe("runCustomJob", () => {
       deadlineMs: 7_000,
       jobRef: ESCROW_REF,
     });
+  });
+
+  it("hands the executor the job context that the route built, unchanged", async () => {
+    const seen: ExecutorJob[] = [];
+    const executor = fakeExecutor(async (job) => {
+      seen.push(job);
+      return { outputPayload: "out" };
+    });
+
+    await runCustomJob(makeParams(executor));
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.context).toEqual(CONTEXT);
   });
 
   it("caps the executor deadline at deliver_by minus the Submit reserve when that is sooner than the service timeout", async () => {

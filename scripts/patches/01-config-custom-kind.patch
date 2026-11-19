@@ -1,8 +1,16 @@
 diff --git i/agent/src/config.ts w/agent/src/config.ts
-index feb0804..dcc9458 100644
+index e742388..8d59bcd 100644
 --- i/agent/src/config.ts
 +++ w/agent/src/config.ts
-@@ -124,7 +124,7 @@ export interface AdvertRef {
+@@ -87,6 +87,7 @@
+ 
+ import { isIP } from "node:net";
+ import { parseAgentId } from "./identity/agent.js";
++import { loadRuntimeSettings, type RuntimeSettings } from "./runtimeSettings.js";
+ 
+ const HEX64_RE = /^[0-9a-fA-F]{64}$/;
+ const TX_HASH_RE = /^[0-9a-fA-F]{64}$/;
+@@ -135,7 +136,7 @@ export interface AdvertRef {
   *                    image → one extraction). Upstream is an OpenAI-compatible
   *                    VISION endpoint (OPENAI_BASE_URL), e.g. vLLM serving
   *                    datalab-to/chandra-ocr-2. */
@@ -11,7 +19,16 @@ index feb0804..dcc9458 100644
  
  /** Served-checkpoint probe cadence for the ocr capability.
   *   "per_job" — probe the upstream before every Claim (default when
-@@ -295,6 +295,26 @@ export interface SupplierConfig {
+@@ -195,7 +196,7 @@ export interface Paper2AgentConfig {
+   freeCalls?: boolean;
+ }
+ 
+-export interface SupplierConfig {
++export interface SupplierConfig extends RuntimeSettings {
+   supplierPrivKeyHex: string;
+   ogmiosUrl: string;
+   /** Empty string when capabilityKind="tts" or llmBackend="openai". */
+@@ -321,6 +322,26 @@ export interface SupplierConfig {
    revisionProbeUrl: string;
    /** Probe cadence; see RevisionProbeMode. Env: REVISION_PROBE_MODE. */
    revisionProbeMode: RevisionProbeMode;
@@ -38,7 +55,7 @@ index feb0804..dcc9458 100644
    /**
     * When true, the supplier boots a LiveOgmiosProvider (real submitTx/awaitTx).
     * Default false → ReadOnlyOgmiosProvider (safe; no chain writes).
-@@ -354,9 +374,10 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+@@ -380,9 +401,10 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
      capKindStr !== "tts" &&
      capKindStr !== "chat-session" &&
      capKindStr !== "ocr" &&
@@ -51,7 +68,7 @@ index feb0804..dcc9458 100644
    }
    const capabilityKind: CapabilityKind = capKindStr;
    const paper2agent = capabilityKind === "paper2agent"
-@@ -379,7 +400,12 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+@@ -405,7 +427,12 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
    let ollamaUrl = "";
    let openaiBaseUrl = "";
    let piperUrl = "";
@@ -65,7 +82,7 @@ index feb0804..dcc9458 100644
      // Multi-turn chat streams via callOpenAiStream, which only speaks the
      // OpenAI-compatible wire format — so chat-session is openai-only.
      if (llmBackend !== "openai") {
-@@ -611,6 +637,34 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+@@ -652,6 +679,34 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
    }
    const revisionProbeMode: RevisionProbeMode = probeModeStr;
  
@@ -100,7 +117,17 @@ index feb0804..dcc9458 100644
    const piperTimeoutStr = env.PIPER_TIMEOUT_MS;
    let piperTimeoutMs = 120_000;
    if (piperTimeoutStr !== undefined && piperTimeoutStr !== "") {
-@@ -786,6 +840,11 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+@@ -676,6 +731,9 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
+     walletHealthIntervalMs = Number(whIntervalStr);
+   }
+ 
++  // Settings that the template adds for the custom kind (SERVICE_PRECHECK_URL and others).
++  const runtimeSettings = loadRuntimeSettings(env, capabilityKind === "custom");
++
+   const resellerFields = [
+     "RESELLER_DATABASE_URL",
+     "RESELLER_RESERVE_USD",
+@@ -829,6 +887,12 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
      hfModelRevision,
      revisionProbeUrl,
      revisionProbeMode,
@@ -109,6 +136,7 @@ index feb0804..dcc9458 100644
 +    serviceAuthHeader,
 +    serviceContentType,
 +    advertMaxProcessingMs,
++    ...runtimeSettings,
      liveChain,
      walletHealthIntervalMs,
      reseller,

@@ -22,14 +22,14 @@
  *      it cannot run.
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
 import { createHash } from "crypto";
 import type { Request, Response, NextFunction } from "express";
 
 import type { ChainProvider, OutputReference, Utxo } from "@marketplace/shared/chain";
 import { encodeAdvertDatum, encodeEscrowDatum, canonicalize } from "@marketplace/shared/cbor";
 import type { AdvertDatum, EscrowDatum } from "@marketplace/shared/cbor";
-import type { WalletKey } from "@marketplace/shared/tx";
+import { buildClaimTx, buildSubmitTx, type WalletKey } from "@marketplace/shared/tx";
 import type * as TxModule from "@marketplace/shared/tx";
 
 // The paths under test all answer before the Claim, so the two tx builders the
@@ -53,6 +53,7 @@ import { SupplierState } from "../state.js";
 import { JobStore } from "../jobs.js";
 import type { SupplierIdentity } from "../identity/agent.js";
 import { makeCustomHandler, type CustomRouteDeps } from "./custom.js";
+import type { PrecheckJob, PrecheckResult } from "../executor/executor.js";
 
 /**
  * Every escrow in this file has the legacy layout, which needs no agent
@@ -127,7 +128,10 @@ const escrowDatum: EscrowDatum = {
 function makeChain(
   advertPatch: Partial<AdvertDatum> = {},
   escrowPatch: Partial<EscrowDatum> = {},
+  /** The lovelace that the escrow output holds. Default: the payment plus both bonds of its datum. */
+  held?: bigint,
 ): ChainProvider {
+  const escrow = { ...escrowDatum, ...escrowPatch };
   const advertUtxo: Utxo = {
     ref: ADVERT_REF,
     address: "addr_test1_advert",
@@ -139,15 +143,15 @@ function makeChain(
   const escrowUtxo: Utxo = {
     ref: { txHash: ESCROW_TX_HASH, index: 0 },
     address: "addr_test1_escrow",
-    lovelace: 0n,
+    lovelace: held ?? escrow.payment_lovelace + escrow.buyer_bond_lovelace + escrow.supplier_bond_lovelace,
     assets: {},
-    datumHex: encodeEscrowDatum({ ...escrowDatum, ...escrowPatch }),
+    datumHex: encodeEscrowDatum(escrow),
     scriptRef: null,
   };
   return {
     tip: vi.fn(async () => 0),
     queryUtxo: vi.fn(async (ref: OutputReference) => {
-      if (ref.txHash === ADVERT_REF.txHash) return advertUtxo;
+      if (ref.txHash.toLowerCase() === ADVERT_REF.txHash) return advertUtxo;
       if (ref.txHash === ESCROW_TX_HASH) return escrowUtxo;
       return null;
     }),
@@ -178,6 +182,7 @@ function makeReqRes(body: unknown) {
 const config = {
   advertRef: ADVERT_REF,
   advertMaxProcessingMs: advert.max_processing_ms,
+  serviceTimeoutMs: 120_000,
 } as unknown as SupplierConfig;
 
 describe("makeCustomHandler — prompt_hash check", () => {
@@ -297,5 +302,329 @@ describe("makeCustomHandler — executor presence", () => {
     expect(captured.statusCode).toBe(503);
     expect(captured.body).toMatchObject({ reason: "executor_unavailable" });
     expect(state.snapshot().activeSessions).toBe(0);
+  });
+});
+
+describe("makeCustomHandler — the escrow against the advert of this node", () => {
+  // A buyer that builds its own escrow writes any numbers in the datum and locks
+  // any amount. The route compares the escrow with the advert of this node
+  // before it claims, so a refusal costs no Claim.
+  const PAYLOAD = "matching payload";
+  const ADVERT_TERMS: Partial<AdvertDatum> = {
+    price_lovelace: 2_000_000n,
+    buyer_bond_lovelace: 1_000_000n,
+    supplier_bond_lovelace: 500_000n,
+  };
+  /** An escrow that matches ADVERT_TERMS in every term. */
+  const MATCHING: Partial<EscrowDatum> = {
+    prompt_hash: sha256Hex(PAYLOAD),
+    payment_lovelace: 2_000_000n,
+    buyer_bond_lovelace: 1_000_000n,
+    supplier_bond_lovelace: 500_000n,
+  };
+  const SUM = 3_500_000n;
+
+  beforeEach(() => {
+    vi.mocked(buildClaimTx).mockReset().mockResolvedValue({ txCborHex: "00", expectedTxHash: "d".repeat(64) });
+    vi.mocked(buildSubmitTx).mockReset().mockResolvedValue({ txCborHex: "00", expectedTxHash: "e".repeat(64) });
+  });
+
+  interface PostResult {
+    captured: { statusCode?: number; body?: unknown };
+    state: SupplierState;
+  }
+
+  async function post(options: { escrow?: Partial<EscrowDatum>; held?: bigint; config?: SupplierConfig } = {}): Promise<PostResult> {
+    const state = new SupplierState(1);
+    const deps: CustomRouteDeps = {
+      chain: makeChain(ADVERT_TERMS, { ...MATCHING, ...options.escrow }, options.held),
+      state,
+      config: options.config ?? config,
+      supplierKey,
+      jobs: new JobStore(),
+      identity: legacyOnlyIdentity,
+      executor: { execute: vi.fn(async () => ({ outputPayload: "{}" })) },
+    };
+    const next = vi.fn();
+    const { req, res, captured } = makeReqRes({ escrow_ref: ESCROW_REF_STR, payload: PAYLOAD });
+    await makeCustomHandler(deps)(req, res, next as unknown as NextFunction);
+    expect(next).not.toHaveBeenCalled();
+    return { captured, state };
+  }
+
+  /** A refusal: the code in `error` and in `reason`, a text, no Claim and no slot held. */
+  function expectRefusal(result: PostResult, code: string, text: string) {
+    expect(result.captured.statusCode).toBe(409);
+    const body = result.captured.body as Record<string, unknown>;
+    expect(Object.keys(body).sort()).toEqual(["error", "message", "reason"]);
+    expect(body.error).toBe(code);
+    expect(body.reason).toBe(code);
+    expect(body.message).toContain(text);
+    expect(buildClaimTx).not.toHaveBeenCalled();
+    expect(result.state.snapshot().activeSessions).toBe(0);
+  }
+
+  /** The twin of every refusal: the request passes the checks and the Claim is built. */
+  async function expectClaimed(result: PostResult) {
+    expect(result.captured.statusCode).toBe(202);
+    expect(buildClaimTx).toHaveBeenCalledTimes(1);
+    // The job runs on its own: wait until it frees the slot.
+    await vi.waitFor(() => expect(result.state.snapshot().activeSessions).toBe(0));
+  }
+
+  it("claims an escrow that matches the advert in every term", async () => {
+    await expectClaimed(await post());
+  });
+
+  it("refuses wrong_advert when the escrow names another advert", async () => {
+    const other: OutputReference = { txHash: "f".repeat(64), index: 0 };
+    expectRefusal(await post({ escrow: { advert_ref: other } }), "wrong_advert", `${other.txHash}#0`);
+  });
+
+  it("refuses wrong_advert when only the output index of the advert differs", async () => {
+    expectRefusal(
+      await post({ escrow: { advert_ref: { txHash: ADVERT_REF.txHash, index: 1 } } }),
+      "wrong_advert",
+      `${ADVERT_REF.txHash}#1`,
+    );
+  });
+
+  it("claims when only the letter case of the configured advert hash differs", async () => {
+    const upper = { ...config, advertRef: { txHash: ADVERT_REF.txHash.toUpperCase(), index: ADVERT_REF.index } } as SupplierConfig;
+    await expectClaimed(await post({ config: upper }));
+  });
+
+  it("refuses underpaid when the payment is below the advert price", async () => {
+    expectRefusal(await post({ escrow: { payment_lovelace: 1_999_999n } }), "underpaid", "1999999");
+  });
+
+  it("claims when the payment is above the advert price", async () => {
+    await expectClaimed(await post({ escrow: { payment_lovelace: 3_000_000n } }));
+  });
+
+  it("refuses bond_mismatch when the buyer bond is below the advert bond", async () => {
+    expectRefusal(await post({ escrow: { buyer_bond_lovelace: 999_999n } }), "bond_mismatch", "999999");
+  });
+
+  it("refuses bond_mismatch when the supplier bond is below the advert bond", async () => {
+    expectRefusal(await post({ escrow: { supplier_bond_lovelace: 499_999n } }), "bond_mismatch", "499999");
+  });
+
+  it("claims when the buyer bond is above the advert bond (a payment from a vault adds the lock floor to it)", async () => {
+    await expectClaimed(await post({ escrow: { buyer_bond_lovelace: 1_500_000n } }));
+  });
+
+  it("refuses underpaid when the escrow output holds less than the payment and both bonds", async () => {
+    expectRefusal(await post({ held: SUM - 1n }), "underpaid", String(SUM - 1n));
+  });
+
+  it("claims when the escrow output holds more than the payment and both bonds (the minimum ada floor)", async () => {
+    await expectClaimed(await post({ held: SUM + 1_000_000n }));
+  });
+
+  it("names the advert first when the advert and an amount are both wrong", async () => {
+    const other: OutputReference = { txHash: "f".repeat(64), index: 0 };
+    expectRefusal(
+      await post({ escrow: { advert_ref: other, payment_lovelace: 1n } }),
+      "wrong_advert",
+      `${other.txHash}#0`,
+    );
+  });
+});
+
+describe("makeCustomHandler — the check of the service before the Claim", () => {
+  const PAYLOAD = "matching payload";
+  // The default escrow and advert match in every term. Only the hash of the payload is set.
+  const MATCHING: Partial<EscrowDatum> = { prompt_hash: sha256Hex(PAYLOAD) };
+  const REFUSAL: PrecheckResult = {
+    ok: false,
+    status: 403,
+    code: "approval_digest_mismatch",
+    message: "The digest does not match.",
+  };
+
+  beforeEach(() => {
+    vi.mocked(buildClaimTx).mockReset().mockResolvedValue({ txCborHex: "00", expectedTxHash: "d".repeat(64) });
+    vi.mocked(buildSubmitTx).mockReset().mockResolvedValue({ txCborHex: "00", expectedTxHash: "e".repeat(64) });
+  });
+
+  function setup(precheck?: (job: PrecheckJob) => Promise<PrecheckResult>, escrow: Partial<EscrowDatum> = {}) {
+    const state = new SupplierState(1);
+    const jobs = new JobStore();
+    const execute = vi.fn(async () => ({ outputPayload: "{}" }));
+    const deps: CustomRouteDeps = {
+      chain: makeChain({}, { ...MATCHING, ...escrow }),
+      state,
+      config,
+      supplierKey,
+      jobs,
+      identity: legacyOnlyIdentity,
+      executor: precheck === undefined ? { execute } : { execute, precheck },
+    };
+    return { deps, state, jobs, execute };
+  }
+
+  async function post(deps: CustomRouteDeps) {
+    const next = vi.fn();
+    const { req, res, captured } = makeReqRes({ escrow_ref: ESCROW_REF_STR, payload: PAYLOAD });
+    await makeCustomHandler(deps)(req, res, next as unknown as NextFunction);
+    expect(next).not.toHaveBeenCalled();
+    return captured;
+  }
+
+  it("asks the service once, with the payload and the context of the escrow, before it builds the Claim", async () => {
+    const order: string[] = [];
+    const precheck = vi.fn(async (_job: PrecheckJob): Promise<PrecheckResult> => {
+      order.push("precheck");
+      return { ok: true };
+    });
+    vi.mocked(buildClaimTx).mockImplementation(async () => {
+      order.push("claim");
+      return { txCborHex: "00", expectedTxHash: "d".repeat(64) };
+    });
+    const { deps, state } = setup(precheck);
+
+    const captured = await post(deps);
+    await vi.waitFor(() => expect(state.snapshot().activeSessions).toBe(0));
+
+    expect(captured.statusCode).toBe(202);
+    expect(order).toEqual(["precheck", "claim"]);
+    expect(precheck).toHaveBeenCalledTimes(1);
+    expect(precheck).toHaveBeenCalledWith({
+      capabilityId: advert.capability_id,
+      requestPayload: PAYLOAD,
+      jobRef: ESCROW_REF_STR,
+      context: {
+        escrowRef: ESCROW_REF_STR,
+        advertRef: `${ADVERT_REF.txHash}#0`,
+        advertModel: advert.model,
+        buyerPkh: "4f".repeat(28),
+        paymentLovelace: "1000000",
+        deliverByMs: escrowDatum.deliver_by,
+      },
+    });
+  });
+
+  it("claims and runs the job when the service says go", async () => {
+    const { deps, state, execute } = setup(async () => ({ ok: true }));
+
+    const captured = await post(deps);
+    await vi.waitFor(() => expect(state.snapshot().activeSessions).toBe(0));
+
+    expect(captured.statusCode).toBe(202);
+    expect(buildClaimTx).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses with the status, the code and the text of the service, and builds no Claim", async () => {
+    const { deps, state, jobs, execute } = setup(async () => REFUSAL);
+
+    const captured = await post(deps);
+
+    expect(captured.statusCode).toBe(403);
+    expect(captured.body).toEqual({
+      error: "approval_digest_mismatch",
+      message: "The digest does not match.",
+      reason: "approval_digest_mismatch",
+    });
+    expect(buildClaimTx).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    // The escrow stays Open and no job exists: the refusal is not a failed job.
+    expect(jobs.count()).toBe(0);
+    expect(state.snapshot().activeSessions).toBe(0);
+  });
+
+  it("serves the next request after a refusal, because the refusal frees the slot", async () => {
+    const precheck = vi.fn(async (): Promise<PrecheckResult> => REFUSAL);
+    precheck.mockResolvedValueOnce(REFUSAL).mockResolvedValueOnce({ ok: true });
+    const { deps, state } = setup(precheck);
+
+    expect((await post(deps)).statusCode).toBe(403);
+    expect((await post(deps)).statusCode).toBe(202);
+    await vi.waitFor(() => expect(state.snapshot().activeSessions).toBe(0));
+    expect(buildClaimTx).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses with 503 when the check of an executor throws", async () => {
+    const { deps, state } = setup(async () => {
+      throw new Error("the check broke");
+    });
+
+    const captured = await post(deps);
+
+    expect(captured.statusCode).toBe(503);
+    expect(captured.body).toMatchObject({ error: "precheck_failed", reason: "precheck_failed" });
+    expect(JSON.stringify(captured.body)).not.toContain("the check broke");
+    expect(buildClaimTx).not.toHaveBeenCalled();
+    expect(state.snapshot().activeSessions).toBe(0);
+  });
+
+  it.each([200, 302, 99, 600, 40.5])("refuses with 503 when an executor refuses with the status %s, which is not an error status", async (status) => {
+    const { deps } = setup(async () => ({ ok: false, status, code: "x", message: "y" }));
+
+    const captured = await post(deps);
+
+    expect(captured.statusCode).toBe(503);
+    expect(captured.body).toMatchObject({ error: "x", reason: "x", message: "y" });
+    expect(buildClaimTx).not.toHaveBeenCalled();
+  });
+
+  it("answers supplier_busy and does not ask the service when this node already works another job", async () => {
+    const precheck = vi.fn(async (): Promise<PrecheckResult> => ({ ok: true }));
+    const { deps, state } = setup(precheck);
+    expect(state.tryAcquire(`${"9".repeat(64)}#0`)).toBe(true);
+
+    const captured = await post(deps);
+
+    expect(captured.statusCode).toBe(409);
+    expect(captured.body).toMatchObject({ reason: "supplier_busy" });
+    expect(precheck).not.toHaveBeenCalled();
+  });
+
+  it("does not ask the service about a job that fails an earlier check", async () => {
+    const precheck = vi.fn(async (): Promise<PrecheckResult> => ({ ok: true }));
+    const { deps } = setup(precheck, { advert_ref: { txHash: "f".repeat(64), index: 0 } });
+
+    const captured = await post(deps);
+
+    expect(captured.body).toMatchObject({ reason: "wrong_advert" });
+    expect(precheck).not.toHaveBeenCalled();
+  });
+
+  it("claims without a question when the executor has no check", async () => {
+    const { deps, state } = setup(undefined);
+
+    const captured = await post(deps);
+    await vi.waitFor(() => expect(state.snapshot().activeSessions).toBe(0));
+
+    expect(captured.statusCode).toBe(202);
+    expect(buildClaimTx).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers a busy service as it answers its own busy slot: 409 with the code supplier_busy", async () => {
+    const busyNode = setup(async () => ({ ok: true }));
+    expect(busyNode.state.tryAcquire(`${"9".repeat(64)}#0`)).toBe(true);
+    const own = await post(busyNode.deps);
+
+    const { deps, state } = setup(async () => ({ ok: false, status: 409, code: "busy", message: "The service is working on another job." }));
+    const mapped = await post(deps);
+
+    expect(mapped.statusCode).toBe(409);
+    expect(mapped.body).toEqual(own.body);
+    expect(mapped.body).toMatchObject({ reason: "supplier_busy", error: { reason: "supplier_busy" } });
+    expect(buildClaimTx).not.toHaveBeenCalled();
+    expect(state.snapshot().activeSessions).toBe(0);
+  });
+
+  it.each([
+    ["a 409 with another code", { status: 409, code: "unavailable" }],
+    ["the code busy with another status", { status: 503, code: "busy" }],
+  ])("does not map %s", async (_name, answer) => {
+    const { deps } = setup(async () => ({ ok: false, ...answer, message: "The service says no." }));
+
+    const captured = await post(deps);
+
+    expect(captured.statusCode).toBe(answer.status);
+    expect(captured.body).toEqual({ error: answer.code, message: "The service says no.", reason: answer.code });
   });
 });

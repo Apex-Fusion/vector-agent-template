@@ -15,8 +15,9 @@
 #
 # Two exceptions to those exclusions, both scanned:
 #   the template-owned files that live inside agent/ (executor/,
-#     customJobRunner*, routes/custom*, config.custom.test.ts). This repo
-#     authored those, so this repo answers for their prose.
+#     customJobRunner*, routes/custom*, runtimeSettings*, releaseWatcher*,
+#     config.custom.test.ts). This repo authored those, so this repo answers
+#     for their prose.
 #   the ADDED lines of scripts/patches/*.patch. A patch's context lines are
 #     verbatim upstream text; its added lines are ours and land in the
 #     vendored tree, which is the one way template prose reaches those files.
@@ -27,7 +28,7 @@ cd "$ROOT"
 # Name spellings include their diacritic forms: the plain-ASCII variant alone
 # misses the way these names are normally written.
 BANNED='earn AP3X|governance|Blagojevi(c|ć)|Cejtlin|Nedeljkovi(c|ć)|Mu(z|ž)evi(c|ć)|Fragiskatos|datalab|chandra| TPS|throughput|accuracy of [0-9]|% accuracy'
-OWNED_INSIDE_VENDORED='^agent/src/(executor/|customJobRunner|routes/custom|config\.custom\.test\.ts)'
+OWNED_INSIDE_VENDORED='^agent/src/(executor/|customJobRunner|routes/custom|runtimeSettings|releaseWatcher|config\.custom\.test\.ts)'
 
 fail=0
 
@@ -66,8 +67,20 @@ if ! printf 'agents earn while selling\n' | grep -qiE "$PROSE_BANNED"; then
   echo "FAIL: tier-2 pattern self-test did not match its probe - lint broken" >&2
   exit 1
 fi
+# One protocol name has the banned word between hyphens: the header x-vector-payment-lovelace.
+# It is a name, not commerce framing. Blank it before the match, so that a line with the name
+# and a banned word still fails. (Self-tests: the name alone passes, the name plus "pays" fails.)
+ALLOWED_NAME='x-vector-payment-lovelace'
+if printf 'the header %s\n' "$ALLOWED_NAME" | sed "s/$ALLOWED_NAME//g" | grep -qiE "$PROSE_BANNED"; then
+  echo "FAIL: tier-2 allowance self-test: the protocol header name alone must pass - lint broken" >&2
+  exit 1
+fi
+if ! printf '%s pays\n' "$ALLOWED_NAME" | sed "s/$ALLOWED_NAME//g" | grep -qiE "$PROSE_BANNED"; then
+  echo "FAIL: tier-2 allowance self-test: a banned word next to the name must fail - lint broken" >&2
+  exit 1
+fi
 PROSE_RAW=$(grep -rniE "$PROSE_BANNED" README.md docs/*.md || true)
-PROSE_HITS=$(printf '%s\n' "$PROSE_RAW" | grep -v 'buy-once' || true)
+PROSE_HITS=$(printf '%s\n' "$PROSE_RAW" | sed "s/$ALLOWED_NAME//g" | grep -iE "$PROSE_BANNED" | grep -v 'buy-once' || true)
 if [ -n "$PROSE_HITS" ]; then
   printf '%s\n' "$PROSE_HITS"
   echo "FAIL: commerce/payment framing in prose (stake, bond, commission, settle - never sell/buy/pay)" >&2

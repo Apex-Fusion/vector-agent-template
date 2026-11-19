@@ -20,6 +20,9 @@
  *   4. a record that fails the escrow contract's checks answers
  *      agent_not_eligible and frees the slot, with no transaction.
  *   5. a legacy escrow keeps the legacy path: no reference input, 8 fields.
+ *   6. an escrow that names another advert, or that pays or holds less than
+ *      the advert asks, is refused before any slot or Claim (wrong_advert,
+ *      underpaid, bond_mismatch). A buyer bond above the advert bond is not.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -188,6 +191,10 @@ interface SetupOptions {
   escrow?: "legacy" | Partial<IdentityEscrowDatum>;
   /** Capabilities of the agent's record; null seeds no record. */
   recordCapabilities?: string[] | null;
+  /** The lovelace that the escrow output holds. Default: the payment and both bonds of its datum. */
+  held?: bigint;
+  /** More settings for loadConfig, for example SERVICE_PRECHECK_URL. */
+  env?: Record<string, string>;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -229,7 +236,7 @@ function setup(options: SetupOptions = {}) {
 
   // The escrow output holds payment + both bonds, as a Post locks them.
   const escrow = newEscrow(options.escrow === "legacy" ? {} : options.escrow);
-  const locked = escrow.payment_lovelace + escrow.buyer_bond_lovelace + escrow.supplier_bond_lovelace;
+  const locked = options.held ?? escrow.payment_lovelace + escrow.buyer_bond_lovelace + escrow.supplier_bond_lovelace;
   if (options.escrow === "legacy") {
     const { agent_id: _agentId, refund: _refund, ...legacy } = escrow;
     chain.seed({
@@ -263,6 +270,7 @@ function setup(options: SetupOptions = {}) {
     SERVICE_TIMEOUT_MS: "60000",
     ADVERT_MAX_PROCESSING_MS: "300000",
     ...(agentId === undefined ? {} : { AGENT_ID: agentId }),
+    ...options.env,
   });
   const jobs = new JobStore();
   const state = new SupplierState(1);
@@ -274,24 +282,36 @@ function setup(options: SetupOptions = {}) {
     jobs,
     identity: supplierIdentity(chain, 0, { blueprint: IDENTITY }),
   });
-  return { app, chain, jobs, state, submitted };
+  return { app, chain, jobs, state, submitted, escrow, config };
 }
 
-const service = vi.fn(async (url: string | URL | Request) => {
+const PRECHECK_URL = "http://service.test/precheck";
+
+/** What the service answers at PRECHECK_URL. A test replaces it. */
+let precheckAnswer: () => Response = () => new Response(null, { status: 200 });
+
+const service = vi.fn(async (url: string | URL | Request, _init?: RequestInit) => {
+  if (String(url) === PRECHECK_URL) return precheckAnswer();
   if (String(url) !== SERVICE_URL) throw new Error(`unexpected fetch ${String(url)}`);
   return new Response(OUTPUT, { status: 200 });
 });
 
 beforeEach(() => {
   service.mockClear();
+  precheckAnswer = () => new Response(null, { status: 200 });
   vi.stubGlobal("fetch", service);
 });
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-async function postJob(app: Application) {
-  return request(app).post("/v1/job").send({ escrow_ref: ESCROW_REF_STR, payload: PAYLOAD });
+async function postJob(app: Application, headers: Record<string, string> = {}) {
+  return request(app).post("/v1/job").set(headers).send({ escrow_ref: ESCROW_REF_STR, payload: PAYLOAD });
+}
+
+/** The headers of the n-th call that the runtime made to the service, with lower-case names. */
+function sentHeaders(call = 0): Record<string, string> {
+  return Object.fromEntries(new Headers(service.mock.calls[call]![1]!.headers).entries());
 }
 
 describe("custom capability: a new escrow of this supplier's own agent", () => {
@@ -389,6 +409,262 @@ describe("custom capability: refusals before any slot or Claim", () => {
     expect(posted.status).toBe(503);
     expect(posted.body.reason).toBe("agent_mismatch");
     expect(submitted).toHaveLength(0);
+  });
+});
+
+describe("custom capability: the escrow against the advert", () => {
+  // Each refusal has its twin above or in this block: the same request with the
+  // escrow that matches the advert is claimed.
+  it("refuses an escrow that names another advert, with the code in error and in reason", async () => {
+    const { app, state, submitted } = setup({ escrow: { advert_ref: { txHash: "ff".repeat(32), index: 0 } } });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(409);
+    expect(posted.body).toEqual({
+      error: "wrong_advert",
+      reason: "wrong_advert",
+      message: expect.stringContaining(`${"ff".repeat(32)}#0`),
+    });
+    expect(submitted).toHaveLength(0);
+    expect(service).not.toHaveBeenCalled();
+    expect(state.snapshot().activeSessions).toBe(0);
+  });
+
+  it("refuses an escrow with a payment below the advert price", async () => {
+    const { app, submitted } = setup({ escrow: { payment_lovelace: 1_999_999n } });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(409);
+    expect(posted.body).toMatchObject({ error: "underpaid", reason: "underpaid" });
+    expect(submitted).toHaveLength(0);
+    expect(service).not.toHaveBeenCalled();
+  });
+
+  it("refuses an escrow with a bond below the advert bond", async () => {
+    const { app, submitted } = setup({ escrow: { supplier_bond_lovelace: 999_999n } });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(409);
+    expect(posted.body).toMatchObject({ error: "bond_mismatch", reason: "bond_mismatch" });
+    expect(submitted).toHaveLength(0);
+  });
+
+  it("refuses an escrow output that holds less than its datum says", async () => {
+    const { app, submitted } = setup({ held: 3_999_999n });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(409);
+    expect(posted.body).toMatchObject({ error: "underpaid", reason: "underpaid" });
+    expect(submitted).toHaveLength(0);
+  });
+
+  it("claims an escrow with a buyer bond above the advert bond, as a payment from a vault posts it", async () => {
+    const { app, jobs, submitted } = setup({ escrow: { buyer_bond_lovelace: 1_633_000n } });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(202);
+    await vi.waitFor(() => expect(jobs.get(posted.body.job_id)?.status).toBe("done"));
+    expect(submitted.map((tx) => tx.body.type)).toEqual(["claim", "submit"]);
+  });
+});
+
+describe("custom capability: the job context for the service", () => {
+  const CONTEXT_NAMES = [
+    "x-vector-advert-model",
+    "x-vector-advert-ref",
+    "x-vector-buyer-pkh",
+    "x-vector-deliver-by-ms",
+    "x-vector-escrow-ref",
+    "x-vector-payment-lovelace",
+  ];
+
+  it("sends the escrow, the advert, the buyer, the payment and the deadline to the service as headers", async () => {
+    const { app, jobs, escrow } = setup();
+
+    const posted = await postJob(app);
+    expect(posted.status).toBe(202);
+    await vi.waitFor(() => expect(jobs.get(posted.body.job_id)?.status).toBe("done"));
+
+    const headers = sentHeaders();
+    expect(headers["x-vector-escrow-ref"]).toBe(ESCROW_REF_STR);
+    expect(headers["x-vector-advert-ref"]).toBe(`${ADVERT_REF.txHash}#${ADVERT_REF.index}`);
+    expect(headers["x-vector-advert-model"]).toBe(MODEL);
+    expect(headers["x-vector-buyer-pkh"]).toBe(BUYER_PKH);
+    expect(headers["x-vector-payment-lovelace"]).toBe("2000000");
+    expect(headers["x-vector-deliver-by-ms"]).toBe(String(escrow.deliver_by));
+  });
+
+  it("never passes a header of the buyer to the service, not even one with a name of the context", async () => {
+    const { app, jobs } = setup();
+
+    const posted = await postJob(app, {
+      "x-vector-escrow-ref": `${"0".repeat(64)}#9`,
+      "x-vector-advert-ref": `${"0".repeat(64)}#9`,
+      "x-vector-advert-model": "forged-model",
+      "x-vector-buyer-pkh": "0".repeat(56),
+      "x-vector-payment-lovelace": "999999999999",
+      "x-vector-deliver-by-ms": "1",
+      "x-vector-extra": "forged",
+      authorization: "Bearer forged",
+      cookie: "session=forged",
+    });
+    expect(posted.status).toBe(202);
+    await vi.waitFor(() => expect(jobs.get(posted.body.job_id)?.status).toBe("done"));
+
+    const headers = sentHeaders();
+    // The values are the ones of the chain, and the names are exactly the six and the content type.
+    expect(headers["x-vector-escrow-ref"]).toBe(ESCROW_REF_STR);
+    expect(headers["x-vector-buyer-pkh"]).toBe(BUYER_PKH);
+    expect(headers["x-vector-advert-model"]).toBe(MODEL);
+    expect(Object.keys(headers).sort()).toEqual(["content-type", ...CONTEXT_NAMES]);
+    expect(Object.values(headers).join(" ")).not.toContain("forged");
+  });
+});
+
+describe("custom capability: the check of the service before the Claim", () => {
+  const env = { SERVICE_PRECHECK_URL: PRECHECK_URL };
+
+  it("asks the service before the Claim, with the payload and the same headers as the job call", async () => {
+    const { app, chain, jobs } = setup({ env });
+    const submit = vi.spyOn(chain, "submitTx");
+
+    const posted = await postJob(app);
+    expect(posted.status).toBe(202);
+    await vi.waitFor(() => expect(jobs.get(posted.body.job_id)?.status).toBe("done"));
+
+    expect(service.mock.calls.map(([url]) => String(url))).toEqual([PRECHECK_URL, SERVICE_URL]);
+    expect(service.mock.calls.map(([, init]) => init?.body)).toEqual([PAYLOAD, PAYLOAD]);
+    expect(sentHeaders(0)).toEqual(sentHeaders(1));
+    // Order: the question, then the Claim, then the job.
+    const [question, job] = service.mock.invocationCallOrder;
+    const [claim] = submit.mock.invocationCallOrder;
+    expect(question).toBeLessThan(claim!);
+    expect(claim).toBeLessThan(job!);
+  });
+
+  it("refuses with the status of the service, leaves the escrow Open and calls no job", async () => {
+    precheckAnswer = () => Response.json(
+      { error: "approval_digest_mismatch", message: "The digest does not match." },
+      { status: 403 },
+    );
+    const { app, chain, jobs, state, submitted } = setup({ env });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(403);
+    expect(posted.body).toEqual({
+      error: "approval_digest_mismatch",
+      message: "The digest does not match.",
+      reason: "approval_digest_mismatch",
+    });
+    expect(submitted).toHaveLength(0);
+    expect(service).toHaveBeenCalledTimes(1);
+    expect(jobs.count()).toBe(0);
+    expect(state.snapshot().activeSessions).toBe(0);
+    const escrow = await chain.queryUtxo(ESCROW_REF);
+    expect(decodeIdentityEscrowDatum(escrow!.datumHex!).state).toBe("Open");
+  });
+
+  it("claims the same escrow on a second try after a refusal, because the escrow stayed Open", async () => {
+    const refusal = () => Response.json({ error: "busy" }, { status: 409 });
+    precheckAnswer = refusal;
+    const { app, jobs } = setup({ env });
+
+    expect((await postJob(app)).status).toBe(409);
+    precheckAnswer = () => new Response(null, { status: 204 });
+    const second = await postJob(app);
+
+    expect(second.status).toBe(202);
+    await vi.waitFor(() => expect(jobs.get(second.body.job_id)?.status).toBe("done"));
+  });
+
+  it("answers a busy service with the answer of a busy supplier: 409 supplier_busy, the code that buyer clients retry", async () => {
+    precheckAnswer = () => Response.json({ error: "busy" }, { status: 409 });
+    const { app } = setup({ env });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(409);
+    expect(posted.body).toEqual({
+      reason: "supplier_busy",
+      message: "supplier is already working another job",
+      error: { reason: "supplier_busy", message: "supplier is already working another job" },
+    });
+  });
+
+  it("refuses with 503 when the service cannot be reached, and builds no Claim", async () => {
+    precheckAnswer = () => {
+      throw new TypeError("fetch failed");
+    };
+    const { app, submitted } = setup({ env });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(503);
+    expect(posted.body).toMatchObject({ error: "precheck_unreachable", reason: "precheck_unreachable" });
+    expect(submitted).toHaveLength(0);
+  });
+});
+
+describe("custom capability: the agent card", () => {
+  const env = { PUBLIC_ORIGIN: "https://agent.example" };
+
+  it("serves the card with the capability and the model of the advert, and a 200 on GET /", async () => {
+    const { app } = setup({ env });
+
+    const card = await request(app).get("/.well-known/agent-card.json");
+
+    expect(card.status).toBe(200);
+    expect(card.body).toMatchObject({
+      name: MODEL,
+      capabilities: {},
+      defaultInputModes: ["application/json"],
+      defaultOutputModes: ["application/json"],
+      skills: [{ id: CAPABILITY, name: CAPABILITY }],
+      supportedInterfaces: [{ url: "https://agent.example/v1/job", protocolBinding: "vector-job-v1", protocolVersion: "1" }],
+    });
+    expect((await request(app).get("/")).status).toBe(200);
+  });
+});
+
+describe("custom capability: every new setting unset", () => {
+  // The agent of today: no check, no card, no watcher. Its answers do not change.
+  it("serves neither the card nor a page on GET /, as before", async () => {
+    const { app } = setup();
+
+    expect((await request(app).get("/")).status).toBe(404);
+    expect((await request(app).get("/.well-known/agent-card.json")).status).toBe(404);
+  });
+
+  it("has empty settings", () => {
+    const { config } = setup();
+    expect(config).toMatchObject({ servicePrecheckUrl: "", publicOrigin: "", releaseWatcher: false });
+  });
+
+  it("makes one call to the service for a job, to SERVICE_URL, with the body and the headers of the job call only", async () => {
+    const { app, jobs } = setup();
+
+    const posted = await postJob(app);
+    expect(posted.status).toBe(202);
+    await vi.waitFor(() => expect(jobs.get(posted.body.job_id)?.status).toBe("done"));
+
+    expect(service).toHaveBeenCalledTimes(1);
+    expect(String(service.mock.calls[0]![0])).toBe(SERVICE_URL);
+    expect(service.mock.calls[0]![1]).toMatchObject({ method: "POST", body: PAYLOAD });
+    expect(Object.keys(sentHeaders()).sort()).toEqual([
+      "content-type",
+      "x-vector-advert-model",
+      "x-vector-advert-ref",
+      "x-vector-buyer-pkh",
+      "x-vector-deliver-by-ms",
+      "x-vector-escrow-ref",
+      "x-vector-payment-lovelace",
+    ]);
   });
 });
 

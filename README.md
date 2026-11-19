@@ -12,12 +12,13 @@ A public, MIT-licensed GitHub template. Clone it, plug in your service, and you 
 
 ```
 README.md            # you are here
-docs/                 # LIFECYCLE.md, WALLET.md, GOTCHAS.md: the operator detail
+docs/                 # LIFECYCLE.md, WALLET.md, GOTCHAS.md, TRUST-LAYER.md, THREE-RUNTIMES.md: the operator detail
 agent/                 # supplier runtime + your integration seam (executor/)
 packages/shared/       # vendored chain core, byte-identical to the upstream pin
 try-it/                 # self-test buyer: commission one job from your own agent, verify offline
 examples/                # echo-service.mjs, a fake black box, and payload.txt for step 7
 deploy/                 # docker-compose.yml
+.env.example            # every setting, with SERVICE_PRECHECK_URL, PUBLIC_ORIGIN and RELEASE_WATCHER
 scripts/sync-core.sh    # re-vendor the chain core from a pinned upstream commit
 ```
 
@@ -169,23 +170,84 @@ Needs its own funded wallet: `BUYER_PRIV_KEY_HEX`, plus `OGMIOS_URL`, `NETWORK_I
 
 ## Plug in your software
 
-The whole integration surface is one interface:
+The integration surface is one interface, with one optional method:
 
 ```ts
+interface JobContext {
+  escrowRef: string;        // the escrow of the job: "<64 hex>#<index>", in lower case
+  advertRef: string;        // the advert that the escrow names: "<64 hex>#<index>"
+  advertModel: string;      // the model text of the advert
+  buyerPkh: string;         // the key hash of the buyer: 56 hex characters
+  paymentLovelace: string;  // the quoted amount of the escrow, in lovelace
+  deliverByMs: number;      // the deliver-by time of the escrow, in POSIX milliseconds
+}
 interface ExecutorJob {
   capabilityId: string;
   requestPayload: string;   // opaque request string, hashed into the escrow/receipt
   deadlineMs: number;       // remaining time budget, do not exceed it
   jobRef: string;           // escrow reference, for logging/correlation
+  context: JobContext;      // what the agent read from the chain about the escrow
 }
 interface ExecutorResult {
   outputPayload: string;    // opaque output string, hashed into the receipt
   meta?: Record<string, unknown>;
 }
+interface PrecheckJob {
+  capabilityId: string;
+  requestPayload: string;   // the same bytes that the job call sends later
+  jobRef: string;
+  context: JobContext;
+}
+type PrecheckResult = { ok: true } | { ok: false; status: number; code: string; message: string };
 execute(job: ExecutorJob): Promise<ExecutorResult>
+precheck?(job: PrecheckJob): Promise<PrecheckResult>   // optional: asked before the Claim
 ```
 
 **The common case needs no code.** The default implementation (`agent/src/executor/httpCallout.ts`) POSTs `requestPayload` as the raw request body to `SERVICE_URL`, with your response body becoming `outputPayload`. Point `SERVICE_URL` at anything that speaks HTTP.
+
+**What your service receives.** Each call to your service carries the job context as six headers. The agent reads the values from the chain, so a buyer cannot set them. The agent builds the headers of each call itself and passes no header of the buyer on. A header that a buyer sends with one of these names never reaches your service.
+
+| Header | Value |
+|---|---|
+| `x-vector-escrow-ref` | The escrow of the job: `<64 hex>#<index>`, in lower case. |
+| `x-vector-advert-ref` | The advert that the escrow names: `<64 hex>#<index>`. |
+| `x-vector-advert-model` | The model text of the advert, percent-encoded. Decode it with `decodeURIComponent`. A plain name stays as it is. |
+| `x-vector-buyer-pkh` | The key hash of the buyer: 56 hex characters. |
+| `x-vector-payment-lovelace` | The quoted amount of the escrow, in lovelace. |
+| `x-vector-deliver-by-ms` | The deliver-by time of the escrow, in POSIX milliseconds. |
+
+**Check a job before the agent claims it.** Set `SERVICE_PRECHECK_URL` to a URL of your service. The agent then asks your service before it builds the Claim. With no setting there is no check, and the agent claims as before.
+
+The call is a `POST` to that URL. The body is the request of the buyer: the same bytes that the job call sends later. The headers are the headers of the job call: the `content-type`, your `SERVICE_AUTH_HEADER` as `authorization`, and the six `x-vector-*` headers above. The agent makes the call after its own checks. It holds its job slot while it waits, so a second request gets `supplier_busy` before it reaches your service.
+
+| Your service answers | The agent does |
+|---|---|
+| A 2xx status | It claims the escrow, and then it calls your service for the job. |
+| A status from 400 to 599 | It builds no Claim. The escrow stays Open. The buyer gets that status and your code. |
+| 409 with the code `busy` | It builds no Claim. The buyer gets the answer of an agent that is busy: 409 with the code `supplier_busy`. Buyer clients retry that code. |
+| A 3xx status | It builds no Claim. The buyer gets 502. The agent does not follow a redirect. |
+| No answer in 10 seconds, or no connection | It builds no Claim. The buyer gets 503. |
+| 401 | It builds no Claim. The buyer gets 503 with the code `precheck_failed`. A 401 means that your service refused the token of the agent (`SERVICE_AUTH_HEADER`). That is a fault of the operator, not of the buyer. The log of the agent names the cause. |
+
+The buyer gets a JSON body with the keys `error`, `reason` and `message`. `error` and `reason` hold the same code. The code comes from the key `error` of the JSON body of your refusal: letters, digits, `_`, `.` and `-`, at most 64 characters. When your answer has no such code, the code is `precheck_refused`. The words come from the key `message`: the agent makes them one line and cuts them to 500 characters. An answer as short as `{"error":"busy"}` is enough.
+
+The agent has four codes of its own for the check: `precheck_timeout` and `precheck_unreachable` (both 503), `precheck_failed` (503, when an executor of your own throws, or when your service answers 401) and `precheck_bad_status` (502).
+
+A refusal costs no Claim fee. The buyer can send the same job again, or Reclaim the escrow after deliver-by. If you replace `makeHttpCalloutExecutor` with an executor of your own, add the optional method `precheck(job)` to it. It takes the request and the context, and it returns `{ ok: true }` or `{ ok: false, status, code, message }`.
+
+**Serve an agent card.** Set `PUBLIC_ORIGIN` to the https origin at which buyers reach this agent, for example `https://agent.example.com`. It must be the origin of the `endpoint` in your agent record. The agent then serves `GET /.well-known/agent-card.json` and answers `GET /` with a 200. The card is an A2A card with one interface: `<PUBLIC_ORIGIN>/v1/job`, with the binding `vector-job-v1` and the version `1`. The identity gateway lists your agent in its catalogs when it finds this card at the endpoint of your record. The card needs no data from the chain, so it is live before you register the record. It names the capability and the model of your advert when the agent can read the advert, and it has no skill when the agent cannot. Without `PUBLIC_ORIGIN` the agent serves neither route: both answer 404, as before. The origin comes from the setting only, never from a header of the request.
+
+**Release a Submitted escrow that the buyer did not accept.** Set `RELEASE_WATCHER=1`. It needs `LIVE_CHAIN=1`. Each minute the agent reads the escrow addresses, and it releases each Submitted escrow of its own whose 600-second accept window has ended. An escrow is its own when its supplier key is the key of this agent. An escrow that names an agent must name the agent of this node. The agent releases one escrow at a time, inside the wallet lock of the Claim and the Submit, with the Release transaction of the vendored core. It never releases before the window ends. After a failed release it waits five minutes before it tries that escrow again. It reads the chain, so it also releases the escrows that were Submitted before a restart. A release costs a chain fee, like each script transaction. Unset, empty or `0` is off, and `1` is on. Any other value stops the boot.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `SERVICE_PRECHECK_URL` | unset | The check before the Claim. Unset: no check. |
+| `PUBLIC_ORIGIN` | unset | The agent card, and a 200 on `GET /`. Unset: neither. |
+| `RELEASE_WATCHER` | unset (off) | The release watcher. Needs `LIVE_CHAIN=1`. |
+
+With the three settings unset, the agent answers each request as it did before. The context headers and the checks of the escrow against your advert have no setting: they apply to every job. To give an agent that runs today a card and nothing else, set `PUBLIC_ORIGIN` only.
+
+**Three runtimes in front of one service.** Each runtime needs its own key, advert and port, and the runtimes share one service URL. The check before the Claim keeps the one job slot of the service. See `docs/THREE-RUNTIMES.md`.
 
 **One thing to know about the payload:** `try-it` builds the request payload as the canonical JSON of a one-element message *array*, `canonicalize([{ content: <your file>, role: "user" }])`, because that is the preimage the vendored escrow builder hashes when it is given messages. Your service receives that whole array as the POST body, not your bare content:
 

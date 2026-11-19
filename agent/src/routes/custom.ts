@@ -12,9 +12,10 @@
  *   - prompt_hash check is sha256(utf8(payload)) — the raw request bytes, not
  *     a canonicalised message array;
  *   - the runner is `runCustomJob`, handed the mounted Executor;
- *   - one extra pre-Claim check the chat route has no equivalent for: the live
+ *   - two extra pre-Claim checks the chat route has no equivalent for: the live
  *     advert's max_processing_ms against the SLA this node was configured with
  *     (step 3b), because the boot guard could only check the configured value;
+ *     and the escrow against the advert of this node (step 5b, customTerms.ts);
  *   - GET renders the stored Responses payload in the custom wire shape
  *     (`choices[0].message.content` = the output bytes) and adds
  *     `submitted_ref`, the Submitted escrow output the buyer Accepts.
@@ -51,7 +52,7 @@ import {
 import type { SupplierState } from "../state.js";
 import type { SupplierConfig } from "../config.js";
 import type { JobStore } from "../jobs.js";
-import type { Executor } from "../executor/executor.js";
+import type { Executor, PrecheckJob, PrecheckResult } from "../executor/executor.js";
 import { runCustomJob } from "../customJobRunner.js";
 import { triggerOnFailureConsolidate } from "../walletHealth.js";
 import {
@@ -63,6 +64,8 @@ import {
   ownAgentId,
   type SupplierIdentity,
 } from "../identity/agent.js";
+import { escrowTermsRefusal } from "./customTerms.js";
+import { jobContext } from "../executor/context.js";
 
 /**
  * The subset of server.ts's (module-private) ResolvedDeps these handlers use,
@@ -98,6 +101,34 @@ function jsonError(res: Response, status: number, reason: string, message: strin
   return res
     .status(status)
     .json({ reason, message, error: { reason, message } });
+}
+
+/**
+ * A refusal of a check that this node makes before it claims. `error` and
+ * `reason` both hold the code, so a buyer reads it from either key. (The
+ * envelope above has `error` as an object. The buyer clients of this route
+ * read the top-level `reason` and `message`.)
+ */
+function refusal(res: Response, status: number, code: string, message: string): Response {
+  return res.status(status).json({ error: code, message, reason: code });
+}
+
+/**
+ * The check of the executor before the Claim, or a go when it has none. A check
+ * that throws is a refusal 503. A refusal with a status that is not an HTTP
+ * error status gets 503 too, so that the buyer always gets a status of 400 to 599.
+ */
+async function askService(executor: Executor, job: PrecheckJob): Promise<PrecheckResult> {
+  if (executor.precheck === undefined) return { ok: true };
+  let verdict: PrecheckResult;
+  try {
+    verdict = await executor.precheck(job);
+  } catch {
+    return { ok: false, status: 503, code: "precheck_failed", message: "The check before the Claim failed." };
+  }
+  if (verdict.ok) return verdict;
+  const status = Number.isInteger(verdict.status) && verdict.status >= 400 && verdict.status <= 599 ? verdict.status : 503;
+  return { ...verdict, status };
 }
 
 interface CustomBody {
@@ -222,6 +253,17 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
       const agentRefusal = newEscrowRefusal(escrowDatum, escrowUtxo.lovelace, advertResult.agentId, deps.identity);
       if (agentRefusal) return jsonError(res, agentRefusal.status, agentRefusal.reason, agentRefusal.message);
 
+      // ── 5b. The escrow against the advert of this node ───────────────
+      // The advert reference, the price, both bonds and the amount that the
+      // output holds (see ./customTerms.ts). Refused before any slot or Claim.
+      const termsRefusal = escrowTermsRefusal({
+        escrow: escrowDatum,
+        held: escrowUtxo.lovelace,
+        advert,
+        advertRef: deps.config.advertRef,
+      });
+      if (termsRefusal) return refusal(res, termsRefusal.status, termsRefusal.code, termsRefusal.message);
+
       // ── 6. Hash checks ───────────────────────────────────────────────
       const expectedRequestSpecHash = sha256Hex(canonicalize({
         capability_id: advert.capability_id,
@@ -251,6 +293,11 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
           `now ${nowMs} >= deliver_by ${escrowDatum.deliver_by}`);
       }
 
+      // ── 7b. The job context for the service ──────────────────────────
+      // Built from the escrow and the advert that this node read from the
+      // chain (see ../executor/context.ts). Nothing in it comes from the buyer.
+      const context = jobContext({ escrowRef: escrowRefStr, escrow: escrowDatum, advert });
+
       // ── 8. Acquire session slot ──────────────────────────────────────
       if (!deps.state.tryAcquire(escrowRefStr)) {
         return jsonError(res, 409, "supplier_busy", "supplier is already working another job");
@@ -258,6 +305,28 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
       acquiredRef = escrowRefStr;
       // From here on, every error path MUST release the slot until the
       // runner takes ownership of it.
+
+      // ── 8b. The check of the service before the Claim ────────────────
+      // The executor has this check only when SERVICE_PRECHECK_URL is set. A
+      // refusal leaves the escrow Open: no Claim and no job. The buyer gets
+      // the status, the code and the words of the service.
+      const verdict = await askService(executor, {
+        capabilityId: advert.capability_id,
+        requestPayload: payload,
+        jobRef: escrowRefStr,
+        context,
+      });
+      if (!verdict.ok) {
+        deps.state.release(escrowRefStr);
+        acquiredRef = null;
+        console.warn(`[precheck_refused] escrow=${escrowRefStr} status=${verdict.status} code=${JSON.stringify(verdict.code)}`);
+        // A busy service is a busy supplier. The buyer clients retry only this code, so
+        // the answer is the one that this node gives when its own slot is busy.
+        if (verdict.status === 409 && verdict.code === "busy") {
+          return jsonError(res, 409, "supplier_busy", "supplier is already working another job");
+        }
+        return refusal(res, verdict.status, verdict.code, verdict.message);
+      }
 
       // ── 9+10. Claim tx: build + confirm as ONE wallet critical section ─
       // (splitting them would let another wallet spend coin-select mid-flight)
@@ -327,6 +396,7 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
           identity: deps.identity,
         },
         executor,
+        context,
         jobId,
         escrowRef: escrowRefStr,
         claimedRef,

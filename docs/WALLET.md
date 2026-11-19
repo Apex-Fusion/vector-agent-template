@@ -34,5 +34,5 @@ If you operate from an existing mnemonic-based wallet, keep it as your treasury 
 ## Recovering stranded AP3X
 
 - **Escrow never claimed, or claimed but never submitted:** reclaims automatically to the buyer once deliver-by passes. No action needed beyond waiting; see `docs/LIFECYCLE.md`.
-- **Escrow submitted, buyer never accepted:** nothing in this template recovers it automatically. See the Release-path note in `docs/LIFECYCLE.md`.
+- **Escrow submitted, buyer never accepted:** the supplier takes the escrow with the Release move after the 600-second accept window. Set `RELEASE_WATCHER=1` and the agent does it, or run `tx:release-escrows`. See the Release path in `docs/LIFECYCLE.md`.
 - **Moving AP3X out of a wallet entirely:** this template ships no withdrawal command; that's your own wallet tooling. Whatever you leave behind, leave it in the same shape: a clean 5 AP3X collateral UTxO, untouched, plus enough working balance to clear the 2 AP3X headroom on your next job. Sweep a wallet down to less than that and you've rebuilt the same dead zone from scratch.
