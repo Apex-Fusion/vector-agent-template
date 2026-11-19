@@ -22,7 +22,7 @@ A service often does one job at a time. Each runtime thinks that it is free. Wit
 The check before the Claim prevents this. Set `SERVICE_PRECHECK_URL` to a route of your service. The runtime asks that route before each Claim, and it waits 10 seconds for the answer:
 
 1. When the service is free, it answers with a 2xx status. It keeps its job slot for the escrow that `x-vector-escrow-ref` names. When the service is busy, it answers 409.
-2. The runtime claims the escrow only after a 2xx answer. After a 409 it builds no Claim. The escrow stays Open, and the buyer gets the 409 with the code from your answer, for example `{"error":"busy"}`. The buyer can send the same job again later.
+2. The runtime claims the escrow only after a 2xx answer. After a refusal it builds no Claim, and the escrow stays Open. When your answer is 409 with the code `busy`, the buyer gets the answer of an agent that is busy: 409 with the code `supplier_busy`. Buyer clients retry that code, so they send the same job again later. Any other refusal reaches the buyer with its own status and code.
 3. The job call carries the same `x-vector-escrow-ref`. The service gives the kept slot to that job.
 
 Make the kept slot end by itself after a short time, for example two minutes. Then a Claim that fails does not block the service for ever. A service that has no slot rule needs no check.

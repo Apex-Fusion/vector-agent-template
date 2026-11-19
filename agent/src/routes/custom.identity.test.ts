@@ -583,14 +583,18 @@ describe("custom capability: the check of the service before the Claim", () => {
     await vi.waitFor(() => expect(jobs.get(second.body.job_id)?.status).toBe("done"));
   });
 
-  it("passes the code busy of a busy service on, with the status 409", async () => {
+  it("answers a busy service with the answer of a busy supplier: 409 supplier_busy, the code that buyer clients retry", async () => {
     precheckAnswer = () => Response.json({ error: "busy" }, { status: 409 });
     const { app } = setup({ env });
 
     const posted = await postJob(app);
 
     expect(posted.status).toBe(409);
-    expect(posted.body).toMatchObject({ error: "busy", reason: "busy" });
+    expect(posted.body).toEqual({
+      reason: "supplier_busy",
+      message: "supplier is already working another job",
+      error: { reason: "supplier_busy", message: "supplier is already working another job" },
+    });
   });
 
   it("refuses with 503 when the service cannot be reached, and builds no Claim", async () => {

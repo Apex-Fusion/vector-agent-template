@@ -600,4 +600,31 @@ describe("makeCustomHandler — the check of the service before the Claim", () =
     expect(captured.statusCode).toBe(202);
     expect(buildClaimTx).toHaveBeenCalledTimes(1);
   });
+
+  it("answers a busy service as it answers its own busy slot: 409 with the code supplier_busy", async () => {
+    const busyNode = setup(async () => ({ ok: true }));
+    expect(busyNode.state.tryAcquire(`${"9".repeat(64)}#0`)).toBe(true);
+    const own = await post(busyNode.deps);
+
+    const { deps, state } = setup(async () => ({ ok: false, status: 409, code: "busy", message: "The service is working on another job." }));
+    const mapped = await post(deps);
+
+    expect(mapped.statusCode).toBe(409);
+    expect(mapped.body).toEqual(own.body);
+    expect(mapped.body).toMatchObject({ reason: "supplier_busy", error: { reason: "supplier_busy" } });
+    expect(buildClaimTx).not.toHaveBeenCalled();
+    expect(state.snapshot().activeSessions).toBe(0);
+  });
+
+  it.each([
+    ["a 409 with another code", { status: 409, code: "unavailable" }],
+    ["the code busy with another status", { status: 503, code: "busy" }],
+  ])("does not map %s", async (_name, answer) => {
+    const { deps } = setup(async () => ({ ok: false, ...answer, message: "The service says no." }));
+
+    const captured = await post(deps);
+
+    expect(captured.statusCode).toBe(answer.status);
+    expect(captured.body).toEqual({ error: answer.code, message: "The service says no.", reason: answer.code });
+  });
 });

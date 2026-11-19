@@ -320,6 +320,11 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
         deps.state.release(escrowRefStr);
         acquiredRef = null;
         console.warn(`[precheck_refused] escrow=${escrowRefStr} status=${verdict.status} code=${JSON.stringify(verdict.code)}`);
+        // A busy service is a busy supplier. The buyer clients retry only this code, so
+        // the answer is the one that this node gives when its own slot is busy.
+        if (verdict.status === 409 && verdict.code === "busy") {
+          return jsonError(res, 409, "supplier_busy", "supplier is already working another job");
+        }
         return refusal(res, verdict.status, verdict.code, verdict.message);
       }
 
