@@ -1,8 +1,15 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   build:
     runs-on: nixos
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -18,7 +25,17 @@ jobs:
       - run: pnpm -r --if-present typecheck
       - run: pnpm -r --if-present test
       - run: bash scripts/lint-public-prose.sh
-      - run: docker build -f agent/Dockerfile -t vector-agent-template:ci .
+      - uses: docker/setup-buildx-action@v4
+      # context: . and load: true keep the old docker build behaviour: local files in, local image out.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: agent/Dockerfile
+          tags: vector-agent-template:ci
+          push: false
+          load: true
+          cache-from: type=gha,scope=vector-agent-template
+          cache-to: type=gha,mode=max,scope=vector-agent-template
       # The compiled validator blueprint must be INSIDE the image.
       # loadBlueprint() is called lazily, deep inside the live tx builders, so
       # an image that is missing contracts/marketplace/plutus.json still builds
