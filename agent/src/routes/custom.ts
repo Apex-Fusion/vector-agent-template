@@ -12,9 +12,10 @@
  *   - prompt_hash check is sha256(utf8(payload)) — the raw request bytes, not
  *     a canonicalised message array;
  *   - the runner is `runCustomJob`, handed the mounted Executor;
- *   - one extra pre-Claim check the chat route has no equivalent for: the live
+ *   - two extra pre-Claim checks the chat route has no equivalent for: the live
  *     advert's max_processing_ms against the SLA this node was configured with
  *     (step 3b), because the boot guard could only check the configured value;
+ *     and the escrow against the advert of this node (step 5b, customTerms.ts);
  *   - GET renders the stored Responses payload in the custom wire shape
  *     (`choices[0].message.content` = the output bytes) and adds
  *     `submitted_ref`, the Submitted escrow output the buyer Accepts.
@@ -63,6 +64,7 @@ import {
   ownAgentId,
   type SupplierIdentity,
 } from "../identity/agent.js";
+import { escrowTermsRefusal } from "./customTerms.js";
 
 /**
  * The subset of server.ts's (module-private) ResolvedDeps these handlers use,
@@ -98,6 +100,16 @@ function jsonError(res: Response, status: number, reason: string, message: strin
   return res
     .status(status)
     .json({ reason, message, error: { reason, message } });
+}
+
+/**
+ * A refusal of a check that this node makes before it claims. `error` and
+ * `reason` both hold the code, so a buyer reads it from either key. (The
+ * envelope above has `error` as an object. The buyer clients of this route
+ * read the top-level `reason` and `message`.)
+ */
+function refusal(res: Response, status: number, code: string, message: string): Response {
+  return res.status(status).json({ error: code, message, reason: code });
 }
 
 interface CustomBody {
@@ -221,6 +233,17 @@ export function makeCustomHandler(deps: CustomRouteDeps) {
       // value cap; a legacy escrow passes. Refused before any slot or Claim.
       const agentRefusal = newEscrowRefusal(escrowDatum, escrowUtxo.lovelace, advertResult.agentId, deps.identity);
       if (agentRefusal) return jsonError(res, agentRefusal.status, agentRefusal.reason, agentRefusal.message);
+
+      // ── 5b. The escrow against the advert of this node ───────────────
+      // The advert reference, the price, both bonds and the amount that the
+      // output holds (see ./customTerms.ts). Refused before any slot or Claim.
+      const termsRefusal = escrowTermsRefusal({
+        escrow: escrowDatum,
+        held: escrowUtxo.lovelace,
+        advert,
+        advertRef: deps.config.advertRef,
+      });
+      if (termsRefusal) return refusal(res, termsRefusal.status, termsRefusal.code, termsRefusal.message);
 
       // ── 6. Hash checks ───────────────────────────────────────────────
       const expectedRequestSpecHash = sha256Hex(canonicalize({

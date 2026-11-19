@@ -52,6 +52,20 @@ An advert posted with your `AGENT_ID` (README step 5) gives escrows that carry t
 
 Escrows posted against a legacy advert keep the legacy rules and the 8-field receipt until the last of them closes.
 
+## What the agent checks before the Claim
+
+A buyer sends the job to `POST /v1/job` with the escrow reference and the request. The agent reads the escrow and your advert from the chain. It claims the escrow only when every check passes. A refused job costs no Claim, and the escrow stays Open. The buyer can Reclaim it after deliver-by.
+
+Some checks compare the escrow with your own advert (`ADVERT_REF`). The answer to the buyer is a JSON body with the keys `error` and `reason` (both hold the code) and `message`:
+
+| Code | Status | The escrow breaks this rule |
+|---|---|---|
+| `wrong_advert` | 409 | The escrow names another advert than `ADVERT_REF`. |
+| `underpaid` | 409 | The quoted amount (`payment_lovelace`) of the escrow is below the advert price. Or the escrow output holds less than the quoted amount and both bonds of its datum. |
+| `bond_mismatch` | 409 | A bond of the escrow is below the bond of the advert. |
+
+An amount above the advert is not refused. The supplier gets more, not less. An escrow that comes from a vault can have a buyer bond above the advert bond, because the builder adds the minimum ada of the output to that bond.
+
 ## Timing
 
 - **Deliver-by** = the time the escrow was posted + your advert's SLA (`max_processing_ms`) + a 30-second grace. Before deliver-by passes, a buyer cannot Reclaim an Open or Claimed escrow: the supplier still has time to work it. After deliver-by passes, the buyer can walk away with a full refund whether or not you've started.

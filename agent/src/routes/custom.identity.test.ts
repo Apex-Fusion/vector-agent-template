@@ -20,6 +20,9 @@
  *   4. a record that fails the escrow contract's checks answers
  *      agent_not_eligible and frees the slot, with no transaction.
  *   5. a legacy escrow keeps the legacy path: no reference input, 8 fields.
+ *   6. an escrow that names another advert, or that pays or holds less than
+ *      the advert asks, is refused before any slot or Claim (wrong_advert,
+ *      underpaid, bond_mismatch). A buyer bond above the advert bond is not.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -188,6 +191,8 @@ interface SetupOptions {
   escrow?: "legacy" | Partial<IdentityEscrowDatum>;
   /** Capabilities of the agent's record; null seeds no record. */
   recordCapabilities?: string[] | null;
+  /** The lovelace that the escrow output holds. Default: the payment and both bonds of its datum. */
+  held?: bigint;
 }
 
 function setup(options: SetupOptions = {}) {
@@ -229,7 +234,7 @@ function setup(options: SetupOptions = {}) {
 
   // The escrow output holds payment + both bonds, as a Post locks them.
   const escrow = newEscrow(options.escrow === "legacy" ? {} : options.escrow);
-  const locked = escrow.payment_lovelace + escrow.buyer_bond_lovelace + escrow.supplier_bond_lovelace;
+  const locked = options.held ?? escrow.payment_lovelace + escrow.buyer_bond_lovelace + escrow.supplier_bond_lovelace;
   if (options.escrow === "legacy") {
     const { agent_id: _agentId, refund: _refund, ...legacy } = escrow;
     chain.seed({
@@ -389,6 +394,67 @@ describe("custom capability: refusals before any slot or Claim", () => {
     expect(posted.status).toBe(503);
     expect(posted.body.reason).toBe("agent_mismatch");
     expect(submitted).toHaveLength(0);
+  });
+});
+
+describe("custom capability: the escrow against the advert", () => {
+  // Each refusal has its twin above or in this block: the same request with the
+  // escrow that matches the advert is claimed.
+  it("refuses an escrow that names another advert, with the code in error and in reason", async () => {
+    const { app, state, submitted } = setup({ escrow: { advert_ref: { txHash: "ff".repeat(32), index: 0 } } });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(409);
+    expect(posted.body).toEqual({
+      error: "wrong_advert",
+      reason: "wrong_advert",
+      message: expect.stringContaining(`${"ff".repeat(32)}#0`),
+    });
+    expect(submitted).toHaveLength(0);
+    expect(service).not.toHaveBeenCalled();
+    expect(state.snapshot().activeSessions).toBe(0);
+  });
+
+  it("refuses an escrow with a payment below the advert price", async () => {
+    const { app, submitted } = setup({ escrow: { payment_lovelace: 1_999_999n } });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(409);
+    expect(posted.body).toMatchObject({ error: "underpaid", reason: "underpaid" });
+    expect(submitted).toHaveLength(0);
+    expect(service).not.toHaveBeenCalled();
+  });
+
+  it("refuses an escrow with a bond below the advert bond", async () => {
+    const { app, submitted } = setup({ escrow: { supplier_bond_lovelace: 999_999n } });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(409);
+    expect(posted.body).toMatchObject({ error: "bond_mismatch", reason: "bond_mismatch" });
+    expect(submitted).toHaveLength(0);
+  });
+
+  it("refuses an escrow output that holds less than its datum says", async () => {
+    const { app, submitted } = setup({ held: 3_999_999n });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(409);
+    expect(posted.body).toMatchObject({ error: "underpaid", reason: "underpaid" });
+    expect(submitted).toHaveLength(0);
+  });
+
+  it("claims an escrow with a buyer bond above the advert bond, as a payment from a vault posts it", async () => {
+    const { app, jobs, submitted } = setup({ escrow: { buyer_bond_lovelace: 1_633_000n } });
+
+    const posted = await postJob(app);
+
+    expect(posted.status).toBe(202);
+    await vi.waitFor(() => expect(jobs.get(posted.body.job_id)?.status).toBe("done"));
+    expect(submitted.map((tx) => tx.body.type)).toEqual(["claim", "submit"]);
   });
 });
 
