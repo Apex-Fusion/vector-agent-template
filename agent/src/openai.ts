@@ -6,6 +6,7 @@ import {
   responseInputToChatMessages,
   responseCompatibilityError,
   responseTextToChatResponseFormat,
+  responseInputTokenUpperBound,
   responseOutputText,
   type ResponseFunctionTool,
   type ResponseItem,
@@ -33,6 +34,19 @@ export interface CallResponsesParams extends ResponseRequest {
   responsesUrl?: string;
   /** Collect native SSE even for buffered calls when the provider is streaming-only. */
   responsesStreamOnly?: boolean;
+  /**
+   * Collect the Chat Completions SSE even for buffered calls. For providers
+   * that send no response header before the answer is complete: the Node 20
+   * fetch gives up on such a call after 300 s, whatever `timeoutMs` is.
+   */
+  chatStreamOnly?: boolean;
+  /**
+   * Context window of the upstream model in tokens. With it, an output limit
+   * is also capped to the window minus an upper bound of the input, because
+   * the provider counts the input against the window and refuses a limit
+   * that leaves no room for it.
+   */
+  contextTokens?: number;
 }
 
 export interface OpenAiResult {
@@ -170,11 +184,23 @@ function assertSuccessfulTerminal(response: ResponseObject): void {
   }
 }
 
-function effectiveMaxOutputTokens(buyerLimit: number | undefined, operatorLimit: number | undefined): number | undefined {
-  const buyer = typeof buyerLimit === "number" && buyerLimit > 0 ? buyerLimit : undefined;
-  const operator = typeof operatorLimit === "number" && operatorLimit > 0 ? operatorLimit : undefined;
-  if (buyer !== undefined && operator !== undefined) return Math.min(buyer, operator);
-  return buyer ?? operator;
+/**
+ * The output limit that goes upstream: the buyer's explicit limit, capped to
+ * the operator ceiling. With a known context window it is also capped to the
+ * window minus an upper bound of the input (the provider counts the input
+ * against the window and refuses a limit that leaves no room for it). A call
+ * without a limit stays without one, and a window that the input bound
+ * already fills leaves the limit as it is: the provider then decides.
+ */
+function effectiveMaxOutputTokens(params: CallResponsesParams): number | undefined {
+  const buyer = typeof params.max_output_tokens === "number" && params.max_output_tokens > 0
+    ? params.max_output_tokens
+    : undefined;
+  const operator = typeof params.maxTokens === "number" && params.maxTokens > 0 ? params.maxTokens : undefined;
+  const limit = buyer !== undefined && operator !== undefined ? Math.min(buyer, operator) : buyer ?? operator;
+  if (limit === undefined || params.contextTokens === undefined) return limit;
+  const room = params.contextTokens - responseInputTokenUpperBound(params);
+  return room >= 1 ? Math.min(limit, room) : limit;
 }
 
 function endpoint(params: CallResponsesParams, api: OpenAiUpstreamApi): string {
@@ -213,7 +239,7 @@ function nativePayload(params: CallResponsesParams, stream: boolean): Record<str
   ] as const) {
     if (params[key] !== undefined) payload[key] = params[key];
   }
-  const maxOutputTokens = effectiveMaxOutputTokens(params.max_output_tokens, params.maxTokens);
+  const maxOutputTokens = effectiveMaxOutputTokens(params);
   if (maxOutputTokens !== undefined) payload.max_output_tokens = maxOutputTokens;
   if (params.disableReasoning) {
     payload.reasoning = {
@@ -268,7 +294,7 @@ function chatPayload(params: CallResponsesParams, stream: boolean): Record<strin
 
   const payload: Record<string, unknown> = { model: params.model, messages, stream };
   if (stream) payload.stream_options = { include_usage: true };
-  const maxOutputTokens = effectiveMaxOutputTokens(params.max_output_tokens, params.maxTokens);
+  const maxOutputTokens = effectiveMaxOutputTokens(params);
   if (maxOutputTokens !== undefined) payload.max_tokens = maxOutputTokens;
   if (params.tools?.length) payload.tools = params.tools.map(chatTool);
   if (params.tool_choice !== undefined) payload.tool_choice = chatToolChoice(params.tool_choice);
@@ -469,6 +495,9 @@ export async function callResponses(params: CallResponsesParams): Promise<OpenAi
     if (api === "responses" && params.responsesStreamOnly) {
       return await callNativeResponsesStream(params, undefined, startedAt, controller);
     }
+    if (api === "chat-completions" && params.chatStreamOnly) {
+      return await callChatCompletionsCollected(params, startedAt, controller);
+    }
     const upstream = await fetchUpstream(params, api, false, controller.signal);
     await assertOk(upstream);
     let parsed: unknown;
@@ -590,7 +619,22 @@ interface ChatStreamState {
   finishReason?: string;
   usage: ResponseUsage | null;
   costUsd?: number;
+  /** The usage object as the provider sent it; the last one counts. */
+  rawUsage?: unknown;
   toolCalls: Map<number, { id: string; name: string; arguments: string }>;
+}
+
+function newChatStreamState(model: string): ChatStreamState {
+  return {
+    id: `resp_${crypto.randomUUID()}`,
+    model,
+    createdAt: Math.floor(Date.now() / 1000),
+    text: "",
+    refusal: "",
+    contentOrder: [],
+    usage: null,
+    toolCalls: new Map(),
+  };
 }
 
 function parseChatChunk(raw: unknown, state: ChatStreamState): Array<{ kind: "text" | "refusal"; delta: string }> {
@@ -600,6 +644,7 @@ function parseChatChunk(raw: unknown, state: ChatStreamState): Array<{ kind: "te
   if (finiteNonNegative(value.created)) state.createdAt = value.created;
   if (value.usage !== undefined && value.usage !== null) {
     state.usage = chatUsage(value.usage);
+    state.rawUsage = value.usage;
     state.costUsd = costFromUsage(value.usage);
   }
   if (value.error && typeof value.error === "object") {
@@ -802,6 +847,35 @@ function chatStreamResponse(state: ChatStreamState): ResponseObject {
   });
 }
 
+/**
+ * The buffered chat completion that the same call without streaming returns.
+ * chatTerminal reads it, so a collected stream gives the canonical Response of
+ * the buffered call: the message Item has no id, and reasoning deltas are
+ * dropped as the buffered call drops message.reasoning.
+ */
+function chatCompletionFromStream(state: ChatStreamState): Record<string, unknown> {
+  const toolCalls = [...state.toolCalls.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([, call]) => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } }));
+  return {
+    id: state.id,
+    object: "chat.completion",
+    created: state.createdAt,
+    model: state.model,
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        content: state.text === "" ? null : state.text,
+        refusal: state.refusal === "" ? null : state.refusal,
+        ...(toolCalls.length === 0 ? {} : { tool_calls: toolCalls }),
+      },
+      finish_reason: state.finishReason,
+    }],
+    ...(state.rawUsage === undefined ? {} : { usage: state.rawUsage }),
+  };
+}
+
 async function callChatCompletionsStream(
   params: CallResponsesParams,
   onEvent: (event: ResponseStreamEvent) => void,
@@ -813,16 +887,7 @@ async function callChatCompletionsStream(
   if (!upstream.body) {
     throw new OpenAiError("openai_malformed", "OpenAI streaming response had no body");
   }
-  const state: ChatStreamState = {
-    id: `resp_${crypto.randomUUID()}`,
-    model: params.model,
-    createdAt: Math.floor(Date.now() / 1000),
-    text: "",
-    refusal: "",
-    contentOrder: [],
-    usage: null,
-    toolCalls: new Map(),
-  };
+  const state = newChatStreamState(params.model);
   let sequence = 0;
   let created = false;
   let messageStarted = false;
@@ -937,6 +1002,40 @@ async function callChatCompletionsStream(
   }
   emit({ type: response.status === "incomplete" ? "response.incomplete" : "response.completed", response });
   return resultFromResponse(response, startedAt, state.costUsd);
+}
+
+/**
+ * A buffered Chat Completions call that reads the provider's SSE
+ * (chatStreamOnly). The provider sends the response header at once and a chunk
+ * for each token, so neither the 300 s header timeout nor the 300 s body
+ * timeout of the Node fetch ends a long generation. The result is the one of a
+ * buffered call.
+ */
+async function callChatCompletionsCollected(
+  params: CallResponsesParams,
+  startedAt: number,
+  controller: AbortController,
+): Promise<OpenAiResult> {
+  const upstream = await fetchUpstream(params, "chat-completions", true, controller.signal);
+  await assertOk(upstream);
+  if (!upstream.body) {
+    throw new OpenAiError("openai_malformed", "OpenAI streaming response had no body");
+  }
+  const state = newChatStreamState(params.model);
+  try {
+    for await (const chunk of readChatSse(upstream.body)) parseChatChunk(chunk, state);
+  } catch (error) {
+    if (error instanceof OpenAiError) throw error;
+    if (isAbortError(error)) {
+      throw new OpenAiError("openai_timeout", `OpenAI stream exceeded ${params.timeoutMs}ms`);
+    }
+    throw new OpenAiError(
+      "openai_failure",
+      `OpenAI stream read failed: ${(error as Error)?.message ?? String(error)}`,
+    );
+  }
+  const terminal = chatTerminal(chatCompletionFromStream(state), params.model);
+  return resultFromResponse(terminal.response, startedAt, terminal.costUsd);
 }
 
 export async function callResponsesStream(

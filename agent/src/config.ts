@@ -39,6 +39,17 @@
  *   OLLAMA_TIMEOUT_MS      — ollama request timeout in ms (default 120_000)
  *   OPENAI_TIMEOUT_MS      — openai request timeout in ms (default 180_000 — GPT
  *                            first-token latency is longer than local Ollama)
+ *   OPENAI_CHAT_STREAM_ONLY
+ *                          — "1" collects the Chat Completions SSE even for buffered
+ *                            one-shot calls. For a provider that sends no response
+ *                            header before the answer is complete (Hetzner): the
+ *                            Node 20 fetch gives up on such a call after 300 s,
+ *                            whatever OPENAI_TIMEOUT_MS is. Strict "1" only. Default
+ *                            off. Requires OPENAI_UPSTREAM_API=chat-completions.
+ *   OPENAI_CONTEXT_TOKENS  — context window of the upstream model in tokens (default
+ *                            unset). An output limit is then capped to the window
+ *                            minus an upper bound of the input, so that a buyer limit
+ *                            near the window does not make the provider refuse the call.
  *   OPENAI_SESSION_PASSTHROUGH
  *                          — "1" switches chat-session turns to the stateful-
  *                            upstream contract (OpenClaw): escrow ref as the
@@ -204,6 +215,14 @@ export interface SupplierConfig {
   /** Collect the native SSE result for providers whose JSON aggregate omits output. */
   openaiResponsesStreamOnly: boolean;
   /**
+   * Collect the Chat Completions SSE even for buffered one-shot calls. For
+   * providers that send no response header before the answer is complete
+   * (Hetzner): the Node 20 fetch gives up on such a call after 300 s, whatever
+   * OPENAI_TIMEOUT_MS is. Env: OPENAI_CHAT_STREAM_ONLY="1". Requires
+   * OPENAI_UPSTREAM_API=chat-completions.
+   */
+  openaiChatStreamOnly: boolean;
+  /**
    * When true, native Responses calls send `reasoning:{effort:"none"}`.
    * Explicit Chat Completions adapters send the documented OpenRouter
    * `reasoning:{enabled:false}` extension. Set via OPENAI_REASONING=off.
@@ -214,6 +233,13 @@ export interface SupplierConfig {
    * explicitly supplies max_output_tokens.
    */
   openaiMaxTokens: number;
+  /**
+   * Context window of the upstream model in tokens (env OPENAI_CONTEXT_TOKENS).
+   * 0 means unknown. With it, an output limit is capped to the window minus an
+   * upper bound of the input, so that a buyer limit near the window does not
+   * make the provider refuse the call.
+   */
+  openaiContextTokens: number;
   /**
    * When true, chat-session turns speak the STATEFUL-upstream contract
    * (e.g. an OpenClaw gateway): each turn sends the escrow ref as the OpenAI
@@ -502,6 +528,10 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
   if (openaiResponsesStreamOnly && openaiUpstreamApi !== "responses") {
     throw new Error("loadConfig: OPENAI_RESPONSES_STREAM_ONLY requires OPENAI_UPSTREAM_API=responses");
   }
+  const openaiChatStreamOnly = env.OPENAI_CHAT_STREAM_ONLY === "1";
+  if (openaiChatStreamOnly && openaiUpstreamApi !== "chat-completions") {
+    throw new Error("loadConfig: OPENAI_CHAT_STREAM_ONLY requires OPENAI_UPSTREAM_API=chat-completions");
+  }
 
   // OPENAI_REASONING — "off"/"false"/"0"/"no" disables upstream reasoning.
   // Native Responses calls send reasoning:{effort:"none"}. Explicit
@@ -537,6 +567,17 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
       throw new Error("loadConfig: OPENAI_MAX_TOKENS must be a positive integer");
     }
     openaiMaxTokens = Number(maxTokStr);
+  }
+
+  // OPENAI_CONTEXT_TOKENS — optional context window of the upstream model.
+  // Unset (0) leaves an output limit as the buyer and the operator set it.
+  const contextTokStr = env.OPENAI_CONTEXT_TOKENS;
+  let openaiContextTokens = 0;
+  if (contextTokStr !== undefined && contextTokStr !== "") {
+    if (!POS_INT_RE.test(contextTokStr)) {
+      throw new Error("loadConfig: OPENAI_CONTEXT_TOKENS must be a positive integer");
+    }
+    openaiContextTokens = Number(contextTokStr);
   }
 
   // OPENAI_SESSION_PASSTHROUGH — "1" switches chat-session turns to the
@@ -813,8 +854,10 @@ export function loadConfig(env: Record<string, string | undefined>): SupplierCon
     openaiUpstreamApi,
     openaiResponsesUrl,
     openaiResponsesStreamOnly,
+    openaiChatStreamOnly,
     openaiReasoningDisabled,
     openaiMaxTokens,
+    openaiContextTokens,
     openaiSessionPassthrough,
     openaiModelOverride,
     piperUrl,

@@ -24,6 +24,7 @@ import type { LiveOgmiosProvider } from "../../chain/LiveOgmiosProvider.js";
 import { loadIdentityBlueprint, type IdentityBlueprint } from "../blueprint.js";
 import type { BuildResult, WalletKey } from "../types.js";
 import { TxConstructionError } from "../types.js";
+import { checkedAddressText } from "./addressText.js";
 import { createLucidContext } from "./lucidContext.js";
 import {
   assertCollateralCandidate, buildLucidProvider, chainUtxoToLucidScriptInput, reserveScriptSpendCollateral,
@@ -108,6 +109,8 @@ function minimumLovelace(output: LiveOutput, coinsPerUtxoByte: bigint): bigint {
 }
 
 export async function buildLiveScriptSpend(params: LiveScriptSpendParams): Promise<BuildResult> {
+  // The refund address of a datum is a text from outside. Lucid reads each output address with the decoder library.
+  for (const output of params.outputs) checkedAddressText(output.address, "the address of a planned output");
   const provider = buildLucidProvider(params.chain);
   const { lucid } = await createLucidContext(provider, params.walletKey, {
     networkId: 1,

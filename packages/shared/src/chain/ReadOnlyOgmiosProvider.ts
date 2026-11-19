@@ -7,12 +7,16 @@
  * submitTx() and awaitTx() throw NotSupportedError — this provider is
  * read-only and cannot mutate chain state.
  *
+ * Every request is read-only. A transient error (HTTP status 500 or higher,
+ * network error) is tried again, at most 2 more times: see ogmiosRetry.ts.
+ *
  * JSON-RPC pattern follows apex-dashboard's ogmios-client.ts:
  *   - HTTP POST to ogmiosUrl
  *   - body: { jsonrpc: "2.0", method, params, id }
  *   - response: { jsonrpc: "2.0", result | error, id }
  */
 
+import { WithheldOutputs, assertOutputFields } from "./datumGuard.js";
 import type {
   ChainProvider,
   OutputReference,
@@ -21,6 +25,7 @@ import type {
   Utxo,
 } from "./ChainProvider.js";
 import { NotSupportedError } from "./ChainProvider.js";
+import { fetchOgmiosRead } from "./ogmiosRetry.js";
 
 export interface ReadOnlyOgmiosProviderOpts {
   ogmiosUrl: string;
@@ -28,6 +33,8 @@ export interface ReadOnlyOgmiosProviderOpts {
   timeoutMs?: number;
   /** Injected fetch for testing. Defaults to globalThis.fetch resolved at call time. */
   fetch?: typeof globalThis.fetch;
+  /** Wait before a new try of a request, in ms. Injected for testing. Defaults to a timer. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 interface OgmiosUtxo {
@@ -61,12 +68,14 @@ export class ReadOnlyOgmiosProvider implements ChainProvider {
   private readonly ogmiosUrl: string;
   private readonly timeoutMs: number;
   private readonly injectedFetch?: typeof globalThis.fetch;
+  private readonly sleep?: (ms: number) => Promise<void>;
   private requestId = 0;
 
   constructor(opts: ReadOnlyOgmiosProviderOpts) {
     this.ogmiosUrl = opts.ogmiosUrl;
     this.timeoutMs = opts.timeoutMs ?? 30_000;
     this.injectedFetch = opts.fetch;
+    this.sleep = opts.sleep;
   }
 
   private resolveFetch(): typeof globalThis.fetch {
@@ -84,18 +93,15 @@ export class ReadOnlyOgmiosProvider implements ChainProvider {
     };
     if (params !== undefined) body.params = params;
 
-    const init: RequestInit = {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    // A read-only request: a transient error is tried again (see ogmiosRetry.ts).
+    const response = await fetchOgmiosRead({
+      fetch: this.resolveFetch(),
+      url: this.ogmiosUrl,
+      method,
       body: JSON.stringify(body),
-    };
-    // AbortSignal.timeout is widely supported in Node 18+; guard for environments
-    // where it may not exist (some test mocks).
-    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
-      init.signal = AbortSignal.timeout(this.timeoutMs);
-    }
-
-    const response = await this.resolveFetch()(this.ogmiosUrl, init);
+      timeoutMs: this.timeoutMs,
+      sleep: this.sleep,
+    });
     if (!response.ok) {
       throw new Error(`Ogmios HTTP error: ${response.status} ${response.statusText}`);
     }
@@ -123,20 +129,21 @@ export class ReadOnlyOgmiosProvider implements ChainProvider {
     };
     const result = await this.rpc<OgmiosUtxo[]>("queryLedgerState/utxo", params);
     if (!Array.isArray(result) || result.length === 0) return null;
-    return ogmiosUtxoToUtxo(result[0]);
+    return ogmiosAnswerToUtxos([result[0]])[0] ?? null;
   }
 
   async queryUtxosByAddress(address: string): Promise<Utxo[]> {
     const params = { addresses: [address] };
     const result = await this.rpc<OgmiosUtxo[]>("queryLedgerState/utxo", params);
     if (!Array.isArray(result)) return [];
-    return result.map(ogmiosUtxoToUtxo);
+    return ogmiosAnswerToUtxos(result);
   }
 
   async evaluateTx(txCborHex: string): Promise<TxEvaluationResult> {
     // We split error handling into two layers:
-    //   - HTTP/transport errors (500, network failures): re-thrown so callers
-    //     can distinguish "the node is down" from "the script failed".
+    //   - HTTP/transport errors (500, network failures): tried again (see
+    //     ogmiosRetry.ts), then re-thrown so callers can distinguish "the
+    //     node is down" from "the script failed".
     //   - JSON-RPC errors (Ogmios returned a structured error like script
     //     execution failure): returned as { ok: false, error }.
     const params = { transaction: { cbor: txCborHex } };
@@ -148,16 +155,14 @@ export class ReadOnlyOgmiosProvider implements ChainProvider {
       params,
       id: this.requestId,
     });
-    const init: RequestInit = {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    const response = await fetchOgmiosRead({
+      fetch: this.resolveFetch(),
+      url: this.ogmiosUrl,
+      method: "evaluateTransaction",
       body,
-    };
-    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
-      init.signal = AbortSignal.timeout(this.timeoutMs);
-    }
-
-    const response = await this.resolveFetch()(this.ogmiosUrl, init);
+      timeoutMs: this.timeoutMs,
+      sleep: this.sleep,
+    });
     if (!response.ok) {
       throw new Error(`Ogmios HTTP error: ${response.status} ${response.statusText}`);
     }
@@ -190,7 +195,23 @@ export class ReadOnlyOgmiosProvider implements ChainProvider {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-function ogmiosUtxoToUtxo(o: OgmiosUtxo): Utxo {
+/**
+ * The UTxOs of one Ogmios answer. This client never leaves an output out: an output is absent from an answer only when the node does
+ * not list it, and the callers read "absent" as "spent". An output whose datum fails the check stays in the list with no datum
+ * (datumGuard.ts). The client maps no native script (only a Plutus V3 script, as opaque bytes), so the decoder library never reads
+ * a script that comes from here. An output with a field that is longer than the ledger allows (assertOutputFields) fails the whole
+ * call, as any other error of the node does. The log has one line for each output reference, one time.
+ */
+function ogmiosAnswerToUtxos(result: OgmiosUtxo[]): Utxo[] {
+  const withheld = new WithheldOutputs();
+  const utxos = result.map((o) => ogmiosUtxoToUtxo(o, withheld));
+  withheld.report("ReadOnlyOgmiosProvider");
+  return utxos;
+}
+
+function ogmiosUtxoToUtxo(o: OgmiosUtxo, withheld: WithheldOutputs): Utxo {
+  assertOutputFields(o);
+  const ref = `${o.transaction.id}#${o.index}`;
   const lovelaceRaw = o.value?.ada?.lovelace;
   const lovelace =
     typeof lovelaceRaw === "bigint"
@@ -217,10 +238,9 @@ function ogmiosUtxoToUtxo(o: OgmiosUtxo): Utxo {
     }
   }
 
-  const datumHex =
-    typeof o.datum === "string" && o.datum.length > 0 ? o.datum : null;
-  const scriptRef =
-    typeof o.script === "string" ? o.script : null;
+  const datumHex = typeof o.datum === "string" && o.datum.length > 0 ? withheld.datum(o.datum, ref, o.address) : null;
+  // Only a Plutus V3 script maps here, and Plutus script bytes are opaque.
+  const scriptRef = ogmiosScriptRef(o.script);
 
   return {
     ref: { txHash: o.transaction.id, index: o.index },
@@ -230,6 +250,17 @@ function ogmiosUtxoToUtxo(o: OgmiosUtxo): Utxo {
     datumHex,
     scriptRef,
   };
+}
+
+/**
+ * Ogmios v6 returns a reference script as `{ language, cbor }`. `Utxo.scriptRef`
+ * holds a Plutus V3 script (its compiled code, hex), so only `plutus:v3` maps;
+ * another language gives null.
+ */
+function ogmiosScriptRef(script: unknown): string | null {
+  if (typeof script !== "object" || script === null) return null;
+  const { language, cbor } = script as { language?: unknown; cbor?: unknown };
+  return language === "plutus:v3" && typeof cbor === "string" && cbor.length > 0 ? cbor : null;
 }
 
 function aggregateBudget(

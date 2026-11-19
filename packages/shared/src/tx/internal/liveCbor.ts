@@ -46,6 +46,7 @@ import type {
   WalletKey,
 } from "../types.js";
 import { TxConstructionError } from "../types.js";
+import { checkedAddressText } from "./addressText.js";
 
 import { encodeAdvertDatum } from "../../cbor/AdvertDatum.js";
 import { encodeEscrowDatum } from "../../cbor/EscrowDatum.js";
@@ -573,7 +574,10 @@ export async function buildLiveTxForEscrow(
     slotLengthMs: 1000,
   }, { usePresetProtocolParameters: true });
 
-  const escrowAddress = params.target?.address ?? loadBlueprint().escrowScriptAddress(MAINNET_ID);
+  const escrowAddress = checkedAddressText(
+    params.target?.address ?? loadBlueprint().escrowScriptAddress(MAINNET_ID),
+    "the escrow address",
+  );
   const datumHex = params.target?.datumHex ?? encodeEscrowDatum(escrowDatum);
   // hi = min(deliver_by, lo + 1 h): an escrow transaction has hi − lo ≤ MAX_RANGE_MS (Part 2 §6.5).
   const window = postWindow(postedAt, deliverBy, vectorSlotClock());
@@ -1036,7 +1040,10 @@ export async function buildLiveTxForAdvert(
     slotLengthMs: 1000,
   }, { usePresetProtocolParameters: true });
 
-  const advertAddress = params.target?.address ?? loadBlueprint().advertScriptAddress(MAINNET_ID);
+  const advertAddress = checkedAddressText(
+    params.target?.address ?? loadBlueprint().advertScriptAddress(MAINNET_ID),
+    "the advert address",
+  );
   const datumHex = params.target?.datumHex ?? encodeAdvertDatum(advertDatum);
 
   // Pad to protocol min-utxo if the supplier bond is below floor — same

@@ -15,6 +15,7 @@ import type { BuildResult, WalletKey } from "../types.js";
 import { TxConstructionError } from "../types.js";
 import { OgmiosLucidProvider } from "../../chain/OgmiosLucidProvider.js";
 import { createLucidContext } from "../internal/lucidContext.js";
+import { checkedShelleyAddress } from "../internal/addressText.js";
 import { DEFAULT_FEE_RESERVE } from "./planConsolidate.js";
 
 export interface WithdrawWalletParams {
@@ -34,7 +35,9 @@ export interface WithdrawWalletBuildResult extends BuildResult {
 export async function buildWithdrawTx(
   params: WithdrawWalletParams,
 ): Promise<WithdrawWalletBuildResult> {
-  const { chain, walletKey, toAddress } = params;
+  const { chain, walletKey } = params;
+  // The destination comes from a request: a text that is no payment address is refused before Lucid reads it.
+  const toAddress = checkedShelleyAddress(params.toAddress, "the destination address");
 
   const provider = new OgmiosLucidProvider({ ogmiosUrl: chain.url, fetch: chain.fetchImpl });
   const { lucid } = await createLucidContext(

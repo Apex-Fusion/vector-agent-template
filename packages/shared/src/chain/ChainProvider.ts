@@ -22,7 +22,8 @@ export type Lovelace = bigint;
 /**
  * Utxo — a single unspent output as returned by the chain query layer.
  * `assets` key is the Cardano native-asset unit = policyId (hex) + assetName (hex); lovelace is separate.
- * `datumHex` is the inline datum encoded as hex CBOR; null when no inline datum present.
+ * `datumHex` is the inline datum encoded as hex CBOR; null when no inline datum present, and null when the client withheld it
+ * because it nests deeper than 64 levels or is not CBOR that the decoders read (datumGuard.ts). The output stays in the list.
  * `scriptRef` is the inline script reference as hex; null when no reference script is attached.
  */
 export interface Utxo {
