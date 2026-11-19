@@ -144,6 +144,21 @@ function jsonError(
     .json({ reason, message, ...(param === undefined ? {} : { param }), error });
 }
 
+const STACK_FRAME_RE = /^\s+at .*?([^\s()]+:\d+):\d+\)?$/;
+
+/**
+ * `file:line` of the first stack frame that has a source location. The stack starts
+ * with "Name: message" and the message can have several lines: they are skipped.
+ */
+function topFrame(err: unknown): string {
+  if (!(err instanceof Error) || typeof err.stack !== "string") return "unknown";
+  for (const line of err.stack.split("\n").slice(String(err.message).split("\n").length)) {
+    const location = line.length <= 1_000 ? STACK_FRAME_RE.exec(line) : null;
+    if (location) return location[1];
+  }
+  return "unknown";
+}
+
 // ─── /capability ───────────────────────────────────────────────────────────
 
 interface ResolvedDeps {
@@ -1582,6 +1597,7 @@ function makeChatSessionHandlers(deps: ResolvedDeps) {
             baseUrl: deps.config.openaiBaseUrl,
             responsesUrl: deps.config.openaiResponsesUrl || undefined,
             responsesStreamOnly: deps.config.openaiResponsesStreamOnly,
+            contextTokens: deps.config.openaiContextTokens || undefined,
             upstreamApi: deps.config.openaiUpstreamApi,
             model: deps.config.openaiModelOverride || record.advert.model,
             ...turnRequest,
@@ -1800,8 +1816,14 @@ export function createApp(deps: SupplierDeps): Application {
   }
 
   // Centralised error handler (4 args required by Express).
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     void _next;
+    // Class and top frame only. The message can quote the request body (a JSON parse
+    // error does) or backend output, and the log must not keep prompts or answers.
+    console.error(
+      `[internal_error] method=${req.method} path=${req.path} ` +
+      `error_class=${err instanceof Error ? err.constructor.name : typeof err} frame=${topFrame(err)}`,
+    );
     const message = err instanceof Error ? err.message : String(err);
     if (!res.headersSent) {
       res.status(500).json({

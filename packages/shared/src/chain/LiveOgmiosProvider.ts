@@ -5,10 +5,14 @@
  *   - tip(), queryUtxo(), queryUtxosByAddress(), evaluateTx() — identical to
  *     ReadOnlyOgmiosProvider; implemented via composition (holds an inner
  *     ReadOnlyOgmiosProvider and forwards all read calls).
+ *     A transient read error (HTTP status 500 or higher, network error) is
+ *     tried again in that inner provider: see ogmiosRetry.ts.
  *   - submitTx(txCborHex) — HTTP POST JSON-RPC `submitTransaction` to ogmiosUrl.
  *     Returns the resulting txHash string from `result.transaction.id`.
  *     On Ogmios JSON-RPC error, throws OgmiosSubmitError (structured: name,
  *     code, data fields preserved for upstream retry / dispute flows).
+ *     submitTx is NEVER tried again, for any error: a submit that got no
+ *     clear answer may be on chain (see the comment in submitTx).
  *   - awaitTx(txHash, timeoutMs) — polls `queryLedgerState/utxo` every
  *     pollIntervalMs (default 2000 ms) using a synthetic OutputReference
  *     {transaction:{id:txHash}, index:0} and resolves when ANY returned UTxO
@@ -36,6 +40,8 @@ export interface LiveOgmiosProviderOpts {
   pollIntervalMs?: number;
   /** Injected fetch for testing. Defaults to globalThis.fetch resolved at call time. */
   fetch?: typeof globalThis.fetch;
+  /** Wait before a new try of a read request, in ms. Injected for testing. Defaults to a timer. submitTx and awaitTx do not use it. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -84,6 +90,7 @@ export class LiveOgmiosProvider implements ChainProvider {
       ogmiosUrl: opts.ogmiosUrl,
       timeoutMs: opts.timeoutMs,
       fetch: opts.fetch,
+      sleep: opts.sleep,
     });
     this.ogmiosUrl = opts.ogmiosUrl;
     this.timeoutMs = opts.timeoutMs ?? 30_000;
@@ -124,6 +131,12 @@ export class LiveOgmiosProvider implements ChainProvider {
   // ── submitTx ──────────────────────────────────────────────────────
 
   async submitTx(txCborHex: string): Promise<string> {
+    // NEVER try this request again, for any error (HTTP 5xx, network error,
+    // timeout). A submit that got no clear answer may be on chain. A second
+    // submit of the same transaction fails with a misleading error (its
+    // inputs are spent), and the caller would treat a transaction that is on
+    // chain as failed. Read requests are tried again (see ogmiosRetry.ts);
+    // this one does not use fetchOgmiosRead.
     const id = generateUuid();
     const body = JSON.stringify({
       jsonrpc: "2.0",
@@ -199,6 +212,10 @@ export class LiveOgmiosProvider implements ChainProvider {
   }
 
   private async checkOnce(txHash: string, signal: AbortSignal): Promise<boolean> {
+    // No ogmiosRetry here: the poll loop is the retry. A non-OK HTTP answer
+    // (5xx too) returns false below, and awaitTx polls again after
+    // pollIntervalMs. A fetch rejection (network error) is not caught here:
+    // it ends awaitTx with that error, as it did before the retry change.
     const body = JSON.stringify({
       jsonrpc: "2.0",
       method: "queryLedgerState/utxo",

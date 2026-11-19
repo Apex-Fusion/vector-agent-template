@@ -133,6 +133,8 @@ export async function runChatJob(params: RunChatJobParams): Promise<void> {
           baseUrl: deps.config.openaiBaseUrl,
           responsesUrl: deps.config.openaiResponsesUrl || undefined,
           responsesStreamOnly: deps.config.openaiResponsesStreamOnly,
+          chatStreamOnly: deps.config.openaiChatStreamOnly,
+          contextTokens: deps.config.openaiContextTokens || undefined,
           upstreamApi: deps.config.openaiUpstreamApi,
           model: deps.config.openaiModelOverride || advert.model,
           ...requestBody,

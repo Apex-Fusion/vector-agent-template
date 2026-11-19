@@ -9,9 +9,11 @@ export type {
 } from "./types.js";
 export { TxConstructionError, VECTOR_MAINNET_SLOT_CONFIG } from "./types.js";
 export { checkWindow, slotAt, validityWindow } from "./complete.js";
+export { readCbor } from "./cbor.js";
+export type { CborItem } from "./cbor.js";
 export {
-  addressBytes, addressFromBytes, enterpriseAddress, executionFee, minUtxo, paymentCredential, plutusV3Hash,
-  referenceScriptFee, scriptDataHash,
+  addressBytes, addressFromBytes, blake2b256Hex, enterpriseAddress, executionFee, minUtxo, paymentCredential,
+  plutusV3Hash, referenceScriptFee, scriptDataHash,
 } from "./ledger.js";
 export type { Credential, TxAsset, VKeyWitness } from "./ledger.js";
 export {

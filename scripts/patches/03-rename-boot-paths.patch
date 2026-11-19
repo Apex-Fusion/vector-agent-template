@@ -125,11 +125,11 @@ index e76d753..75d7040 100644
 -CMD ["node_modules/.bin/tsx", "supplier/src/index.ts"]
 +CMD ["node_modules/.bin/tsx", "agent/src/index.ts"]
 diff --git i/agent/src/index.ts w/agent/src/index.ts
-index 5b1a388..d94187d 100644
+index 8c4f188..f51fd0c 100644
 --- i/agent/src/index.ts
 +++ w/agent/src/index.ts
-@@ -187,9 +187,17 @@ async function main(): Promise<void> {
-   process.on("SIGTERM", () => shutdown("SIGTERM"));
+@@ -216,9 +216,17 @@ async function main(startHealth: typeof startDecoderHealth = startDecoderHealth)
+   });
  }
  
 -// Only run when executed directly (not when imported by tests).

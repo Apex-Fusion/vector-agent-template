@@ -27,6 +27,11 @@ export {
 export type { SignedTransactionInfo, SignedTransactionFinancials } from "./internal/signedTransaction.js";
 export { inspectSignedTransaction, inspectSignedTransactionFinancials } from "./internal/signedTransaction.js";
 
+// ── Health of the decoder library in a process ──────────────────────────
+// Only a process that loads the library imports this barrel, so only such a process can start the check.
+export type { DecoderHealth, DecoderHealthOptions } from "./internal/decoderHealth.js";
+export { startDecoderHealth } from "./internal/decoderHealth.js";
+
 // ── Wallet consolidate (one-shot operational tx; live-only) ─────────────
 export type {
   ConsolidateWalletParams,
@@ -55,6 +60,9 @@ export type {
   WithdrawWalletBuildResult,
 } from "./wallet/withdrawWallet.js";
 export { buildWithdrawTx } from "./wallet/withdrawWallet.js";
+
+// ── Address text checks (before Lucid reads an address text) ────────────
+export { MAX_ADDRESS_TEXT_LENGTH, checkedAddressText, checkedShelleyAddress, isAddressRefusal } from "./internal/addressText.js";
 
 // ── Surplus Merkle-batch anchor (live-only) ────────────────────────────
 export type {

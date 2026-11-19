@@ -36,6 +36,7 @@
 import type { ChainProvider } from "@marketplace/shared/chain";
 import type { WalletKey } from "@marketplace/shared/tx";
 import {
+  isAddressRefusal,
   runConsolidateWallet,
   type ConsolidateWalletFlowParams,
   type ConsolidateWalletFlowResult,
@@ -155,6 +156,14 @@ async function consolidateOnce(
       }
     }
   } catch (err) {
+    if (isAddressRefusal(err)) {
+      // The address of this wallet is empty, too long, or not a payment address (a wrong SUPPLIER_ADDRESS). No later tick or trigger
+      // can build a transaction with it, so the health stops here: one log line, no new try, and no cost. A restart with a right
+      // address starts it again. An error of another kind does not halt: it may pass at the next tick.
+      guards.halted = true;
+      opts.log(`HALT: ${err.message} — wallet-health stopped. Set SUPPLIER_ADDRESS to a payment address and restart the supplier to start it again.`);
+      return;
+    }
     // Neither healthy nor consolidated (e.g. balance too low): no fee was
     // spent, so the guards don't move — but nothing converged either, so
     // the consecutive counter is NOT reset.

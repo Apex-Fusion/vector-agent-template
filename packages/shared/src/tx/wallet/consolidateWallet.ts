@@ -25,6 +25,7 @@ import type { BuildResult, WalletKey } from "../types.js";
 import { TxConstructionError } from "../types.js";
 import { OgmiosLucidProvider } from "../../chain/OgmiosLucidProvider.js";
 import { createLucidContext } from "../internal/lucidContext.js";
+import { checkedShelleyAddress } from "../internal/addressText.js";
 import {
   DEFAULT_COLLATERAL_LOVELACE,
   planConsolidate,
@@ -83,12 +84,15 @@ export async function buildConsolidateWalletTx(
     };
   }
 
+  // The address comes from the environment of the process, and the text can be empty or wrong: it is read here before Lucid reads it.
+  const walletAddress = checkedShelleyAddress(walletKey.address, "the wallet address");
+
   let signed;
   try {
     const txBuilder = lucid
       .newTx()
-      .pay.ToAddress(walletKey.address, { lovelace: collateralLovelace })
-      .pay.ToAddress(walletKey.address, { lovelace: plan.workingOutput })
+      .pay.ToAddress(walletAddress, { lovelace: collateralLovelace })
+      .pay.ToAddress(walletAddress, { lovelace: plan.workingOutput })
       .addSignerKey(walletKey.pubKeyHash)
       // 500K floor matches commit 4f1ec9a's setMinFee bump across live builders.
       // The workingOutput already deducts a 2M fee reserve in planConsolidate;

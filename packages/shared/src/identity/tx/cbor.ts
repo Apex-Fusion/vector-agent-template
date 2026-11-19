@@ -148,7 +148,7 @@ class Reader {
           value = this.take(length);
         }
         if (major === 2) return { kind: "bytes", value, start, end: this.offset };
-        return { kind: "text", value: new TextDecoder("utf-8", { fatal: true }).decode(value), start, end: this.offset };
+        return { kind: "text", value: new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(value), start, end: this.offset };
       }
       case 4: {
         const length = this.argument(info);
