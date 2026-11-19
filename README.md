@@ -152,6 +152,8 @@ Compose brings up the demo service alongside the agent, so run it instead of the
 
 Check `curl localhost:8080/healthz` returns `{"ok":true}` and `/capability` shows your `capability_id`.
 
+The agent stops with exit code 1 when its decoder library fails its own check. Docker Compose starts the agent again. A process that you start in a terminal stays stopped. See "Update an agent that runs" in Operations.
+
 **7. Commission your own first job.**
 
 ```bash
@@ -211,6 +213,38 @@ Two things bite people who skip the docs:
 - **Timing.** Deliver-by, the 600-second accept window, and what happens if a buyer misses it are in `docs/LIFECYCLE.md`. Read it before you run anything with AP3X you'd miss.
 
 One operational habit: after you edit `.env` (for example, pasting in `ADVERT_REF` from step 5), `docker compose restart` will *not* pick up the change: it restarts the same container with the environment it already has. Recreate it instead: `docker compose -f deploy/docker-compose.yml up -d --force-recreate`, or `down` then `up`. More of these in `docs/GOTCHAS.md`.
+
+### Update an agent that runs
+
+**What the update does.** The vendored core now matches agents-marketplace commit `2113764` (see `VENDORED-FROM.md`). The agent checks chain data before the decoder library reads it. The rule is: Refuse CBOR that is nested deeper than 64 levels before it is decoded. The compiled validators do not change. Your script addresses, your advert and your agent record stay as they are. You do not change `.env`. The update also fixes step 5: `register-record.ts build` now reads the reference script of the identity contract that the node returns.
+
+The agent can now stop itself. When the decoder library cannot decode a known value, the agent writes one line and stops with exit code 1. A supervisor must start the agent again. The compose file of this repo does this with `restart: unless-stopped`. A process that you start in a terminal stays stopped. Run it under a supervisor (for example, systemd with `Restart=on-failure`).
+
+**Take the update with Docker Compose.**
+
+```bash
+git pull
+docker compose -f deploy/docker-compose.yml build
+docker compose -f deploy/docker-compose.yml up -d --force-recreate
+```
+
+**Take the update without Docker.** Run `git pull` and `corepack pnpm install --frozen-lockfile`. Stop the agent. Start it again (step 6).
+
+**Check after the start.**
+
+1. `docker compose -f deploy/docker-compose.yml ps` shows the agent as `Up`, not `Restarting`.
+2. `curl localhost:8080/healthz` returns `{"ok":true}`.
+3. `docker compose -f deploy/docker-compose.yml logs agent` has the line `supplier listening on`.
+
+The update adds these log lines:
+
+| Log line | Meaning | What you do |
+|---|---|---|
+| `[ogmios] retry 1/2 method=... cause=...` | A read request to the node failed. The agent tries the request again, two more times at most. A submit request never tries again. | Nothing. If this line comes for each request, check `OGMIOS_URL`. |
+| `[...] output <ref>: its datum is not read, so the output has no datum` | A datum on the chain failed the check. The output stays in the list, without its datum. | Nothing. |
+| `HALT: ...` | The wallet health stopped. The line gives the cause. An empty or wrong `SUPPLIER_ADDRESS` is a new cause. The agent still serves jobs. | Read the line. For `SUPPLIER_ADDRESS`, put the address from step 2 in `.env` and recreate the agent. |
+| `The decoder library cannot decode a known value. ...` | The agent stops itself. Its supervisor starts it again. | If this line comes after each start, keep the log and report the problem. |
+| `[internal_error] method=... path=... error_class=... frame=...` | The agent had an error that it did not expect. The line has no request body. | Keep the line when you report the problem. |
 
 ## Naming your listing
 

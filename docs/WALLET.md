@@ -23,6 +23,8 @@ Claim, Submit, and Accept traffic fragments a wallet into more and smaller UTxOs
 
 That consolidation is deliberately conservative. It halts itself (logging loudly once) if it ever consolidates three times in a row without reaching a healthy shape, or more than six times inside any 24-hour window, and stays halted until you consolidate by hand and restart the agent. Those two circuit breakers exist because an earlier version of this exact mechanism had neither: a non-idempotent health check made every single tick consolidate, and it burned real AP3X in fees continuously until the wallet ran dry. The guards are permanent; there's no config flag to turn them off.
 
+The health also halts for a different cause: `SUPPLIER_ADDRESS` is empty or is not a wallet address. The health writes one `HALT:` line. No later tick can build a transaction with such an address, so the health does not try again. Put the right address in `.env` and recreate the agent. The health then starts again.
+
 ## Your keys are raw keypairs, and nothing can regenerate them
 
 `gen-keypair.ts` produces a raw ed25519 keypair, written once to stdout. It is deliberately simple: no BIP39 mnemonic, no HD derivation, no seed phrase. That has one hard consequence: **the JSON the command prints is the only copy of that wallet that will ever exist.** No phrase recovers it; no wallet app re-derives it. Store the file somewhere durable before the wallet holds anything, and treat a wallet whose key file is lost as gone, whatever its balance says on-chain.
